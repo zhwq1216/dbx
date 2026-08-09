@@ -1398,7 +1398,7 @@ const settingsCategoryNav = computed<{ value: SettingsCategory; label: string }[
   { value: "tunnels", label: t("settings.tunnelsTab") },
   { value: "shortcuts", label: t("settings.shortcutsTab") },
   { value: "snippets", label: t("settings.snippetsTab") },
-  ...(isWeb ? [] : [{ value: "sync" as const, label: t("settings.syncTab") }]),
+  { value: "sync" as const, label: t("settings.syncTab") },
   { value: "ai", label: t("settings.aiTab") },
   { value: "mcp" as const, label: t("settings.mcpTab") },
   ...(isWeb ? [{ value: "security" as const, label: t("settings.securityTab") }] : []),
@@ -5313,7 +5313,7 @@ onUnmounted(() => {
                         {{ t("settings.syncRemotePathDescription") }}
                       </p>
                     </div>
-                    <div class="space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
+                    <div v-if="!isWeb" class="space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
                       <label class="flex items-center gap-2 text-xs">
                         <input v-model="webdavAutoUploadEnabled" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
                         <span class="font-medium">{{ t("settings.syncAutoUpload") }}</span>

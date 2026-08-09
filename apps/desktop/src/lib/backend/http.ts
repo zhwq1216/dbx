@@ -500,12 +500,12 @@ export async function restartDriverRuntime(runtimeId: string): Promise<void> {
   await post("/api/agents/runtime/restart", { runtimeId });
 }
 
-export async function installAgent(dbType: string, _source?: UpdateDownloadSource, operationId?: string): Promise<void> {
-  await post("/api/agents/install", { dbType, operationId });
+export async function installAgent(dbType: string, source?: UpdateDownloadSource, operationId?: string): Promise<void> {
+  await post("/api/agents/install", { dbType, source, operationId });
 }
 
-export async function upgradeAllAgents(_source?: UpdateDownloadSource, operationId?: string): Promise<UpgradeAllAgentDriversResult> {
-  return post("/api/agents/upgrade-all", { operationId });
+export async function upgradeAllAgents(source?: UpdateDownloadSource, operationId?: string): Promise<UpgradeAllAgentDriversResult> {
+  return post("/api/agents/upgrade-all", { source, operationId });
 }
 
 export async function checkAgentUpdateBlockers(dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
@@ -566,8 +566,8 @@ export async function importAgentDriver(dbType: string, pathOrFile: string | Fil
 
 export const importAgentJar = importAgentDriver;
 
-export async function reinstallJre(jreKey?: string, _source?: UpdateDownloadSource, operationId?: string): Promise<void> {
-  await post("/api/agents/reinstall-jre", { jreKey, operationId });
+export async function reinstallJre(jreKey?: string, source?: UpdateDownloadSource, operationId?: string): Promise<void> {
+  await post("/api/agents/reinstall-jre", { jreKey, source, operationId });
 }
 
 export async function uninstallJre(jreKey: string): Promise<void> {

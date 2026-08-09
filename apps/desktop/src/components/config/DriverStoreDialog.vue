@@ -1336,7 +1336,7 @@ watch(driverStoreTab, (tab) => {
               </TabsTrigger>
             </TabsList>
             <div v-if="driverStoreTab !== 'storage'" class="flex flex-wrap items-center gap-2">
-              <div v-if="driverStoreTab === 'agent' && !isWeb" class="flex items-center gap-1.5">
+              <div v-if="driverStoreTab === 'agent'" class="flex items-center gap-1.5">
                 <span class="text-xs text-muted-foreground">{{ t("settings.updateDownloadSource") }}</span>
                 <Select :model-value="settingsStore.editorSettings.updateDownloadSource" :disabled="downloadSourceBusy" @update:model-value="setUpdateDownloadSource">
                   <SelectTrigger class="h-7 w-[160px] rounded-md text-xs">

@@ -2,6 +2,7 @@ import { onMounted, onUnmounted } from "vue";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { appendDebugLog } from "@/lib/backend/debugLog";
 import { webdavSyncUpload } from "@/lib/backend/api";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { readWebDavAutoUploadConfig, WEB_DAV_AUTO_UPLOAD_STORAGE_KEYS } from "@/lib/webdav/webdavAutoUploadConfig";
 
 export function useWebDavAutoUpload() {
@@ -17,6 +18,7 @@ export function useWebDavAutoUpload() {
 
   function schedule() {
     clearTimer();
+    if (!isTauriRuntime()) return;
     const config = readWebDavAutoUploadConfig();
     if (!config.enabled || !config.webDavConfig) return;
 

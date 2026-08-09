@@ -12,7 +12,8 @@ test("shares the configured download source with agent driver management", () =>
   const driverStore = source("apps/desktop/src/components/config/DriverStoreDialog.vue");
   const backendApi = source("apps/desktop/src/lib/backend/api.ts");
 
-  assert.match(driverStore, /driverStoreTab === 'agent' && !isWeb/);
+  assert.match(driverStore, /driverStoreTab === 'agent'/);
+  assert.doesNotMatch(driverStore, /driverStoreTab === 'agent' && !isWeb/);
   assert.match(driverStore, /:model-value="settingsStore\.editorSettings\.updateDownloadSource"/);
   assert.match(driverStore, /settingsStore\.updateEditorSettings\(\{ updateDownloadSource: value \}\)/);
   assert.match(driverStore, /void forceRefresh\(\)\.catch\(\(\) => undefined\)/);

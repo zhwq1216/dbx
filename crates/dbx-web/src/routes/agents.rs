@@ -8,11 +8,12 @@ use dbx_core::agent_manager::{
 };
 use dbx_core::agent_service::{
     build_agent_list, clear_agent_download_cache, fetch_registry, import_agent_driver,
-    import_agents_from_package as import_agents_from_package_core, inspect_offline_package, install_agent_driver,
-    invalidate_registry_cache, reinstall_agent_jre, uninstall_agent_driver, uninstall_agent_jre,
-    upgrade_all_agent_drivers, AgentProgressEvent, OfflineImportPlan,
+    import_agents_from_package as import_agents_from_package_core, inspect_offline_package, install_agent_driver_from,
+    invalidate_registry_cache, reinstall_agent_jre_from, uninstall_agent_driver, uninstall_agent_jre,
+    upgrade_all_agent_drivers_from, AgentProgressEvent, OfflineImportPlan,
 };
 use dbx_core::driver_runtime::DriverRuntimeSummary;
+use dbx_core::DownloadSource;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -26,6 +27,8 @@ use crate::state::WebState;
 pub struct AgentTypeRequest {
     pub db_type: String,
     pub operation_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<DownloadSource>,
 }
 
 #[derive(Deserialize)]
@@ -33,12 +36,16 @@ pub struct AgentTypeRequest {
 pub struct JreRequest {
     pub jre_key: Option<String>,
     pub operation_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<DownloadSource>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentOperationRequest {
     pub operation_id: Option<String>,
+    #[serde(default)]
+    pub source: Option<DownloadSource>,
 }
 
 #[derive(Deserialize)]
@@ -122,8 +129,9 @@ pub async fn install_agent(
 ) -> Result<Json<serde_json::Value>, AppError> {
     ensure_no_agent_update_blockers(&state.app, std::slice::from_ref(&req.db_type)).await.map_err(AppError::from)?;
     let operation_id = req.operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let source = req.source.unwrap_or_default();
     let tx = progress_sender(&state, "global").await;
-    install_agent_driver(&state.app.agent_manager, &req.db_type, |event| {
+    install_agent_driver_from(&state.app.agent_manager, &req.db_type, source, |event| {
         send_progress_event(&tx, event.with_operation_id(&operation_id))
     })
     .await
@@ -141,8 +149,9 @@ pub async fn upgrade_all_agents(
         agents.iter().filter(|agent| agent.update_available).map(|agent| agent.db_type.clone()).collect();
     ensure_no_agent_update_blockers(&state.app, &updatable).await.map_err(AppError::from)?;
     let operation_id = req.operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let source = req.source.unwrap_or_default();
     let tx = progress_sender(&state, "global").await;
-    let result = upgrade_all_agent_drivers(&state.app.agent_manager, |event| {
+    let result = upgrade_all_agent_drivers_from(&state.app.agent_manager, source, |event| {
         send_progress_event(&tx, event.with_operation_id(&operation_id))
     })
     .await
@@ -299,10 +308,16 @@ pub async fn reinstall_jre(
     Json(req): Json<JreRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let operation_id = req.operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let source = req.source.unwrap_or_default();
     let tx = progress_sender(&state, "global").await;
-    reinstall_agent_jre(&state.app.agent_manager, req.jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY), |event| {
-        send_progress_event(&tx, event.with_operation_id(&operation_id));
-    })
+    reinstall_agent_jre_from(
+        &state.app.agent_manager,
+        req.jre_key.as_deref().unwrap_or(DEFAULT_JRE_KEY),
+        source,
+        |event| {
+            send_progress_event(&tx, event.with_operation_id(&operation_id));
+        },
+    )
     .await
     .map_err(AppError::from)?;
     Ok(Json(serde_json::json!({ "ok": true })))
