@@ -19,6 +19,7 @@ jobs:
   sync-cnb:
     name: Sync to CNB
     runs-on: ubuntu-latest
+    if: ${{ secrets.CNB_TOKEN != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -40,6 +41,7 @@ jobs:
   sync-atomgit:
     name: Sync to AtomGit
     runs-on: ubuntu-latest
+    if: ${{ secrets.ATOMGIT_TOKEN != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -61,6 +63,7 @@ jobs:
   sync-gitee:
     name: Sync to Gitee
     runs-on: ubuntu-latest
+    if: ${{ secrets.GITEE_TOKEN != '' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
