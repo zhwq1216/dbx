@@ -297,6 +297,9 @@ impl MessageQueueAdmin for PulsarAdmin {
                         internal: false,
                         message_type: None,
                         namespace: None,
+                        message_count: None,
+                        messages_ready: None,
+                        messages_unacked: None,
                     })
                 })
                 .buffered(PARTITION_METADATA_CONCURRENCY)
@@ -323,6 +326,9 @@ impl MessageQueueAdmin for PulsarAdmin {
                     internal: false,
                     message_type: None,
                     namespace: None,
+                    message_count: None,
+                    messages_ready: None,
+                    messages_unacked: None,
                 });
             }
         }
@@ -1154,6 +1160,7 @@ mod tests {
                 token_signing: None,
                 connect_override: None,
                 management_connect_override: None,
+                socks_proxy: None,
                 query_timeout_secs: crate::mq::config::DEFAULT_MQ_QUERY_TIMEOUT_SECS,
                 connect_timeout_secs: crate::mq::config::DEFAULT_MQ_CONNECT_TIMEOUT_SECS,
                 extra: serde_json::Value::Null,

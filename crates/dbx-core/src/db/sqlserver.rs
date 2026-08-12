@@ -1722,7 +1722,47 @@ pub async fn list_databases(client: &mut SqlServerClient) -> Result<Vec<Database
         .await
         .map_err(|e| e.to_string())?;
     let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
-    Ok(rows.iter().map(|row| DatabaseInfo { name: row.get::<&str, _>(0).unwrap_or("").to_string() }).collect())
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseInfo { name: row.get::<&str, _>(0).unwrap_or("").to_string(), ..Default::default() })
+        .collect())
+}
+
+pub async fn list_database_metadata(client: &mut SqlServerClient) -> Result<Vec<DatabaseInfo>, String> {
+    let rows = match list_database_metadata_rows(client).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            log::debug!("Falling back to database names after metadata query failed: {error}");
+            return list_databases(client).await;
+        }
+    };
+    Ok(rows
+        .iter()
+        .map(|row| DatabaseInfo {
+            name: row.get::<&str, _>(0).unwrap_or("").to_string(),
+            created_at: row.get::<chrono::NaiveDateTime, _>(1).map(|value| value.to_string()),
+            default_collation: row.get::<&str, _>(2).map(str::to_string).filter(|value| !value.trim().is_empty()),
+            size_bytes: row.get::<i64, _>(3),
+            ..Default::default()
+        })
+        .collect())
+}
+
+async fn list_database_metadata_rows(client: &mut SqlServerClient) -> Result<Vec<Row>, String> {
+    let stream = client
+        .query(
+            "SELECT d.name, d.create_date, d.collation_name, \
+                    SUM(COALESCE(CONVERT(bigint, f.size), 0)) * 8192 AS size_bytes \
+             FROM sys.databases d \
+             LEFT JOIN sys.master_files f ON f.database_id = d.database_id \
+             WHERE d.state = 0 \
+             GROUP BY d.name, d.create_date, d.collation_name \
+             ORDER BY d.name",
+            &[],
+        )
+        .await;
+    let stream = stream.map_err(|error| error.to_string())?;
+    stream.into_first_result().await.map_err(|error| error.to_string())
 }
 
 pub async fn get_completion_context(client: &mut SqlServerClient) -> Result<SqlServerCompletionContext, String> {
@@ -1776,7 +1816,7 @@ pub async fn list_linked_server_catalogs(
     Ok(rows
         .iter()
         .filter_map(|row| row.get::<&str, _>(0).map(str::trim).filter(|name| !name.is_empty()))
-        .map(|name| DatabaseInfo { name: name.to_string() })
+        .map(|name| DatabaseInfo { name: name.to_string(), ..Default::default() })
         .collect())
 }
 
@@ -2063,6 +2103,8 @@ fn sqlserver_completion_assistant_sql(request: &crate::types::CompletionAssistan
         .filter(|schema| !schema.trim().is_empty())
         .map(|schema| format!(" AND s.name = '{}' ", schema.replace('\'', "''")))
         .unwrap_or_default();
+    let columns_only = object_kinds.len() == 1
+        && matches!(object_kinds.first(), Some(crate::types::CompletionAssistantObjectKind::Column));
 
     let mut queries = Vec::new();
     if (mask.starts_with('#') || mask.starts_with("%#"))
@@ -2145,12 +2187,15 @@ fn sqlserver_completion_assistant_sql(request: &crate::types::CompletionAssistan
              FROM sys.columns c \
              JOIN sys.objects o ON o.object_id = c.object_id \
              JOIN sys.schemas s ON s.schema_id = o.schema_id \
-             WHERE o.type IN ('U','V') AND {object_visibility} {schema_filter} {parent_table_filter} {column_like}"
+             WHERE o.type IN ('U','V') AND {object_visibility} {schema_filter} {parent_table_filter} {column_like} ORDER BY c.column_id"
         ));
     }
 
     if queries.is_empty() {
         "SELECT TOP (0) CAST('' AS NVARCHAR(128)) AS name, CAST('' AS NVARCHAR(128)) AS schema_name, CAST('' AS NVARCHAR(60)) AS object_type, CAST(NULL AS NVARCHAR(128)) AS parent_schema, CAST(NULL AS NVARCHAR(128)) AS parent_name, CAST(NULL AS NVARCHAR(MAX)) AS object_comment, CAST(NULL AS NVARCHAR(128)) AS data_type".to_string()
+    } else if columns_only && queries.len() == 1 {
+        // Preserve sys.columns.column_id order for SELECT * expansion.
+        queries.remove(0)
     } else if queries.len() == 1 {
         format!("SELECT * FROM ({}) AS dbx_completion ORDER BY name", queries.remove(0))
     } else {
@@ -2314,11 +2359,15 @@ pub async fn list_objects(client: &mut SqlServerClient, schema: &str) -> Result<
             schema: Some(schema.to_string()),
             valid: None,
             signature: None,
+            custom_type_kind: None,
+            has_members: None,
             comment: row.get::<&str, _>(4).filter(|s: &&str| !s.is_empty()).map(|s: &str| s.to_string()),
             created_at: row.get::<chrono::NaiveDateTime, _>(2).map(|value| value.to_string()),
             updated_at: row.get::<chrono::NaiveDateTime, _>(3).map(|value| value.to_string()),
             parent_schema: None,
             parent_name: None,
+            trigger: None,
+            xugu_type_members_expandable: None,
         })
         .collect())
 }
@@ -2691,6 +2740,13 @@ pub async fn list_triggers(
             name: row.get::<&str, _>(0).unwrap_or("").to_string(),
             event: row.get::<&str, _>(1).unwrap_or("").to_string(),
             timing: row.get::<&str, _>(2).unwrap_or("AFTER").to_string(),
+            level: None,
+            condition: None,
+            language: None,
+            enabled: None,
+            valid: None,
+            comment: None,
+            created_at: None,
             statement: row.get::<&str, _>(3).map(str::to_string),
         })
         .collect())
@@ -4148,6 +4204,8 @@ mod tests {
         assert!(sql.contains("o.name = 'Users'"));
         assert!(sql.contains("LOWER(c.name) LIKE LOWER('%id%') ESCAPE '\\'"));
         assert!(sql.contains("CAST(NULL AS NVARCHAR(MAX)) AS object_comment"));
+        assert!(sql.contains("ORDER BY c.column_id"));
+        assert!(!sql.contains("AS dbx_completion ORDER BY name"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent } from "vue";
 import { useI18n } from "vue-i18n";
-import { ChevronsRight } from "@lucide/vue";
+import { ChevronsRight, FileText } from "@lucide/vue";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import AppToolbar from "@/components/layout/AppToolbar.vue";
 import AppTabBar from "@/components/layout/AppTabBar.vue";
@@ -172,11 +172,13 @@ const {
   updateDownloaded,
   isInstallingUpdate,
   updateReady,
+  isIgnoringUpdate,
   activeTaskCount: activeUpdateTaskCount,
   hasUpdateAvailable,
   openUrl,
   checkUpdates,
   openLatestRelease,
+  ignoreCurrentVersion,
   downloadAndInstallUpdate,
   cancelDownload,
   installDownloadedUpdate,
@@ -257,6 +259,16 @@ const queryEditorObjectSourceTarget = ref<{
   relationName?: string;
 } | null>(null);
 const showSaveSqlDialog = ref(false);
+const sqlLibrarySaveFeedbackId = ref(0);
+const saveSqlConfirmButtonRef = ref<HTMLElement | { $el?: HTMLElement } | null>(null);
+const sqlLibraryFlyAnimation = ref<{
+  id: number;
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+} | null>(null);
+let sqlLibraryFlyAnimationTimer = 0;
 const showMultiDbExecuteDialog = ref(false);
 const multiExecuteSql = ref("");
 const multiExecuteSourceTabId = ref("");
@@ -853,6 +865,58 @@ function defaultSavedSqlName(title: string) {
   return normalized.endsWith(".sql") ? normalized : `${normalized}.sql`;
 }
 
+function notifySqlLibrarySaved() {
+  sqlLibrarySaveFeedbackId.value += 1;
+  toast(t("savedSql.saved"), 2000);
+}
+
+function elementCenter(element: HTMLElement | null): { x: number; y: number } | null {
+  if (!element || element.getClientRects().length === 0) return null;
+  const rect = element.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
+function saveSqlConfirmButtonElement(): HTMLElement | null {
+  const button = saveSqlConfirmButtonRef.value;
+  if (button instanceof HTMLElement) return button;
+  return button?.$el instanceof HTMLElement ? button.$el : null;
+}
+
+async function notifyNewSqlLibrarySaved(origin: { x: number; y: number } | null) {
+  toast(t("savedSql.saved"), 2000);
+  if (showSqlLibraryPanel.value) {
+    sqlLibrarySaveFeedbackId.value += 1;
+    return;
+  }
+  await nextTick();
+
+  const target = document.querySelector<HTMLElement>("[data-sql-library-trigger]");
+  const destination = elementCenter(target);
+  if (!origin || !destination || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    sqlLibrarySaveFeedbackId.value += 1;
+    return;
+  }
+
+  window.clearTimeout(sqlLibraryFlyAnimationTimer);
+  const animationId = Date.now();
+  sqlLibraryFlyAnimation.value = {
+    id: animationId,
+    fromX: origin.x,
+    fromY: origin.y,
+    toX: destination.x,
+    toY: destination.y,
+  };
+  sqlLibraryFlyAnimationTimer = window.setTimeout(() => finishSqlLibraryFlyAnimation(animationId), 1000);
+}
+
+function finishSqlLibraryFlyAnimation(animationId: number) {
+  if (sqlLibraryFlyAnimation.value?.id !== animationId) return;
+  window.clearTimeout(sqlLibraryFlyAnimationTimer);
+  sqlLibraryFlyAnimation.value = null;
+  sqlLibrarySaveFeedbackId.value += 1;
+}
+
 function canSaveSqlTab(tab: QueryTab): boolean {
   return !!tab.externalSqlPath || !!tab.sql.trim();
 }
@@ -1087,7 +1151,7 @@ async function handleSaveTab(tabId: string) {
     });
     queryStore.linkSavedSql(tab.id, updated.id, updated.name);
     queryStore.markTabClean(tab);
-    toast(t("savedSql.saved"), 2000);
+    notifySqlLibrarySaved();
     completePendingTabSave(tabId);
     return;
   }
@@ -1123,7 +1187,7 @@ async function openSaveSqlDialog() {
     });
     queryStore.linkSavedSql(tab.id, updated.id, updated.name);
     queryStore.markTabClean(tab);
-    toast(t("savedSql.saved"), 2000);
+    notifySqlLibrarySaved();
     return;
   }
 
@@ -1204,6 +1268,7 @@ async function confirmSaveSqlToLibrary() {
   const tab = activeTab.value;
   const name = saveSqlName.value.trim();
   if (!tab || !tab.sql.trim() || !name) return;
+  const flyOrigin = elementCenter(saveSqlConfirmButtonElement());
   try {
     const target = savedSqlTargetForSave(tab);
     const saved = await savedSqlStore.saveFile({
@@ -1219,7 +1284,7 @@ async function confirmSaveSqlToLibrary() {
     queryStore.markTabClean(tab);
     showSaveSqlDialog.value = false;
     closePendingSavedTab();
-    toast(t("savedSql.saved"), 2000);
+    void notifyNewSqlLibrarySaved(flyOrigin);
   } catch (e: any) {
     toast(t("savedSql.saveFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -1546,7 +1611,7 @@ async function openConnectionQuery(connectionId: string) {
     }
     return;
   }
-  if (initialTarget.kind === "etcd" || initialTarget.kind === "zookeeper") {
+  if (initialTarget.kind === "etcd" || initialTarget.kind === "zookeeper" || initialTarget.kind === "consul") {
     try {
       await connectionStore.ensureConnected(connectionId);
       queryStore.createTab(connectionId, "", `${connection.name}:keys`, initialTarget.kind);
@@ -1646,7 +1711,7 @@ async function onClickTable(table: SqlObjectNavigationTarget) {
     return;
   }
   try {
-    await openTableTarget(target, { tableInfoTab: "ddl" });
+    await openObjectBrowserTableTarget(target);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
   }
@@ -1656,7 +1721,7 @@ async function onViewTableData(table: SqlObjectNavigationTarget) {
   const target = tableTargetFromActiveTab(table);
   if (!target) return;
   try {
-    await openTableTarget(target);
+    await openObjectBrowserTableTarget(target);
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
   }
@@ -1759,10 +1824,11 @@ async function changeActiveConnection(connectionId: string) {
     const options = await getDatabaseOptions(connectionId);
     const database = resolveDefaultDatabase(connection, options);
     queryStore.updateDatabase(tab.id, database);
-    if (connection.db_type === "oracle") {
+    if (connection.default_schema || connection.db_type === "oracle") {
       try {
-        // Oracle returns the session's current schema first; preserve that order before toolbar sorting.
-        const schema = schemaAfterConnectionSwitch(connection.db_type, await api.listSchemas(connectionId, database));
+        // A configured default wins. Otherwise Oracle returns the session's current schema first.
+        const orderedSchemas = connection.default_schema ? [] : await api.listSchemas(connectionId, database);
+        const schema = schemaAfterConnectionSwitch(connection.db_type, orderedSchemas, connection.default_schema);
         if (schema && activeTab.value?.id === tab.id && activeTab.value.connectionId === connectionId) {
           queryStore.updateSchema(tab.id, schema);
         }
@@ -1967,6 +2033,8 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadEtcdRoot(item.connectionId);
       } else if (config?.db_type === "zookeeper") {
         await connectionStore.loadZooKeeperRoot(item.connectionId);
+      } else if (config?.db_type === "consul") {
+        await connectionStore.loadConsulRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch") {
@@ -1992,6 +2060,8 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadEtcdRoot(item.connectionId);
       } else if (config?.db_type === "zookeeper") {
         await connectionStore.loadZooKeeperRoot(item.connectionId);
+      } else if (config?.db_type === "consul") {
+        await connectionStore.loadConsulRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
       } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch") {
@@ -2114,7 +2184,7 @@ function handleNativeSelectAll(e: KeyboardEvent) {
   if (shouldBlockAppNativeSelectAll(e)) e.preventDefault();
 }
 
-function handleKeydown(e: KeyboardEvent) {
+async function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
   const shortcuts = settingsStore.editorSettings.shortcuts;
@@ -2192,6 +2262,7 @@ function handleKeydown(e: KeyboardEvent) {
     } else if (showDriverStore.value) {
       closeDriverStorePage();
     } else if (queryStore.activeTabId) {
+      if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
       queryStore.closeTab(queryStore.activeTabId);
     }
     return;
@@ -2454,6 +2525,7 @@ onUnmounted(() => {
   window.removeEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   document.removeEventListener("contextmenu", handleContextMenu);
+  window.clearTimeout(sqlLibraryFlyAnimationTimer);
 });
 </script>
 
@@ -2468,6 +2540,7 @@ onUnmounted(() => {
           :show-ai-panel="showAiPanel"
           :show-history="showHistory"
           :show-sql-library="showSqlLibraryPanel"
+          :sql-library-save-feedback-id="sqlLibrarySaveFeedbackId"
           :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
           :show-settings-page="showSettingsPage"
@@ -2786,18 +2859,33 @@ onUnmounted(() => {
           :update-downloaded="updateDownloaded"
           :is-installing-update="isInstallingUpdate"
           :update-ready="updateReady"
+          :is-ignoring-update="isIgnoringUpdate"
           :active-task-count="activeUpdateTaskCount"
           @open-latest-release="openLatestRelease"
           @download-and-install="downloadAndInstallUpdate"
           @cancel-download="cancelDownload"
           @install-downloaded="installDownloadedUpdate"
           @restart="restartApp"
+          @ignore-version="ignoreCurrentVersion"
         />
         <ExternalSqlFileChangeDialog :prompt="externalSqlFilePrompt" @decide="externalSqlFileChanges.resolvePrompt" />
         <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" :open="showCloseActionPrompt" @update:open="handleCloseActionPromptOpenChange" @quit="chooseQuit" @minimize="chooseMinimize" />
         <QuickOpenDialog :open="showQuickOpen" @update:open="showQuickOpen = $event" @select="handleQuickOpenSelect" />
       </div>
       <Teleport to="body">
+        <FileText
+          v-if="sqlLibraryFlyAnimation"
+          :key="sqlLibraryFlyAnimation.id"
+          aria-hidden="true"
+          class="sql-library-fly-icon pointer-events-none fixed left-0 top-0 z-[100000] h-6 w-6 text-primary"
+          :style="{
+            '--sql-library-fly-from-x': `${sqlLibraryFlyAnimation.fromX}px`,
+            '--sql-library-fly-from-y': `${sqlLibraryFlyAnimation.fromY}px`,
+            '--sql-library-fly-to-x': `${sqlLibraryFlyAnimation.toX}px`,
+            '--sql-library-fly-to-y': `${sqlLibraryFlyAnimation.toY}px`,
+          }"
+          @animationend="finishSqlLibraryFlyAnimation(sqlLibraryFlyAnimation.id)"
+        />
         <Transition name="toast">
           <div v-if="toastVisible" class="fixed bottom-6 inset-x-0 w-max max-w-[90vw] sm:max-w-3xl mx-auto z-99999 px-4 py-2 rounded-lg bg-foreground text-background text-sm shadow-lg select-text whitespace-pre-wrap break-words">
             {{ toastMessage }}
@@ -2852,7 +2940,7 @@ onUnmounted(() => {
           <DialogFooter>
             <Button v-if="isDesktop" variant="secondary" @click="saveActiveSqlAsLocalFile">{{ t("savedSql.saveToFile") }}</Button>
             <Button variant="outline" @click="cancelPendingSaveAndClose()">{{ t("dangerDialog.cancel") }}</Button>
-            <Button :disabled="saveSqlFolderCreationPending || !saveSqlName.trim()" @click="confirmSaveSqlToLibrary">{{ t("savedSql.save") }}</Button>
+            <Button ref="saveSqlConfirmButtonRef" :disabled="saveSqlFolderCreationPending || !saveSqlName.trim()" @click="confirmSaveSqlToLibrary">{{ t("savedSql.save") }}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -2890,6 +2978,26 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+@keyframes sql-library-fly-in {
+  0% {
+    opacity: 1;
+    transform: translate3d(var(--sql-library-fly-from-x), var(--sql-library-fly-from-y), 0) translate(-50%, -50%) scale(0.78);
+  }
+  90% {
+    opacity: 1;
+    transform: translate3d(var(--sql-library-fly-to-x), var(--sql-library-fly-to-y), 0) translate(-50%, -50%) scale(0.5);
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--sql-library-fly-to-x), var(--sql-library-fly-to-y), 0) translate(-50%, -50%) scale(0.42);
+  }
+}
+
+.sql-library-fly-icon {
+  animation: sql-library-fly-in 560ms cubic-bezier(0.45, 0, 0.55, 1) both;
+  will-change: transform, opacity;
+}
+
 .toast-enter-active,
 .toast-leave-active {
   transition: 0.25s ease;
@@ -2899,5 +3007,11 @@ onUnmounted(() => {
 .toast-leave-to {
   opacity: 0;
   transform: translateY(100%) scale(0.95);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sql-library-fly-icon {
+    animation: none;
+  }
 }
 </style>

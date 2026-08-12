@@ -118,6 +118,7 @@ pub enum PoolKind {
     MessageQueue,
     /// Nacos admin connection marker.
     Nacos,
+    Consul(crate::consul::ConsulClient),
     /// MQTT broker connection with an active client.
     #[cfg(feature = "mq-admin")]
     Mqtt(Arc<super::mqtt::client::MqttClient>),
@@ -2039,6 +2040,17 @@ impl AppState {
                 adapter.test_connection().await?;
                 PoolKind::Nacos
             }
+            DatabaseType::Consul => {
+                let mut consul_config = crate::consul::ConsulConfig::from_connection(&db_config)?;
+                let original_host = consul_config.base_url.host_str().unwrap_or_default();
+                let original_port = consul_config.base_url.port_or_known_default().unwrap_or(db_config.port);
+                if host != original_host || port != original_port {
+                    consul_config = consul_config.with_connect_override(&host, port);
+                }
+                let client = crate::consul::ConsulClient::new(consul_config).await?;
+                client.probe().await?;
+                PoolKind::Consul(client)
+            }
             agent_connection_pool_database_type!() => {
                 let connect_params = agent_connect_params_with_role(
                     &db_config,
@@ -2453,6 +2465,15 @@ impl AppState {
             return Err("Oracle TNS connections cannot be combined with SSH, proxy, or HTTP tunnel layers. Remove the transport layer or use Service Name/SID mode.".to_string());
         }
 
+        #[cfg(feature = "mq-admin")]
+        if config.db_type == DatabaseType::MessageQueue
+            && crate::mq::config::MqAdminConfig::from_connection(config)?.system_kind
+                == crate::mq::types::MqSystemKind::RocketMq
+        {
+            self.rocketmq_socks_proxy_for_transport_layers(connection_id, &transport_layers).await?;
+            return Ok((config.host.clone(), config.port));
+        }
+
         let (remote_host, remote_port) = connection_remote_endpoint(config);
         let local_port = db::transport_layer_tunnel::start_transport_layers(
             connection_id,
@@ -2658,6 +2679,69 @@ impl AppState {
     }
 
     #[cfg(feature = "mq-admin")]
+    async fn rocketmq_socks_proxy_for_transport_layers(
+        &self,
+        connection_id: &str,
+        transport_layers: &[TransportLayerConfig],
+    ) -> Result<crate::mq::config::MqSocksProxy, String> {
+        // ProxyType 仅此 mq-admin 分支用到，局部导入避免在关闭 mq-admin 时
+        // 顶层 import 触发 unused 警告。
+        use crate::models::connection::ProxyType;
+        let final_layer = transport_layers.last().ok_or("No transport layers configured")?;
+        match final_layer {
+            TransportLayerConfig::Ssh(_) => {
+                let local_port = db::transport_layer_tunnel::start_transport_layers_with_final_ssh_socks5(
+                    connection_id,
+                    transport_layers,
+                    &self.tunnels,
+                    &self.proxy_tunnels,
+                    &self.http_tunnels,
+                )
+                .await?;
+                Ok(crate::mq::config::MqSocksProxy {
+                    host: "127.0.0.1".to_string(),
+                    port: local_port,
+                    username: String::new(),
+                    password: String::new(),
+                })
+            }
+            TransportLayerConfig::Proxy(proxy) if proxy.proxy_type == ProxyType::Socks5 => {
+                if transport_layers.len() == 1 {
+                    Ok(crate::mq::config::MqSocksProxy {
+                        host: proxy.host.clone(),
+                        port: proxy.port,
+                        username: proxy.username.clone(),
+                        password: proxy.password.clone(),
+                    })
+                } else {
+                    let local_port = db::transport_layer_tunnel::start_transport_layers(
+                        connection_id,
+                        &transport_layers[..transport_layers.len() - 1],
+                        &proxy.host,
+                        proxy.port,
+                        &self.tunnels,
+                        &self.proxy_tunnels,
+                        &self.http_tunnels,
+                    )
+                    .await?;
+                    Ok(crate::mq::config::MqSocksProxy {
+                        host: "127.0.0.1".to_string(),
+                        port: local_port,
+                        username: proxy.username.clone(),
+                        password: proxy.password.clone(),
+                    })
+                }
+            }
+            TransportLayerConfig::Proxy(_) => {
+                Err("RocketMQ requires a SOCKS5 proxy as the final proxy layer".to_string())
+            }
+            TransportLayerConfig::HttpTunnel(_) => {
+                Err("RocketMQ does not support an HTTP tunnel as the final transport layer".to_string())
+            }
+        }
+    }
+
+    #[cfg(feature = "mq-admin")]
     pub async fn mq_admin_config_for_connection(
         &self,
         connection_id: &str,
@@ -2666,6 +2750,12 @@ impl AppState {
         let mqc = crate::mq::config::MqAdminConfig::from_connection(config)?;
         if !config.has_effective_transport_layers() {
             return Ok(mqc);
+        }
+
+        if mqc.system_kind == crate::mq::types::MqSystemKind::RocketMq {
+            let transport_layers = self.resolved_transport_layers(config).await?;
+            let proxy = self.rocketmq_socks_proxy_for_transport_layers(connection_id, &transport_layers).await?;
+            return Ok(mqc.with_socks_proxy(&proxy.host, proxy.port, &proxy.username, &proxy.password));
         }
 
         if mqc.system_kind == crate::mq::types::MqSystemKind::RabbitMq {
@@ -3077,7 +3167,8 @@ impl AppState {
                 | PoolKind::DuckDbWorker(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
-                | PoolKind::Nacos => false,
+                | PoolKind::Nacos
+                | PoolKind::Consul(_) => false,
                 #[cfg(feature = "mq-admin")]
                 PoolKind::Mqtt(_) => false,
             }
@@ -3969,7 +4060,8 @@ impl AppState {
                 | PoolKind::DuckDbWorker(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
-                | PoolKind::Nacos => true,
+                | PoolKind::Nacos
+                | PoolKind::Consul(_) => true,
                 #[cfg(feature = "mq-admin")]
                 PoolKind::Mqtt(_) => true,
                 PoolKind::Redis(_) => unreachable!("Redis handled separately"),
@@ -3995,8 +4087,11 @@ impl AppState {
             }
         }
 
+        let mut detached_pool_keys = Vec::new();
         for (key, client, replace_runtime) in failed_agent_checks {
-            self.detach_agent_pool_if_current(&key, &client, replace_runtime).await;
+            if self.detach_agent_pool_if_current(&key, &client, replace_runtime).await {
+                detached_pool_keys.push(key);
+            }
         }
 
         // Remove dead pools
@@ -4020,13 +4115,20 @@ impl AppState {
                 }
             }
             drop(conns);
+            detached_pool_keys.extend(removed.iter().map(|(key, _)| key.clone()));
             self.pool_routing_control().finish_detach(removed).await;
         }
 
-        // Re-establish SSH tunnels that have died
-        let tunnel_connection_ids: Vec<String> = {
+        // Only failed pools may require a fresh transport. Healthy tunnel listeners must keep
+        // their local ports stable across app resume and visibility-triggered health checks.
+        let tunnel_connection_ids: HashSet<String> = {
             let configs = self.configs.read().await;
-            configs.iter().filter(|(_, c)| c.has_effective_transport_layers()).map(|(id, _)| id.clone()).collect()
+            detached_pool_keys
+                .iter()
+                .filter_map(|pool_key| config_for_pool_key(pool_key, &configs))
+                .filter(|config| config.has_effective_transport_layers())
+                .map(|config| config.id.clone())
+                .collect()
         };
         for connection_id in tunnel_connection_ids {
             self.reset_connection_transport(&connection_id).await;
@@ -4386,6 +4488,8 @@ fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
         parse_mqtt_broker_host_port(config).unwrap_or_else(|| (config.host.clone(), config.port))
     } else if config.db_type == DatabaseType::Nacos {
         parse_nacos_server_host_port(config).unwrap_or_else(|| (config.host.clone(), config.port))
+    } else if config.db_type == DatabaseType::Consul {
+        parse_consul_server_host_port(config).unwrap_or_else(|| (config.host.clone(), config.port))
     } else {
         (config.host.clone(), config.port)
     }
@@ -4455,6 +4559,21 @@ fn parse_nacos_server_host_port(config: &ConnectionConfig) -> Option<(String, u1
     let host = url.host_str()?.to_string();
     let port = url.port_or_known_default()?;
     Some((host, port))
+}
+
+fn parse_consul_server_host_port(config: &ConnectionConfig) -> Option<(String, u16)> {
+    let value = config
+        .external_config
+        .as_ref()?
+        .get("serverAddr")
+        .or_else(|| config.external_config.as_ref()?.get("server_addr"))?
+        .as_str()?
+        .trim();
+    if value.is_empty() {
+        return None;
+    }
+    let url = reqwest::Url::parse(value).ok()?;
+    Some((url.host_str()?.to_string(), url.port_or_known_default()?))
 }
 
 fn parse_mqtt_broker_host_port(config: &ConnectionConfig) -> Option<(String, u16)> {
@@ -4608,6 +4727,7 @@ fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
         }
         PoolKind::MessageQueue => PoolKind::MessageQueue,
         PoolKind::Nacos => PoolKind::Nacos,
+        PoolKind::Consul(client) => PoolKind::Consul(client.clone()),
         #[cfg(feature = "mq-admin")]
         PoolKind::Mqtt(client) => PoolKind::Mqtt(Arc::clone(client)),
         PoolKind::Redis(_) => panic!("clone_pool_kind not supported for Redis — handled separately"),
@@ -4669,6 +4789,7 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
         }
         PoolKind::MessageQueue => {}
         PoolKind::Nacos => {}
+        PoolKind::Consul(_) => {}
         #[cfg(feature = "mq-admin")]
         PoolKind::Mqtt(client) => {
             // 发送 DISCONNECT 并等待事件循环任务结束
@@ -5045,6 +5166,7 @@ mod tests {
             username: "root".to_string(),
             password: "secret".to_string(),
             database: database.map(str::to_string),
+            default_schema: None,
             visible_databases: None,
             visible_schemas: None,
             show_system_schemas: false,
@@ -7217,6 +7339,21 @@ for line in sys.stdin:
         let (state, dir) = test_app_state().await;
         let (runtime, target_client, sibling_client) =
             replace_runtime_on_error_clients(&dir, "validate_connection").await;
+        let mut config = mysql_config(None);
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            profile_id: String::new(),
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+        })];
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        state.connection_host_port(&config.id, &config).await.unwrap();
         {
             let mut connections = state.connections.write().await;
             connections.insert("conn:analytics".to_string(), PoolKind::Agent(target_client));
@@ -7226,7 +7363,35 @@ for line in sys.stdin:
         state.refresh_connections().await;
 
         assert!(state.connections.read().await.is_empty());
+        assert!(state.proxy_tunnels.local_port("conn:transport:0").await.is_none());
         assert!(runtime.is_failed());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn global_health_preserves_transport_for_connections_without_failed_pools() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-connection".to_string();
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            profile_id: String::new(),
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 65000,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+        })];
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        let (_, local_port) = state.connection_host_port(&config.id, &config).await.unwrap();
+
+        state.refresh_connections().await;
+
+        assert_eq!(state.proxy_tunnels.local_port("proxied-connection:transport:0").await, Some(local_port));
+        state.reset_connection_transport(&config.id).await;
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7739,6 +7904,50 @@ for line in sys.stdin:
         assert_eq!(connect_override.host, "127.0.0.1");
         assert_ne!(connect_override.port, 8443);
         state.proxy_tunnels.stop_tunnel("proxied-mq:transport:0").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn rocketmq_transport_passes_socks_proxy_to_multi_endpoint_client() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(None);
+        config.id = "proxied-rocketmq".to_string();
+        config.db_type = DatabaseType::MessageQueue;
+        config.host = "172.19.191.166".to_string();
+        config.port = 9876;
+        config.external_config = Some(serde_json::json!({
+            "systemKind": "rocketmq",
+            "adminUrl": "",
+            "auth": { "kind": "none" },
+            "extra": { "namesrvAddr": "172.19.191.166:9876" }
+        }));
+        config.transport_layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            profile_id: String::new(),
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: "proxy-user".to_string(),
+            password: "proxy-secret".to_string(),
+            test_target: None,
+        })];
+
+        let endpoint = state.connection_host_port("proxied-rocketmq", &config).await.unwrap();
+        assert_eq!(endpoint, ("172.19.191.166".to_string(), 9876));
+        assert!(state.proxy_tunnels.local_port("proxied-rocketmq:transport:0").await.is_none());
+
+        let mqc = state.mq_admin_config_for_connection("proxied-rocketmq", &config).await.unwrap();
+
+        let socks_proxy = mqc.socks_proxy.expect("RocketMQ transport should configure SOCKS5 routing");
+        assert_eq!(socks_proxy.host, "proxy.internal");
+        assert_eq!(socks_proxy.port, 1080);
+        assert_eq!(socks_proxy.username, "proxy-user");
+        assert_eq!(socks_proxy.password, "proxy-secret");
+        assert!(mqc.connect_override.is_none());
+        assert!(state.proxy_tunnels.local_port("proxied-rocketmq:transport:0").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

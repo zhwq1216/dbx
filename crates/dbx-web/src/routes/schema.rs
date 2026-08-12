@@ -44,6 +44,15 @@ pub async fn list_databases(
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
+pub async fn list_database_metadata(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let result =
+        dbx_core::schema::list_database_metadata_core(&state.app, &q.connection_id).await.map_err(AppError::from)?;
+    Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
 pub async fn list_database_storage(
     State(state): State<Arc<WebState>>,
     Json(request): Json<DatabaseStorageRequest>,
@@ -252,11 +261,15 @@ pub async fn list_objects(
                 schema: Some(database.to_string()),
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: table.comment,
                 created_at: None,
                 updated_at: None,
                 parent_schema: table.parent_schema,
                 parent_name: table.parent_name,
+                trigger: None,
+                xugu_type_members_expandable: None,
             })
             .collect::<Vec<_>>()
     } else {
@@ -332,44 +345,72 @@ pub async fn get_object_source(
     Ok(Json(result))
 }
 
-/// 确保前端页面点击刷新时能清理缓存，发送 /api/schema/cache-prefix?prefix=object-meta:v1:
-const KEY_PREFIX: &str = "object-meta:v1";
-const KEY_SEPARATOR: &str = ":";
+pub async fn get_custom_type_details(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<SchemaQuery>,
+) -> Result<Json<dbx_core::db::CustomTypeDetails>, AppError> {
+    let database = q.database.as_deref().unwrap_or("");
+    let schema = q.schema.as_deref().unwrap_or("");
+    let name = q.table.as_deref().unwrap_or("");
+    let result = dbx_core::schema::get_custom_type_details_core(&state.app, &q.connection_id, database, schema, name)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(result))
+}
 
-/// Builds a cache key for a metadata operation.
-///
-/// Format: `object-meta:v1:{connection_id}:{database}:{schema}:{operation}`
-///
-fn metadata_cache_key(connection_id: &str, database: &str, segments: &[&str]) -> String {
-    let mut key = String::with_capacity(
-        20 + connection_id.len() + database.len() + segments.iter().map(|segment| segment.len()).sum::<usize>(),
-    );
-    key.push_str(KEY_PREFIX);
-    key.push_str(KEY_SEPARATOR);
-    key.push_str(connection_id);
-    key.push_str(KEY_SEPARATOR);
-    key.push_str(database);
-    for segment in segments {
-        key.push_str(KEY_SEPARATOR);
-        key.push_str(segment);
+const OBJECT_METADATA_CACHE_PREFIX: &str = "object-meta:v1";
+
+fn metadata_cache_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')' => {
+                encoded.push(byte as char)
+            }
+            _ => {
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
     }
-    key
+    encoded
 }
 
-/// Reads a cached metadata value for `T`; `None` when absent or expired.
-fn decode_metadata_cache<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, AppError> {
-    serde_json::from_value(value).map_err(|error| AppError::from(format!("Failed to decode metadata cache: {error}")))
+fn metadata_cache_key(
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    catalog: Option<&str>,
+    facet: &str,
+) -> String {
+    [
+        OBJECT_METADATA_CACHE_PREFIX.to_string(),
+        metadata_cache_segment(connection_id),
+        metadata_cache_segment(database),
+        metadata_cache_segment(schema),
+        metadata_cache_segment(table),
+        metadata_cache_segment(catalog.unwrap_or("")),
+        facet.to_string(),
+        String::new(),
+    ]
+    .join(":")
 }
 
-/// Wraps a metadata load with the state.storage cache: returns the
-/// cached value when present, otherwise runs `loader` and stores its successful
-/// result under `(connection_id, database, segments…)` forever.
-/// Only successful results are cached; errors propagate unchanged.
+fn decode_metadata_cache<T: DeserializeOwned>(value: serde_json::Value) -> Option<T> {
+    serde_json::from_value(value).ok()
+}
+
 async fn cached_metadata<T, F, Fut>(
     state: &AppState,
     connection_id: &str,
     database: &str,
-    segments: &[&str],
+    schema: &str,
+    table: &str,
+    catalog: Option<&str>,
+    facet: &str,
     loader: F,
 ) -> Result<T, AppError>
 where
@@ -377,16 +418,21 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, AppError>>,
 {
-    let key = metadata_cache_key(connection_id, database, segments);
-    let cached_rs = state.storage.load_schema_cache(&key).await.map_err(|e| AppError::from(e.to_string()))?;
-    if cached_rs.is_some() {
-        return decode_metadata_cache(cached_rs.unwrap());
+    let key = metadata_cache_key(connection_id, database, schema, table, catalog, facet);
+    if let Ok(Some(cached)) = state.storage.load_schema_cache(&key).await {
+        if let Some(value) = decode_metadata_cache(cached) {
+            return Ok(value);
+        }
     }
     let value = loader().await?;
     if let Ok(encoded) = serde_json::to_value(&value) {
-        state.storage.save_schema_cache(&key, &encoded).await.map_err(|e| AppError::from(e.to_string()))?;
+        let _ = state.storage.save_schema_cache(&key, &encoded).await;
     }
     Ok(value)
+}
+
+fn should_cache_columns(client_session_id: Option<&str>) -> bool {
+    client_session_id.is_none()
 }
 
 pub async fn list_columns(
@@ -396,32 +442,40 @@ pub async fn list_columns(
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
     let table = q.table.as_deref().unwrap_or("");
-    let result =
-        cached_metadata(&state.app, &q.connection_id, &database, &[&schema, &table, "list_columns"], async || {
-            if let Some(catalog) = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await {
-                dbx_core::schema::get_doris_catalog_columns_core(
-                    &state.app,
-                    &q.connection_id,
-                    &catalog,
-                    database,
-                    table,
-                )
+    let catalog = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await;
+    let load_columns = || async {
+        if let Some(catalog) = catalog.as_deref() {
+            dbx_core::schema::get_doris_catalog_columns_core(&state.app, &q.connection_id, catalog, database, table)
                 .await
                 .map_err(AppError::from)
-            } else {
-                dbx_core::schema::get_columns_core_for_session(
-                    &state.app,
-                    &q.connection_id,
-                    database,
-                    schema,
-                    table,
-                    q.client_session_id.as_deref(),
-                )
-                .await
-                .map_err(AppError::from)
-            }
-        })
-        .await?;
+        } else {
+            dbx_core::schema::get_columns_core_for_session(
+                &state.app,
+                &q.connection_id,
+                database,
+                schema,
+                table,
+                q.client_session_id.as_deref(),
+            )
+            .await
+            .map_err(AppError::from)
+        }
+    };
+    let result = if should_cache_columns(q.client_session_id.as_deref()) {
+        cached_metadata(
+            &state.app,
+            &q.connection_id,
+            database,
+            schema,
+            table,
+            catalog.as_deref(),
+            "backend-columns",
+            load_columns,
+        )
+        .await?
+    } else {
+        load_columns().await?
+    };
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
@@ -454,13 +508,21 @@ pub async fn list_indexes(
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
     let table = q.table.as_deref().unwrap_or("");
-    let result =
-        cached_metadata(&state.app, &q.connection_id, &database, &[&schema, &table, "list_indexes"], async || {
-            if let Some(catalog) = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await {
+    let catalog = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await;
+    let result = cached_metadata(
+        &state.app,
+        &q.connection_id,
+        database,
+        schema,
+        table,
+        catalog.as_deref(),
+        "backend-indexes",
+        || async {
+            if let Some(catalog) = catalog.as_deref() {
                 dbx_core::schema::list_doris_catalog_indexes_core(
                     &state.app,
                     &q.connection_id,
-                    &catalog,
+                    catalog,
                     database,
                     table,
                 )
@@ -471,8 +533,9 @@ pub async fn list_indexes(
                     .await
                     .map_err(AppError::from)
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
@@ -483,13 +546,21 @@ pub async fn list_foreign_keys(
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
     let table = q.table.as_deref().unwrap_or("");
-    let result =
-        cached_metadata(&state.app, &q.connection_id, &database, &[&schema, &table, "list_foreign_keys"], async || {
-            if let Some(catalog) = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await {
+    let catalog = external_doris_catalog(&state, &q.connection_id, q.catalog.as_deref()).await;
+    let result = cached_metadata(
+        &state.app,
+        &q.connection_id,
+        database,
+        schema,
+        table,
+        catalog.as_deref(),
+        "backend-foreign-keys",
+        || async {
+            if let Some(catalog) = catalog.as_deref() {
                 dbx_core::schema::list_doris_catalog_foreign_keys_core(
                     &state.app,
                     &q.connection_id,
-                    &catalog,
+                    catalog,
                     database,
                     table,
                 )
@@ -500,8 +571,9 @@ pub async fn list_foreign_keys(
                     .await
                     .map_err(AppError::from)
             }
-        })
-        .await?;
+        },
+    )
+    .await?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
 }
 
@@ -675,4 +747,44 @@ pub async fn list_available_extensions(
         .await
         .map_err(AppError::from)?;
     Ok(Json(serde_json::to_value(result).map_err(|e| AppError::from(e.to_string()))?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metadata_cache_keys_match_table_invalidation_prefixes() {
+        let key = metadata_cache_key("conn:1", "db% name", "sch/ema", "表:名", Some("ice:berg"), "backend-columns");
+
+        assert_eq!(
+            key,
+            "object-meta:v1:conn%3A1:db%25%20name:sch%2Fema:%E8%A1%A8%3A%E5%90%8D:ice%3Aberg:backend-columns:"
+        );
+        assert!(key.starts_with("object-meta:v1:conn%3A1:db%25%20name:sch%2Fema:%E8%A1%A8%3A%E5%90%8D:"));
+    }
+
+    #[test]
+    fn metadata_cache_keys_isolate_catalogs_and_facets() {
+        let iceberg_columns = metadata_cache_key("c1", "sales", "", "orders", Some("iceberg"), "backend-columns");
+        let hive_columns = metadata_cache_key("c1", "sales", "", "orders", Some("hive"), "backend-columns");
+        let iceberg_indexes = metadata_cache_key("c1", "sales", "", "orders", Some("iceberg"), "backend-indexes");
+        let internal_columns = metadata_cache_key("c1", "sales", "", "orders", None, "backend-columns");
+
+        assert_ne!(iceberg_columns, hive_columns);
+        assert_ne!(iceberg_columns, iceberg_indexes);
+        assert_eq!(internal_columns, "object-meta:v1:c1:sales::orders::backend-columns:");
+    }
+
+    #[test]
+    fn session_scoped_columns_bypass_persistent_cache() {
+        assert!(should_cache_columns(None));
+        assert!(!should_cache_columns(Some("oracle-session")));
+        assert!(!should_cache_columns(Some("")));
+    }
+
+    #[test]
+    fn invalid_cache_payloads_are_treated_as_misses() {
+        assert_eq!(decode_metadata_cache::<Vec<String>>(serde_json::json!({ "unexpected": true })), None);
+    }
 }

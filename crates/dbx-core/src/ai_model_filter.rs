@@ -98,6 +98,9 @@ pub(crate) fn model_is_assistant_compatible(provider: &AiProvider, model_id: &st
         | AiProvider::PiAgentCli
         | AiProvider::OpenCodeCli
         | AiProvider::CursorCli
+        | AiProvider::GrokCli
+        | AiProvider::CodeBuddyCli
+        | AiProvider::QoderCli
         | AiProvider::MiniMax
         | AiProvider::Custom => true,
     }

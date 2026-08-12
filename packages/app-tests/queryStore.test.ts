@@ -59,6 +59,14 @@ function oracleConn(id: string): ConnectionConfig {
   };
 }
 
+function sapHanaConn(id: string): ConnectionConfig {
+  return {
+    ...conn(id),
+    db_type: "saphana",
+    port: 30015,
+  };
+}
+
 function clearableQuerySchemaConn(id: string, dbType: "oracle" | "dameng" | "gaussdb" | "oceanbase-oracle"): ConnectionConfig {
   return {
     ...conn(id),
@@ -1296,6 +1304,27 @@ test("removing the active result run selects an adjacent run", async () => {
   assert.deepEqual(tab.result?.columns, ["one"]);
 });
 
+test("closing an ordinary query result preserves the query tab", async () => {
+  setActivePinia(createPinia());
+  const store = useQueryStore();
+  const tabId = store.createTab("conn-1", "db");
+  const tab = store.tabs.find((item) => item.id === tabId);
+  assert.ok(tab);
+
+  tab.sql = "select draft";
+  tab.result = { columns: ["one"], rows: [[1]], affected_rows: 0, execution_time_ms: 1 };
+  tab.lastExecutedSql = "select 1";
+
+  assert.equal(await store.closeQueryResult(tabId), true);
+
+  assert.equal(tab.sql, "select draft");
+  assert.equal(tab.connectionId, "conn-1");
+  assert.equal(tab.database, "db");
+  assert.equal(tab.result, undefined);
+  assert.equal(tab.results, undefined);
+  assert.equal(tab.activeResultRunId, undefined);
+});
+
 test("removing the active result run clears output when remaining caches are unavailable", async () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
@@ -1878,6 +1907,109 @@ test("normalizes unquoted Oracle query identifiers before loading editable metad
     assert.equal(tab?.tableMeta?.tableName, "USERS");
     assert.deepEqual(tab?.querySourceColumns, ["ID", "NAME"]);
     assert.equal(tab?.queryEditabilityReason, undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("normalizes only unquoted SAP HANA query identifiers before loading editable metadata", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  const columnRequests: Array<{ schema: string | null; table: string | null }> = [];
+
+  connectionStore.addEphemeralConnection(sapHanaConn("saphana-1"));
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    const url = String(input);
+    if (url === "/api/query/execute-multi") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const quoted = body.sql.includes('"mixedCase"');
+      return new Response(
+        JSON.stringify([
+          {
+            columns: quoted ? ["id"] : ["ID", "NAME"],
+            rows: quoted ? [[1]] : [[1, "Ada"]],
+            affected_rows: 0,
+            execution_time_ms: 1,
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/query/analyze-editability") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      const quoted = body.sql.includes('"mixedCase"');
+      return new Response(
+        JSON.stringify({
+          editable: true,
+          analysis: {
+            schema: quoted ? "mixedSchema" : "saphanadb",
+            schemaQuoted: quoted,
+            tableName: quoted ? "mixedCase" : "zmmt0003",
+            tableNameQuoted: quoted,
+            tableAlias: undefined,
+            selectStar: false,
+            columns: quoted
+              ? [{ sourceName: "id", sourceNameQuoted: true, resultName: "id", expression: '"id"' }]
+              : [
+                  { sourceName: "id", sourceNameQuoted: false, resultName: "ID", expression: "id" },
+                  { sourceName: "name", sourceNameQuoted: false, resultName: "NAME", expression: "name" },
+                ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url.startsWith("/api/schema/columns?")) {
+      const params = new URL(url, "http://localhost").searchParams;
+      const schema = params.get("schema");
+      const table = params.get("table");
+      columnRequests.push({ schema, table });
+      const columns =
+        schema === "SAPHANADB" && table === "ZMMT0003"
+          ? [
+              { name: "ID", data_type: "INTEGER", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: "identifier" },
+              { name: "NAME", data_type: "NVARCHAR", is_nullable: true, column_default: null, is_primary_key: false, extra: null, comment: "display name" },
+            ]
+          : schema === "mixedSchema" && table === "mixedCase"
+            ? [{ name: "id", data_type: "INTEGER", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null }]
+            : [];
+      return new Response(JSON.stringify(columns), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "/api/query/prepare-pagination-plan") {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      return new Response(JSON.stringify({ sqlToExecute: body.options.sql, useAgentResultSession: false }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const unquotedTabId = store.createTab("saphana-1", "SYSTEMDB", "Unquoted", "query", "saphanadb");
+    await store.executeTabSql(unquotedTabId, "select id, name from zmmt0003");
+
+    const unquotedTab = store.tabs.find((item) => item.id === unquotedTabId);
+    await waitFor(() => columnRequests.length > 0 && unquotedTab?.tableMeta?.tableName === "ZMMT0003");
+    assert.deepEqual(columnRequests[0], { schema: "SAPHANADB", table: "ZMMT0003" });
+    assert.equal(unquotedTab?.tableMeta?.schema, "SAPHANADB");
+    assert.deepEqual(unquotedTab?.querySourceColumns, ["ID", "NAME"]);
+    assert.equal(unquotedTab?.queryEditabilityReason, undefined);
+
+    const quotedTabId = store.createTab("saphana-1", "SYSTEMDB", "Quoted", "query", "ignored");
+    await store.executeTabSql(quotedTabId, 'select "id" from "mixedSchema"."mixedCase"');
+
+    const quotedTab = store.tabs.find((item) => item.id === quotedTabId);
+    await waitFor(() => columnRequests.length > 1 && quotedTab?.tableMeta?.tableName === "mixedCase");
+    assert.deepEqual(columnRequests[1], { schema: "mixedSchema", table: "mixedCase" });
+    assert.equal(quotedTab?.tableMeta?.schema, "mixedSchema");
+    assert.deepEqual(quotedTab?.querySourceColumns, ["id"]);
+    assert.equal(quotedTab?.queryEditabilityReason, undefined);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -3818,14 +3950,17 @@ test("MongoDB query result export rejects pagination-plan failures without repla
   }
 });
 
-test("jdbc query pagination uses result sessions without capping max rows to one page", async () => {
+test("jdbc query pagination sends the Agent-safe unlimited row boundary when the global limit is disabled", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
+  const settingsStore = useSettingsStore();
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
   let prepareBody: any;
   let executeBody: any;
+
+  settingsStore.updateEditorSettings({ queryResultMaxRowsEnabled: false });
 
   connectionStore.addEphemeralConnection({
     ...conn("jdbc-1"),
@@ -3882,7 +4017,7 @@ test("jdbc query pagination uses result sessions without capping max rows to one
     assert.equal(prepareBody.options.useAgentCursor, true);
     assert.equal(executeBody.pageSize, 100);
     assert.equal(executeBody.fetchSize, 100);
-    assert.equal(executeBody.maxRows, 100000);
+    assert.equal(executeBody.maxRows, 2147483647);
     assert.equal(executeBody.clientSessionId, tabId);
     assert.equal(tab.resultSessionId, "session-1");
     assert.equal(tab.result?.has_more, true);
@@ -4541,6 +4676,60 @@ test("mongo createIndex execution uses the dedicated create-index endpoint", asy
     });
     assert.deepEqual(tab?.result?.columns, ["name"]);
     assert.deepEqual(tab?.result?.rows, [["users_email_unique"]]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
+test("mongo createUser execution follows a preceding use command", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+  let createUserBody: any;
+
+  connectionStore.addEphemeralConnection({
+    ...conn("mongo-1"),
+    db_type: "mongodb",
+    port: 27017,
+  });
+
+  globalThis.fetch = withConnectionHealthMock(async (input, init) => {
+    if (String(input) === "/api/mongo/create-user") {
+      createUserBody = JSON.parse(String(init?.body ?? "{}"));
+      return Response.json({ affected_rows: 1 });
+    }
+    return new Response("unexpected request", { status: 500 });
+  });
+
+  try {
+    const tabId = store.createTab("mongo-1", "accounting", "Query", "query", "");
+    await store.executeTabSql(
+      tabId,
+      `use admin
+
+db.createUser({
+  user: "test-db",
+  pwd: "test-password",
+  roles: [{ role: "readWrite", db: "db1" }]
+})`,
+    );
+    const tab = store.tabs.find((item) => item.id === tabId);
+
+    assert.deepEqual(createUserBody, {
+      connectionId: "mongo-1",
+      database: "admin",
+      userJson: '{"user":"test-db","pwd":"test-password","roles":[{"role":"readWrite","db":"db1"}]}',
+    });
+    assert.equal(tab?.database, "admin");
+    assert.equal(tab?.results?.length, 2);
+    assert.deepEqual(tab?.results?.[0]?.rows, [["switched to db admin"]]);
+    assert.deepEqual(tab?.results?.[1]?.columns, []);
+    assert.deepEqual(tab?.results?.[1]?.rows, []);
+    assert.equal(tab?.results?.[1]?.affected_rows, 1);
+    assert.equal(tab?.results?.[1]?.sourceLabel, undefined);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -5914,6 +6103,42 @@ test("closing a data tab releases its tab-scoped client session", async () => {
   }
 });
 
+test("closing a MySQL dashboard releases its tab-scoped client session", async () => {
+  const restoreStorage = installMemoryStorage();
+  setActivePinia(createPinia());
+  const connectionStore = useConnectionStore();
+  const store = useQueryStore();
+  const originalFetch = globalThis.fetch;
+
+  connectionStore.addEphemeralConnection({ ...conn("mysql-1"), db_type: "mysql", port: 3306, database: "app" });
+  const tabId = store.openMysqlDashboard("mysql-1");
+  const closedSessions: any[] = [];
+
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === "/api/query/close-client-session") {
+      closedSessions.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify(true), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("unexpected request", { status: 500 });
+  };
+
+  try {
+    store.closeTab(tabId, { force: true });
+
+    await waitFor(() => closedSessions.some((body) => body.clientSessionId === tabId));
+    assert.ok(
+      closedSessions.some((body) => body.connectionId === "mysql-1" && body.database === "" && body.clientSessionId === tabId),
+      `expected close-client-session for MySQL dashboard, got ${JSON.stringify(closedSessions)}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreStorage();
+  }
+});
+
 for (const dbType of ["oracle", "dameng", "gaussdb", "oceanbase-oracle"] as const) {
   test(`clearing a ${dbType} query schema releases its tab-scoped client session`, async () => {
     const restoreStorage = installMemoryStorage();
@@ -6252,7 +6477,7 @@ for (const resultState of [
   { label: "truncated", result: { truncated: true, has_more: false } },
   { label: "ambiguous exhaustion", result: {} },
 ]) {
-  test(`oracle agent ${resultState.label} short page uses COUNT instead of inferring 10000`, async () => {
+  test(`oracle agent ${resultState.label} short page uses COUNT and caps the configured result total`, async () => {
     const restoreStorage = installMemoryStorage();
     setActivePinia(createPinia());
     const connectionStore = useConnectionStore();
@@ -6310,11 +6535,11 @@ for (const resultState of [
 
     try {
       await store.executeTabSql(tabId, "SELECT ID FROM LARGE_TABLE");
-      await waitFor(() => tab.resultTotalRowCount === 3_357_833);
+      await waitFor(() => tab.resultTotalRowCount === 100_000);
 
       assert.equal(countRequests, 1);
       assert.equal(tab.result?.rows.length, 10_000);
-      assert.notEqual(tab.resultTotalRowCount, 10_000);
+      assert.equal(tab.resultTotalRowCount, 100_000);
     } finally {
       globalThis.fetch = originalFetch;
       restoreStorage();

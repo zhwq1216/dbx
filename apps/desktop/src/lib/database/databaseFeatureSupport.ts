@@ -79,7 +79,7 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
 }
 
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos" && dbType !== "hbase";
+  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase";
 }
 
 /**
@@ -165,6 +165,10 @@ export function supportsDriverManagement(dbType?: DatabaseType): boolean {
 
 export function supportsObjectBrowser(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "objectBrowser");
+}
+
+export function supportsConnectionDatabaseBrowser(dbType?: DatabaseType): boolean {
+  return supportsObjectBrowser(dbType);
 }
 
 export function supportsObjectBrowserTreeNode(dbType: DatabaseType | undefined, nodeType: TreeNodeType): boolean {
