@@ -112,12 +112,15 @@ jobs:
       - name: Build frontend
         run: pnpm build
 
-      - name: Build DBX for Windows 7 i686
+      
+
+
+      - name: Build DBX for Windows 7 x86_64
         shell: pwsh
         run: |
-          cargo build --locked --package dbx-web --release --no-default-features --features duckdb-sidecar,mq-admin --target i686-win7-windows-msvc -Z build-std=std,panic_abort
+          cargo build --locked --package dbx-web --release --no-default-features --features duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
       
-      - name: Upload Windows portable i686 ZIP
+      - name: Upload Windows portable x86_64 ZIP
 
         timeout-minutes: 20
         shell: pwsh
@@ -125,12 +128,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
-          $arch = "i686"
+          $arch = "x86_64"
           $portableRoot = "portable"
           $portableDir = Join-Path $portableRoot "DBX_${version}_${arch}"
           $zipName = "dbx-web_${version}_${arch}-browser-static.zip"
           $zipSha256 = "dbx-web_${version}_${arch}-browser-static.zip.sha256"
-          $exePath = "target/i686-win7-windows-msvc/release/dbx-web.exe"
+          $exePath = "target/x86_64-win7-windows-msvc/release/dbx-web.exe"
           $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx-web" } | Select-Object -First 1).version
 
@@ -158,14 +161,13 @@ jobs:
           Set-Content -Path $zipSha256 -Value $zip_sha256 -Encoding utf8NoBOM
 
           gh release upload "${env:GITHUB_REF_NAME}" $zipName $zipSha256 --repo "${env:GITHUB_REPOSITORY}" --clobber
-
-
-      - name: Build DBX for Windows 7 x86_64
+      
+      - name: Build DBX for Windows 7 i686
         shell: pwsh
         run: |
-          cargo build --locked --package dbx-web --release --no-default-features --features duckdb-sidecar,mq-admin --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
+          cargo build --locked --package dbx-web --release --no-default-features --features duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled --target i686-win7-windows-msvc -Z build-std=std,panic_abort
       
-      - name: Upload Windows portable x86_64 ZIP
+      - name: Upload Windows portable i686 ZIP
 
         timeout-minutes: 20
         shell: pwsh
@@ -173,12 +175,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
-          $arch = "x86_64"
+          $arch = "i686"
           $portableRoot = "portable"
           $portableDir = Join-Path $portableRoot "DBX_${version}_${arch}"
           $zipName = "dbx-web_${version}_${arch}-browser-static.zip"
           $zipSha256 = "dbx-web_${version}_${arch}-browser-static.zip.sha256"
-          $exePath = "target/x86_64-win7-windows-msvc/release/dbx-web.exe"
+          $exePath = "target/i686-win7-windows-msvc/release/dbx-web.exe"
           $cargoMetadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           $appVersion = ($cargoMetadata.packages | Where-Object { $_.name -eq "dbx-web" } | Select-Object -First 1).version
 
@@ -269,7 +271,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: |
           cargo zigbuild --release -p dbx-web --target ${{ matrix.target }} \
-            --no-default-features --features "duckdb-sidecar,mq-admin"
+            --no-default-features --features "duckdb-sidecar,dynamodb,mq-admin,dbx-core/sqlite-bundled"
 
       - name: Package static browser runtime
         env:
