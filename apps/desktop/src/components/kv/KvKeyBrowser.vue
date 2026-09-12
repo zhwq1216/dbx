@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { Pane, Splitpanes } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { Activity, Check, ChevronDown, ChevronRight, Clock3, Copy, Download, FolderClosed, FolderOpen, KeyRound, Loader2, LockKeyhole, Pencil, Plus, RefreshCw, Search, Square, Trash2 } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -23,7 +24,7 @@ import { decideKvMetadataRefresh, hasPositiveKvLease, knownKvLeaseSummaries, mer
 import { classifyKvMutationError, type KvMutationErrorKind } from "@/lib/kv/kvMutationError";
 import { refreshedKvSelectionSummary } from "@/lib/kv/kvRefreshSelection";
 import { parseKvLeaseId, parseOptionalTtl } from "@/lib/kv/kvTtl";
-import { formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kv/kvValueDisplay";
+import { decodeBase64Utf8Preview, formatZooKeeperMetadataRows, formatZooKeeperSummaryBadges, prettyPrintJsonText } from "@/lib/kv/kvValueDisplay";
 import { formatTtl } from "@/lib/common/ttlFormat";
 import {
   createLazyKvKeyTreeState,
@@ -117,6 +118,8 @@ interface KvKeyBrowserLabels {
   copy?: string;
   copied?: string;
   copyFailed?: string;
+  utf8PreviewLossy?: string;
+  utf8PreviewUnavailable?: string;
   valueTooLarge?: string;
   deletePrefix?: string;
   selectAll?: string;
@@ -194,11 +197,13 @@ const props = withDefaults(
     safeWrite?: boolean;
     maxValueBytes?: number;
     allowBinaryEdit?: boolean;
+    enableBase64Utf8Preview?: boolean;
     readOnly?: boolean;
     exportFormat?: string;
     exportFileExtension?: string;
     exportFallbackName?: string;
     enableMultiSelect?: boolean;
+    canWriteKey?: (route: KvKeyRoute) => boolean;
     onWatchKey?: (route: KvKeyRoute) => void;
     onDeletePrefix?: (prefix: string) => void;
     watchActiveKey?: string | null;
@@ -220,6 +225,7 @@ const props = withDefaults(
     safeWrite: false,
     maxValueBytes: 0,
     allowBinaryEdit: false,
+    enableBase64Utf8Preview: false,
     readOnly: false,
     exportFormat: "dbx-kv-bundle",
     exportFileExtension: ".dbx-kv.json",
@@ -237,6 +243,7 @@ const emit = defineEmits<{
 const { t } = useI18n();
 const { toast } = useToast();
 const connectionStore = useConnectionStore();
+const settingsStore = useSettingsStore();
 const searchInputRef = ref<HTMLInputElement>();
 const prefix = ref("");
 const keySuggestionOpen = ref(false);
@@ -248,6 +255,7 @@ const listRevision = ref<KvInt64 | null>(null);
 const listFilteredByAcls = ref(false);
 const loading = ref(false);
 const loadingMore = ref(false);
+const listError = ref("");
 const expandedGroupIds = ref<Set<string>>(new Set());
 const selectedKey = ref<string | null>(null);
 const selectedKeyIdentity = ref<string | null>(null);
@@ -287,6 +295,7 @@ const showHistoryDiff = ref(false);
 const restoring = ref(false);
 const selectedCreateMode = ref<KvCreateMode>("persistent");
 const selectedPrettyValue = ref<string | null>(null);
+const selectedBase64ViewMode = ref<"utf8" | "base64">("utf8");
 const selectedValueCopied = ref(false);
 const lazyTreeState = reactive(createLazyKvKeyTreeState(lazyKvRootPath(props.lazyPathStyle), props.lazyPathStyle));
 const multiSelectedKeys = ref<Map<string, KvMultiSelection>>(new Map());
@@ -382,9 +391,44 @@ const selectedTextValue = computed(() => {
   if (!value) return "";
   return value.encoding === "utf8" ? value.data : value.data;
 });
-const displayedSelectedTextValue = computed(() => selectedPrettyValue.value ?? selectedTextValue.value);
 const selectedValueIsBase64 = computed(() => selectedValue.value?.value?.encoding === "base64");
+const selectedBase64Utf8Preview = computed(() => {
+  if (!props.enableBase64Utf8Preview || !selectedValueIsBase64.value) return null;
+  return decodeBase64Utf8Preview(selectedTextValue.value);
+});
+const showSelectedBase64Utf8Controls = computed(() => props.enableBase64Utf8Preview && selectedValueIsBase64.value);
+const selectedBase64DisplayMode = computed<"utf8" | "base64">(() => (selectedBase64ViewMode.value === "utf8" && selectedBase64Utf8Preview.value?.ok ? "utf8" : "base64"));
+const selectedValueUsesUtf8Preview = computed(() => showSelectedBase64Utf8Controls.value && selectedBase64DisplayMode.value === "utf8");
+const selectedBase64Utf8PreviewIsLossy = computed(() => {
+  const preview = selectedBase64Utf8Preview.value;
+  return preview?.ok === true && preview.lossy;
+});
+const selectedBase64Utf8PreviewUnavailable = computed(() => selectedBase64Utf8Preview.value?.ok === false);
+const displayedSelectedTextValue = computed(() => {
+  if (selectedPrettyValue.value != null) return selectedPrettyValue.value;
+  const preview = selectedBase64Utf8Preview.value;
+  return selectedValueUsesUtf8Preview.value && preview?.ok ? preview.value : selectedTextValue.value;
+});
+const selectedValueClipboardText = computed(() => {
+  const preview = selectedBase64Utf8Preview.value;
+  return selectedValueUsesUtf8Preview.value && preview?.ok ? preview.value : selectedTextValue.value;
+});
 const selectedKeyBytes = computed(() => selectedValue.value?.keyBytes ?? selectedRouteKeyBytes.value ?? null);
+function keyIsWritable(key: string, keyBytes?: KvValue | null): boolean {
+  return !props.readOnly && (props.canWriteKey?.({ key, keyBytes }) ?? true);
+}
+const selectedKeyWritable = computed(() => Boolean(selectedKey.value && keyIsWritable(selectedKey.value, selectedKeyBytes.value)));
+const editKeyWritable = computed(() => {
+  const key = editKey.value.trim();
+  if (!key) return false;
+  const keyBytes = !isCreating.value && key === selectedKey.value ? selectedKeyBytes.value : null;
+  return keyIsWritable(key, keyBytes);
+});
+const renameTargetWritable = computed(() => {
+  const target = renameValue.value.trim();
+  if (!target) return false;
+  return keyIsWritable(target) && (renameMode.value === "copy" || selectedKeyWritable.value);
+});
 const selectedKeyLocked = computed(() => Boolean(String(selectedMetadata.value?.session ?? "").trim()));
 const isWatchingSelectedKey = computed(() => Boolean(selectedKey.value && props.watchActiveKey === selectedKey.value));
 const activeSearchHighlight = computed(() => (props.searchHighlight?.key === selectedKey.value ? props.searchHighlight : null));
@@ -432,8 +476,8 @@ const editValueSize = computed(() => {
   }
   return new TextEncoder().encode(editValue.value).length;
 });
-const canEditSelectedValue = computed(() => !props.readOnly && !selectedKeyLocked.value && (!selectedValueIsBase64.value || props.allowBinaryEdit));
-const canDeleteSelectedValue = computed(() => !props.readOnly && !selectedKeyLocked.value);
+const canEditSelectedValue = computed(() => selectedKeyWritable.value && !selectedKeyLocked.value && (!selectedValueIsBase64.value || props.allowBinaryEdit));
+const canDeleteSelectedValue = computed(() => selectedKeyWritable.value && !selectedKeyLocked.value);
 const consulMetadataRows = computed(() => {
   const metadata = selectedMetadata.value;
   return [
@@ -590,6 +634,7 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
   const keyIdentityToRestore = options.preserveSelection ? selectedKeyIdentity.value : null;
   if (reset) {
     loading.value = true;
+    listError.value = "";
     continuation.value = null;
     listRevision.value = null;
     listFilteredByAcls.value = false;
@@ -618,6 +663,10 @@ async function loadKeys(reset = true, options: LoadKeysOptions = {}) {
         clearSelectedKey();
       }
     }
+  } catch (error) {
+    if (reset && generation === keyLoadGeneration && props.connectionId === connectionId) {
+      listError.value = error instanceof Error ? error.message : String(error);
+    }
   } finally {
     if (generation === keyLoadGeneration && props.connectionId === connectionId) {
       loading.value = false;
@@ -640,6 +689,7 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
   };
   const previousExpanded = new Set(expandedGroupIds.value);
   loading.value = true;
+  listError.value = "";
   loadingMore.value = false;
   listFilteredByAcls.value = false;
   if (!options.preserveSelection) {
@@ -692,6 +742,10 @@ async function loadLazyRoot(reset = true, options: LoadKeysOptions = {}) {
       }
     } else {
       expandedGroupIds.value = focusedRootExpansion(rootPath);
+    }
+  } catch (error) {
+    if (lazyLoadContextValid(context)) {
+      listError.value = error instanceof Error ? error.message : String(error);
     }
   } finally {
     if (lazyLoadContextValid(context)) loading.value = false;
@@ -843,6 +897,7 @@ async function loadSelectedKey(input: string | KvKeyRoute) {
   selectedRouteKeyBytes.value = route.keyBytes ?? null;
   selectedValue.value = null;
   selectedPrettyValue.value = null;
+  selectedBase64ViewMode.value = "utf8";
   detailLoading.value = true;
   detailError.value = "";
   try {
@@ -878,6 +933,7 @@ function clearSelectedKey() {
   selectedRouteKeyBytes.value = null;
   selectedValue.value = null;
   selectedPrettyValue.value = null;
+  selectedBase64ViewMode.value = "utf8";
   detailLoading.value = false;
 }
 
@@ -1218,6 +1274,11 @@ async function saveKey() {
     return;
   }
   const key = props.lazyHierarchy ? normalizeLazyKvPath(rawKey, props.lazyPathStyle) : rawKey;
+  const keyBytes = !isCreating.value && key === selectedKey.value ? selectedKeyBytes.value : null;
+  if (!keyIsWritable(key, keyBytes)) {
+    editError.value = t("connection.readOnly");
+    return;
+  }
   const validationError = validateKvValue(editValue.value, editFormat.value);
   if (validationError) {
     editError.value = validationError;
@@ -1235,6 +1296,7 @@ async function saveKey() {
 async function confirmSaveKey() {
   if (!pendingSave.value) return;
   const { key, value, options } = pendingSave.value;
+  if (!keyIsWritable(key, options?.keyBytes)) return;
   saving.value = true;
   editError.value = "";
   editErrorKind.value = "request";
@@ -1327,7 +1389,8 @@ async function selectNodeForAction(node: BrowserTreeNode) {
 }
 
 async function openDeleteForNode(node: BrowserTreeNode) {
-  if (props.readOnly) return;
+  const route = routeFromNode(node);
+  if (!keyIsWritable(route.key, route.keyBytes)) return;
   await selectNodeForAction(node);
   if (!selectedKey.value || !selectedValue.value?.found || !canDeleteSelectedValue.value) return;
   showDeleteConfirm.value = true;
@@ -1351,7 +1414,7 @@ async function copyText(value: string | number | null | undefined) {
 async function copySelectedValue() {
   if (!selectedValue.value?.found) return;
   try {
-    await copyToClipboard(selectedTextValue.value);
+    await copyToClipboard(selectedValueClipboardText.value);
     selectedValueCopied.value = true;
     toast(props.labels.copied || "Copied", 1500);
     if (selectedValueCopyTimer) clearTimeout(selectedValueCopyTimer);
@@ -1459,7 +1522,7 @@ function onEditFormatChange(value: unknown) {
 }
 
 function openRenameDialog() {
-  if (!selectedKey.value || !props.api.rename || props.readOnly) return;
+  if (!selectedKey.value || !props.api.rename || !selectedKeyWritable.value) return;
   renameMode.value = "rename";
   renameValue.value = selectedKey.value;
   renameError.value = "";
@@ -1473,6 +1536,10 @@ async function moveOrCopySelectedKey() {
   const next = renameValue.value.trim();
   if (!next) {
     renameError.value = props.labels.keyRequired;
+    return;
+  }
+  if (!renameTargetWritable.value) {
+    renameError.value = t("connection.readOnly");
     return;
   }
   renaming.value = true;
@@ -1524,7 +1591,7 @@ function compareHistory(event: KvHistoryEvent) {
 }
 
 async function restoreHistory() {
-  if (!selectedKey.value || !historyRestoreValue.value) return;
+  if (!selectedKey.value || !historyRestoreValue.value || !selectedKeyWritable.value) return;
   restoring.value = true;
   try {
     await props.api.put(props.connectionId, selectedKey.value, historyRestoreValue.value, {
@@ -1544,6 +1611,8 @@ async function restoreHistory() {
 
 function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
   if (!props.enableNodeActions) return [];
+  const route = routeFromNode(node);
+  const nodeWritable = keyIsWritable(route.key, route.keyBytes);
   const items: ContextMenuItem[] = [
     {
       label: props.labels.add || props.labels.newKey,
@@ -1558,7 +1627,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
         label: props.labels.edit,
         icon: Pencil,
         action: () => void loadSelectedKey(routeFromNode(node)).then(openEditDialog),
-        disabled: props.readOnly,
+        disabled: !nodeWritable,
       },
       {
         label: props.labels.clone || "Clone",
@@ -1577,7 +1646,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
         label: props.labels.rename || "Rename",
         icon: Pencil,
         action: () => void loadSelectedKey(routeFromNode(node)).then(openRenameDialog),
-        disabled: props.readOnly,
+        disabled: !nodeWritable,
       });
     }
     if (props.api.history) {
@@ -1609,7 +1678,7 @@ function nodeContextMenuItems(node: BrowserTreeNode): ContextMenuItem[] {
       icon: Trash2,
       variant: "destructive",
       action: () => void openDeleteForNode(node),
-      disabled: props.readOnly || !nodeHasValue(node),
+      disabled: !nodeWritable || !nodeHasValue(node),
     });
   }
   return items;
@@ -1865,15 +1934,18 @@ defineExpose({
             <Loader2 class="mr-2 h-4 w-4 animate-spin" />
             {{ labels.loadingKeys }}
           </div>
+          <div v-else-if="listError" class="flex h-full items-center justify-center px-4 text-center text-sm text-destructive">
+            {{ listError }}
+          </div>
           <div v-else-if="visibleRows.length === 0" class="flex h-full items-center justify-center text-sm text-muted-foreground">
             {{ labels.empty }}
           </div>
           <div v-else class="h-full overflow-auto py-1 text-sm">
             <template v-for="row in visibleRows" :key="row.type === 'node' ? row.node.id : row.id">
-              <CustomContextMenu v-if="row.type === 'node'" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu }">
+              <CustomContextMenu v-if="row.type === 'node'" :items="nodeContextMenuItems(row.node)" v-slot="{ onContextMenu, isOpen }">
                 <div
-                  class="flex h-8 w-full select-none items-center gap-1.5 pr-2 text-left transition-colors hover:bg-accent"
-                  :class="rowIsSelected(row.node) ? 'bg-primary/10 font-medium text-foreground shadow-[inset_3px_0_0_hsl(var(--primary))]' : ''"
+                  class="flex h-8 w-full select-none items-center gap-1.5 pr-2 text-left transition-colors"
+                  :class="isOpen || rowIsSelected(row.node) ? 'bg-accent font-medium text-accent-foreground shadow-[inset_3px_0_0_hsl(var(--primary))]' : 'hover:bg-accent/40'"
                   :style="{ paddingLeft: `${8 + row.depth * 18}px` }"
                   @mousedown.right.prevent
                   @contextmenu="(event) => onRowContextMenu(event, row.node, onContextMenu)"
@@ -2009,7 +2081,23 @@ defineExpose({
                 </div>
               </div>
               <div class="min-h-0">
-                <div v-if="metadataStyle === 'zookeeper'" class="mb-2 text-xs font-medium text-muted-foreground">{{ labels.value || "Value" }}</div>
+                <div v-if="metadataStyle === 'zookeeper' || showSelectedBase64Utf8Controls" class="mb-2 flex min-h-8 items-center justify-between gap-3">
+                  <div v-if="metadataStyle === 'zookeeper'" class="text-xs font-medium text-muted-foreground">{{ labels.value || "Value" }}</div>
+                  <div v-if="showSelectedBase64Utf8Controls" class="ml-auto inline-flex rounded-md border bg-muted/20 p-0.5" role="group" aria-label="Value encoding">
+                    <Button
+                      data-testid="kv-base64-utf8-view"
+                      size="sm"
+                      :variant="selectedBase64DisplayMode === 'utf8' ? 'secondary' : 'ghost'"
+                      class="h-7 rounded-sm px-2.5 text-xs"
+                      :aria-pressed="selectedBase64DisplayMode === 'utf8'"
+                      :disabled="selectedBase64Utf8PreviewUnavailable"
+                      @click="selectedBase64ViewMode = 'utf8'"
+                    >
+                      UTF-8
+                    </Button>
+                    <Button data-testid="kv-base64-raw-view" size="sm" :variant="selectedBase64DisplayMode === 'base64' ? 'secondary' : 'ghost'" class="h-7 rounded-sm px-2.5 text-xs" :aria-pressed="selectedBase64DisplayMode === 'base64'" @click="selectedBase64ViewMode = 'base64'"> Base64 </Button>
+                  </div>
+                </div>
                 <div class="relative">
                   <Button
                     size="icon"
@@ -2024,8 +2112,15 @@ defineExpose({
                   </Button>
                   <pre
                     data-native-clipboard
-                    class="dbx-editor-font-family m-0 max-h-[40vh] min-h-32 overflow-auto rounded-md border bg-muted/20 whitespace-pre-wrap break-words p-3 pr-12 text-sm"
+                    class="dbx-editor-font-family m-0 max-h-[40vh] min-h-32 overflow-auto rounded-md border bg-muted/20 p-3 pr-12 text-sm"
+                    :class="settingsStore.editorSettings.wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
                   ><template v-for="(segment, index) in selectedValueHighlightSegments" :key="index"><mark v-if="segment.matched" class="rounded-sm bg-amber-300/80 px-0.5 text-foreground dark:bg-amber-500/40">{{ segment.text }}</mark><span v-else>{{ segment.text }}</span></template></pre>
+                </div>
+                <div v-if="selectedValueUsesUtf8Preview && selectedBase64Utf8PreviewIsLossy" class="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                  {{ labels.utf8PreviewLossy || "Invalid UTF-8 bytes are shown as replacement characters (�). The original Base64 value is unchanged." }}
+                </div>
+                <div v-else-if="showSelectedBase64Utf8Controls && selectedBase64Utf8PreviewUnavailable" class="mt-2 text-xs text-destructive">
+                  {{ labels.utf8PreviewUnavailable || "The Base64 value is invalid, so the original value is shown." }}
                 </div>
                 <div v-if="selectedValueCanPrettyJson" class="mt-2 flex justify-end">
                   <Button size="sm" variant="outline" class="h-8" @click="prettifySelectedJson">
@@ -2173,7 +2268,7 @@ defineExpose({
         </div>
         <DialogFooter class="mx-0 mb-0 shrink-0 gap-3 border-t bg-muted/10 px-6 py-5">
           <Button variant="outline" class="h-10 min-w-20" @click="showEditDialog = false">{{ t("common.cancel") }}</Button>
-          <Button class="h-10 min-w-20" :disabled="saving || readOnly" @click="saveKey">
+          <Button class="h-10 min-w-20" :disabled="saving || !editKeyWritable" @click="saveKey">
             <Loader2 v-if="saving" class="mr-2 h-4 w-4 animate-spin" />
             {{ t("common.save") }}
           </Button>
@@ -2194,7 +2289,7 @@ defineExpose({
         </div>
         <DialogFooter>
           <Button variant="outline" :disabled="renaming" @click="showRenameDialog = false">{{ t("common.cancel") }}</Button>
-          <Button :disabled="renaming || readOnly" @click="moveOrCopySelectedKey">
+          <Button :disabled="renaming || !renameTargetWritable" @click="moveOrCopySelectedKey">
             <Loader2 v-if="renaming" class="mr-2 h-4 w-4 animate-spin" />
             {{ renameMode === "copy" ? labels.clone || "Clone" : labels.rename || "Rename" }}
           </Button>
@@ -2251,7 +2346,7 @@ defineExpose({
       :before="selectedTextValue"
       :after="historyRestoreValue?.data || ''"
       :loading="restoring"
-      :show-confirm="!readOnly && !!historyRestoreValue"
+      :show-confirm="selectedKeyWritable && !!historyRestoreValue"
       :confirm-label="labels.restore || 'Restore'"
       @confirm="restoreHistory"
     />

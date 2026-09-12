@@ -77,6 +77,7 @@ export function createDataGridColumnContextMenuItems(options: {
   canFilter: boolean;
   hasSort: boolean;
   sortMode: "database" | "local";
+  databaseSortEnabled?: boolean;
   frozenColumnCount?: number;
   contextVisibleColIdx?: number;
   hasColumnSelection?: boolean;
@@ -94,13 +95,14 @@ export function createDataGridColumnContextMenuItems(options: {
   }
   if (!options.contextColumn && !options.headerColumn) return items;
   if (options.contextColumn) {
-    items.push(
-      { label: options.labels.databaseAscending, action: () => options.actions.sort("asc", "database"), icon: options.icons.database },
-      { label: options.labels.databaseDescending, action: () => options.actions.sort("desc", "database"), icon: options.icons.database },
-      { label: "", separator: true },
-      { label: options.labels.localAscending, action: () => options.actions.sort("asc", "local"), icon: options.icons.ascending },
-      { label: options.labels.localDescending, action: () => options.actions.sort("desc", "local"), icon: options.icons.descending },
-    );
+    if (options.databaseSortEnabled !== false) {
+      items.push(
+        { label: options.labels.databaseAscending, action: () => options.actions.sort("asc", "database"), icon: options.icons.database },
+        { label: options.labels.databaseDescending, action: () => options.actions.sort("desc", "database"), icon: options.icons.database },
+        { label: "", separator: true },
+      );
+    }
+    items.push({ label: options.labels.localAscending, action: () => options.actions.sort("asc", "local"), icon: options.icons.ascending }, { label: options.labels.localDescending, action: () => options.actions.sort("desc", "local"), icon: options.icons.descending });
     if (options.hasSort) items.push({ label: options.labels.clearSort, action: () => options.actions.sort(null, options.sortMode), icon: options.icons.clearSort });
     if (options.canFilter) items.push({ label: "", separator: true }, options.filterSubmenu);
   }
@@ -210,28 +212,34 @@ export function dataGridSelectedSortMenuValue(state: DataGridColumnSortState, co
   return dataGridColumnIsSorted(state, column, columnIndex) ? `${state.mode}-${state.direction}` : undefined;
 }
 
-export function createDataGridSortMenuItems(options: { column: string; columnIndex: number; state: DataGridColumnSortState; labels: SortMenuLabels; icons: SortMenuIcons }): DataGridColumnMenuItem[] {
-  const { column, columnIndex, state, labels, icons } = options;
+export function createDataGridSortMenuItems(options: { column: string; columnIndex: number; state: DataGridColumnSortState; labels: SortMenuLabels; icons: SortMenuIcons; databaseSortEnabled?: boolean }): DataGridColumnMenuItem[] {
+  const { column, columnIndex, state, labels, icons, databaseSortEnabled = true } = options;
   const sorted = dataGridColumnIsSorted(state, column, columnIndex);
   return [
-    { label: labels.databaseAscending, value: "database-asc", icon: icons.database, checked: sorted && state.direction === "asc" && state.mode === "database" },
-    { label: labels.databaseDescending, value: "database-desc", icon: icons.database, checked: sorted && state.direction === "desc" && state.mode === "database" },
-    { label: labels.currentPageAscending, value: "local-asc", icon: icons.ascending, checked: sorted && state.direction === "asc" && state.mode === "local", separatorBefore: true },
+    ...(databaseSortEnabled
+      ? [
+          { label: labels.databaseAscending, value: "database-asc", icon: icons.database, checked: sorted && state.direction === "asc" && state.mode === "database" },
+          { label: labels.databaseDescending, value: "database-desc", icon: icons.database, checked: sorted && state.direction === "desc" && state.mode === "database" },
+        ]
+      : []),
+    { label: labels.currentPageAscending, value: "local-asc", icon: icons.ascending, checked: sorted && state.direction === "asc" && state.mode === "local", separatorBefore: databaseSortEnabled },
     { label: labels.currentPageDescending, value: "local-desc", icon: icons.descending, checked: sorted && state.direction === "desc" && state.mode === "local" },
     { label: labels.clear, value: "clear", icon: icons.clear, disabled: !sorted, separatorBefore: true },
   ];
 }
 
 export function createDataGridCompactColumnActionItems(options: {
-  labels: { formatter: string; localFilter: string; serverFilter: string };
-  icons: { formatter: Component; filter: Component; database: Component };
+  labels: { formatter: string; clearFormatter: string; localFilter: string; serverFilter: string };
+  icons: { formatter: Component; clearFormatter: Component; filter: Component; database: Component };
   formatterAvailable: boolean;
+  formatterActive: boolean;
   serverFilterAvailable: boolean;
 }): DataGridColumnMenuItem[] {
   const { labels, icons } = options;
   return [
-    { label: labels.formatter, value: "formatter", icon: icons.formatter, disabled: !options.formatterAvailable },
+    { label: labels.formatter, value: "formatter", icon: icons.formatter, disabled: !options.formatterAvailable, checked: options.formatterActive },
     { label: labels.localFilter, value: "localFilter", icon: icons.filter },
     ...(options.serverFilterAvailable ? [{ label: labels.serverFilter, value: "serverFilter", icon: icons.database }] : []),
+    { label: labels.clearFormatter, value: "clearFormatter", icon: icons.clearFormatter, disabled: !options.formatterActive, separatorBefore: true },
   ];
 }

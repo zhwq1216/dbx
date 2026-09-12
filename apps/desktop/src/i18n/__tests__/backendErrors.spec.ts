@@ -9,6 +9,7 @@ import it from "@/i18n/locales/it";
 import ja from "@/i18n/locales/ja";
 import ko from "@/i18n/locales/ko";
 import ptBR from "@/i18n/locales/pt-BR";
+import tr from "@/i18n/locales/tr";
 import zhCN from "@/i18n/locales/zh-CN";
 import zhTW from "@/i18n/locales/zh-TW";
 import { PHOENIX_DRIVER_NOT_INSTALLED_ERROR, PHOENIX_JDBC_PLUGIN_NOT_INSTALLED_ERROR } from "@/lib/database/phoenixConnection";
@@ -20,6 +21,7 @@ const LOCALES = {
   ja,
   ko,
   "pt-BR": ptBR,
+  tr,
   "zh-CN": zhCN,
   "zh-TW": zhTW,
 } as const;
@@ -37,6 +39,7 @@ const STRUCTURED_BACKEND_ERROR_KEYS = [
   "backendErrors.jdbc.protocolFailed",
   "backendErrors.jdbc.contractInvalid",
   "backendErrors.jdbc.legacyFailure",
+  "backendErrors.transaction.sessionExpired",
   "backendErrors.legacy",
   "backendErrors.unknown",
 ] as const;
@@ -55,6 +58,22 @@ const WINDOWS_JRE_REMOVE_ERROR = [
 // Every backend message changed away from hardcoded Chinese, paired with the
 // key and params it must resolve to.
 const CASES: { name: string; message: string; key: string; params?: Record<string, string> }[] = [
+  {
+    name: "Nacos ordinary user must configure managed namespaces when namespace discovery is forbidden",
+    message: "Failed to list Nacos namespaces: NACOS_ERROR[v3ManagedNamespacesRequired]: access denied",
+    key: "nacos.nacosManagedNamespacesRequired",
+  },
+  {
+    name: "Nacos ordinary user must configure managed namespaces when authorization management is forbidden",
+    message: "NACOS_ERROR[managedNamespacesRequired]: 403 Forbidden",
+    key: "nacos.nacosManagedNamespacesRequired",
+  },
+  {
+    name: "Nacos 3 managed namespace permission check failed",
+    message: 'NACOS_ERROR[managedNamespaceAccessDenied]: One or more configured namespace IDs are not readable: namespace "team-a" naming: forbidden',
+    key: "nacos.nacosManagedNamespaceAccessDenied",
+    params: { detail: 'namespace "team-a" naming: forbidden' },
+  },
   {
     name: "Apache Phoenix JDBC driver missing",
     message: PHOENIX_DRIVER_NOT_INSTALLED_ERROR,
@@ -326,6 +345,49 @@ describe("backend error translation", () => {
     const error = new BackendErrorException("legacy backend failure");
     expect(error.backendError.code).toBe("DBX-LEGACY-0001");
     expect(translateBackendError(t, error)).toBe(`${t("backendErrors.legacy")}\n\nlegacy backend failure`);
+  });
+
+  test("keeps an explicit original detail when a structured legacy error omits detail", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1 as const,
+      code: "DBX-LEGACY-0001",
+      messageKey: "backendErrors.legacy",
+      messageParams: {},
+      source: "legacyBackend",
+      operationOutcome: "unknown" as const,
+    };
+
+    expect(translateBackendError(t, error, "ClickHouse error: table analytics.events does not exist")).toBe(`${t("backendErrors.legacy")}\n\nClickHouse error: table analytics.events does not exist`);
+  });
+
+  test("does not append the generic transport fallback to a structured error", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1 as const,
+      code: "DBX-LEGACY-0001",
+      messageKey: "backendErrors.legacy",
+      messageParams: {},
+      source: "legacyBackend",
+      operationOutcome: "unknown" as const,
+    };
+
+    expect(translateBackendError(t, error, "Backend request failed")).toBe(t("backendErrors.legacy"));
+  });
+
+  test("does not duplicate the summary when the fallback already carries it", () => {
+    const t = translatorFor("zh-CN");
+    const error = {
+      version: 1 as const,
+      code: "DBX-LEGACY-0001",
+      messageKey: "backendErrors.legacy",
+      messageParams: {},
+      source: "legacyBackend",
+      operationOutcome: "unknown" as const,
+    };
+    const summary = t("backendErrors.legacy");
+
+    expect(translateBackendError(t, error, `${summary}\n\nrelation missing_table does not exist`)).toBe(`${summary}\n\nrelation missing_table does not exist`);
   });
 
   test("preserves JSON envelopes carried by strings and Error messages", () => {

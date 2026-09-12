@@ -1,11 +1,14 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use serde_json::json;
+use serde_json::Value;
 
 use crate::agent_events::{ToolCall, ToolDefinition, ToolResult};
 use crate::connection::AppState;
 use crate::db::vector_driver;
 use crate::models::connection::DatabaseType;
+use crate::models::connection::{ConnectionConfig, SPANNER_MIN_QUERY_TIMEOUT_SECS};
 use crate::query::QueryExecutionOptions;
 use crate::query_execution_sql::{build_explain_sql, supports_explain_plan, supports_sql_query, ExplainSqlOptions};
 use crate::sql_dialect::{build_table_data_select_sql, TableDataSelectSqlOptions};
@@ -35,6 +38,59 @@ const MAX_QUERY_CELL_CHAR_LIMIT: usize = 4_000;
 
 /// Bounds explicit sliding-window scans without changing the underlying database request.
 const MAX_QUERY_CELL_CHAR_OFFSET: usize = 1_000_000;
+
+fn connection_tool_lock(connection_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut registry = locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = registry.get(connection_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    registry.insert(connection_id.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+fn tool_uses_database(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "list_tables"
+            | "get_columns"
+            | "execute_query"
+            | "get_sample_data"
+            | "list_collections"
+            | "browse_collection"
+            | "explain_query"
+    )
+}
+
+/// Resolve the query timeout (seconds) for an agent/MCP query.
+///
+/// Precedence: an explicit per-call `requested` value wins; otherwise inherit
+/// the connection's `effective_query_timeout_secs()`; the legacy 30s survives
+/// only when no connection config is available to resolve against. `Some(0)`
+/// from either source means "no limit" (unlimited, and it bypasses the Spanner
+/// floor — see `ConnectionConfig::effective_query_timeout_secs`). A finite
+/// value on a Spanner connection gets the 120s floor.
+pub fn agent_query_timeout_secs(requested: Option<u64>, connection: Option<&ConnectionConfig>) -> u64 {
+    match requested {
+        Some(0) => 0,
+        Some(n) => {
+            if connection.is_some_and(|config| config.db_type == DatabaseType::Spanner) {
+                n.max(SPANNER_MIN_QUERY_TIMEOUT_SECS)
+            } else {
+                n
+            }
+        }
+        None => connection.map_or(QUERY_TIMEOUT_SECS, ConnectionConfig::effective_query_timeout_secs),
+    }
+}
+
+/// Legacy fallback query timeout for agent queries. Matches the current fixed
+/// `Some(30)` behavior and remains the last resort when no connection config
+/// can be resolved (that path fails the query at pool lookup anyway).
+const QUERY_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryCellWindow {
@@ -150,6 +206,44 @@ fn sql_risk_allowed(risk: SqlRisk, permissions: AgentSqlPermissions) -> bool {
         SqlRisk::Ddl => permissions.allow_dangerous,
         SqlRisk::Transaction => false,
     }
+}
+
+/// Returns true when an Agent attempted a write or DDL call before DBX has a
+/// user-confirmed SQL binding for the current run. The caller must turn that
+/// attempt into a confirmation proposal instead of sending it to the database.
+pub fn write_requires_confirmation(
+    sql: &str,
+    db_type: DatabaseType,
+    permissions: &AgentSqlPermissions,
+) -> Result<bool, String> {
+    if permissions.allow_writes || permissions.allow_dangerous || permissions.confirmed_write_sql.is_some() {
+        return Ok(false);
+    }
+    let risk = crate::sql_risk::classify_sql_risk_for_database(sql, db_type)?;
+    Ok(matches!(risk, SqlRisk::Write | SqlRisk::Ddl))
+}
+
+/// Snapshot the permissions for one execute_query call and consume an exact
+/// confirmed write/DDL grant before dispatch. Later calls in the same agent run
+/// receive the cleared permissions and must request a new confirmation.
+pub(crate) fn take_sql_permissions_for_execution(
+    sql: &str,
+    db_type: DatabaseType,
+    permissions: &mut AgentSqlPermissions,
+) -> AgentSqlPermissions {
+    let execution_permissions = permissions.clone();
+    let consumes_confirmation = match crate::sql_risk::classify_sql_risk_for_database(sql, db_type) {
+        Ok(risk @ (SqlRisk::Write | SqlRisk::Ddl)) => {
+            sql_risk_allowed(risk, execution_permissions.clone())
+                && sql_matches_confirmed_write(sql, &execution_permissions.confirmed_write_sql)
+                && execution_permissions.confirmed_write_sql.is_some()
+        }
+        _ => false,
+    };
+    if consumes_confirmation {
+        *permissions = AgentSqlPermissions::default();
+    }
+    execution_permissions
 }
 
 /// Returns true for vector database types (Qdrant, Milvus, Weaviate, ChromaDb).
@@ -328,7 +422,7 @@ fn execute_query_tool(sql_permissions: AgentSqlPermissions) -> ToolDefinition {
     } else if sql_permissions.allow_writes {
         "Execute SQL after the user explicitly confirmed this operation. Read queries and non-DDL writes are allowed for this run."
     } else {
-        "Execute a read-only SQL query and return results (max 50 rows). Only SELECT, WITH, SHOW, DESCRIBE, EXPLAIN statements are allowed. Write operations (INSERT/UPDATE/DELETE/DDL) are blocked."
+        "Execute a read-only SQL query and return results (max 50 rows). This run cannot execute writes or DDL because no specific SQL has been confirmed yet; this does not mean the database itself is read-only. When the user requests a write, first propose the exact SQL in one ```sql code block and ask for confirmation. After confirmation, DBX starts a new run that can execute only that exact SQL. Only SELECT, WITH, SHOW, DESCRIBE, EXPLAIN statements may be executed in this run."
     };
     ToolDefinition {
         name: "execute_query",
@@ -468,6 +562,15 @@ pub async fn execute_tool(
     db_type: &DatabaseType,
     sql_permissions: AgentSqlPermissions,
 ) -> ToolResult {
+    // Agent loops for different conversations may share a physical connection.
+    // Lock only the database tool future; model generation and non-DB tools stay
+    // concurrent. Dropping a cancelled future releases either the waiter or the
+    // acquired guard automatically.
+    let _connection_guard = if tool_uses_database(&tool_call.name) {
+        Some(connection_tool_lock(connection_id).lock_owned().await)
+    } else {
+        None
+    };
     let result = match tool_call.name.as_str() {
         "list_tables" => execute_list_tables(tool_call, state, connection_id, database, default_schema, db_type).await,
         "get_columns" => execute_get_columns(tool_call, state, connection_id, database, default_schema, db_type).await,
@@ -712,12 +815,26 @@ async fn execute_execute_query(
     // Classify SQL risk using the concrete database dialect.
     let risk = crate::sql_risk::classify_sql_risk_for_database(sql, *db_type)?;
     let connection_config = state.configs.read().await.get(connection_id).cloned();
-    if let Some(config) = connection_config {
-        if risk != SqlRisk::ReadOnly && crate::production_safety::targets_production_database(&config, database, sql) {
-            return Err("Blocked: AI agents cannot execute writes or DDL on a production database. Return the SQL for the user to review and execute manually in DBX.".to_string());
-        }
+    let targets_production = connection_config.as_ref().is_some_and(|config| {
+        risk != SqlRisk::ReadOnly && crate::production_safety::targets_production_database(config, database, sql)
+    });
+    let risk_allowed = sql_risk_allowed(risk, sql_permissions.clone());
+    let confirmed_sql_matches =
+        risk == SqlRisk::ReadOnly || sql_matches_confirmed_write(sql, &sql_permissions.confirmed_write_sql);
+
+    // Keep permission diagnostics useful without logging SQL, connection details, or result data.
+    log::debug!(
+        "[agent:execute_query:permission] risk={risk:?} targets_production={targets_production} allow_writes={} allow_dangerous={} has_confirmed_sql={} confirmed_sql_matches={confirmed_sql_matches} will_execute={}",
+        sql_permissions.allow_writes,
+        sql_permissions.allow_dangerous,
+        sql_permissions.confirmed_write_sql.is_some(),
+        !targets_production && risk_allowed && confirmed_sql_matches,
+    );
+
+    if targets_production {
+        return Err("Blocked: AI agents cannot execute writes or DDL on a production database. Return the SQL for the user to review and execute manually in DBX.".to_string());
     }
-    if !sql_risk_allowed(risk, sql_permissions.clone()) {
+    if !risk_allowed {
         if risk == SqlRisk::Transaction {
             return Err("Blocked: transaction control statements are not available to the AI agent.".to_string());
         }
@@ -729,7 +846,7 @@ async fn execute_execute_query(
 
     // When the user confirmed a specific write SQL, the agent must
     // execute only that SQL — not an arbitrary different statement.
-    if risk != SqlRisk::ReadOnly && !sql_matches_confirmed_write(sql, &sql_permissions.confirmed_write_sql) {
+    if !confirmed_sql_matches {
         let confirmed = sql_permissions.confirmed_write_sql.as_deref().unwrap_or("");
         return Err(format!(
             "Blocked: the executed SQL does not match the user-confirmed SQL.\n\
@@ -745,10 +862,16 @@ async fn execute_execute_query(
     let client_session_id =
         tool_call.arguments.get("client_session_id").and_then(|v| v.as_str()).map(str::trim).filter(|v| !v.is_empty());
 
-    // Execute query using existing infrastructure
+    // Execute query using existing infrastructure. Timeout resolves as
+    // per-call `timeout_secs` > connection effective timeout (see
+    // `agent_query_timeout_secs`); MCP injects the policy value as
+    // `timeout_secs` in the arguments.
     let options = QueryExecutionOptions {
         max_rows: Some(limit),
-        timeout_secs: Some(30),
+        timeout_secs: Some(agent_query_timeout_secs(
+            tool_call.arguments.get("timeout_secs").and_then(Value::as_u64),
+            connection_config.as_ref(),
+        )),
         client_session_id: client_session_id.map(str::to_string),
         ..Default::default()
     };
@@ -997,8 +1120,18 @@ async fn execute_explain_query(
         }
     };
 
-    // Execute the EXPLAIN query
-    let options = QueryExecutionOptions { max_rows: Some(100), timeout_secs: Some(30), ..Default::default() };
+    // Execute the EXPLAIN query. Timeout resolves like the execute path
+    // (per-call `timeout_secs` > connection effective timeout) so the global
+    // MCP timeout override covers EXPLAIN too.
+    let connection_config = state.configs.read().await.get(connection_id).cloned();
+    let options = QueryExecutionOptions {
+        max_rows: Some(100),
+        timeout_secs: Some(agent_query_timeout_secs(
+            tool_call.arguments.get("timeout_secs").and_then(Value::as_u64),
+            connection_config.as_ref(),
+        )),
+        ..Default::default()
+    };
     let result = match crate::query::execute_sql_statement_with_options(
         state,
         connection_id,
@@ -1109,7 +1242,12 @@ async fn execute_browse_collection(
         collection.to_string()
     };
 
-    let query = build_browse_query(db_type, &collection_id, database, limit)?;
+    let tenant = if *db_type == DatabaseType::ChromaDb {
+        state.configs.read().await.get(connection_id).map(|config| config.username.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let query = build_browse_query(db_type, &collection_id, database, &tenant, limit)?;
 
     let options = QueryExecutionOptions { max_rows: Some(limit), timeout_secs: Some(30), ..Default::default() };
     let result =
@@ -1125,6 +1263,7 @@ fn build_browse_query(
     db_type: &DatabaseType,
     collection: &str,
     database: &str,
+    tenant: &str,
     limit: usize,
 ) -> Result<String, String> {
     let collection = collection.trim();
@@ -1151,11 +1290,9 @@ fn build_browse_query(
         DatabaseType::Weaviate => {
             Ok(format!("GET /v1/objects?class={}&limit={}", vector_driver::query_value(collection), limit))
         }
-        // TODO: ChromaDB Cloud 支持自定义租户和数据库，当前只实现了本地部署
-        // （固定 default_tenant / default_database），后续支持云服务时需改为可配置。
         DatabaseType::ChromaDb => Ok(format!(
-            "POST /api/v2/tenants/default_tenant/databases/default_database/collections/{}/get\n{}",
-            collection,
+            "POST {}/get\n{}",
+            vector_driver::chroma_collection_path(tenant, database, collection, None),
             serde_json::json!({ "limit": limit, "include": ["documents", "metadatas"] })
         )),
         _ => Err(format!("Unsupported database type: {:?}", db_type)),
@@ -1187,6 +1324,68 @@ async fn resolve_chroma_collection_uuid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_query_timeout_resolves_by_precedence() {
+        // Explicit per-call value wins.
+        assert_eq!(agent_query_timeout_secs(Some(45), Some(&postgres_connection(60))), 45);
+        // 0 = unlimited bypasses the Spanner floor.
+        assert_eq!(agent_query_timeout_secs(Some(0), Some(&spanner_connection(60))), 0);
+        // Finite value on Spanner gets the 120s floor.
+        assert_eq!(agent_query_timeout_secs(Some(60), Some(&spanner_connection(60))), 120);
+        // No request + connection => inherit the connection's effective timeout.
+        assert_eq!(agent_query_timeout_secs(None, Some(&postgres_connection(60))), 60);
+        assert_eq!(agent_query_timeout_secs(None, Some(&postgres_connection(120))), 120);
+        assert_eq!(agent_query_timeout_secs(None, Some(&postgres_connection(0))), 0);
+        // No request, no connection => legacy 30s fallback.
+        assert_eq!(agent_query_timeout_secs(None, None), 30);
+    }
+
+    fn postgres_connection(query_timeout_secs: u64) -> ConnectionConfig {
+        let mut config = test_connection();
+        config.db_type = DatabaseType::Postgres;
+        config.query_timeout_secs = query_timeout_secs;
+        config
+    }
+
+    fn spanner_connection(query_timeout_secs: u64) -> ConnectionConfig {
+        let mut config = test_connection();
+        config.db_type = DatabaseType::Spanner;
+        config.query_timeout_secs = query_timeout_secs;
+        config
+    }
+
+    fn test_connection() -> ConnectionConfig {
+        serde_json::from_value(json!({
+            "id": "agent-timeout-test",
+            "name": "timeout-test",
+            "db_type": "postgres",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "username": "",
+            "password": "",
+            "ssl": false,
+        }))
+        .expect("test connection config")
+    }
+
+    #[tokio::test]
+    async fn database_tool_locks_are_connection_scoped_and_cancel_safe() {
+        let first = connection_tool_lock("agent-tool-lock-a").lock_owned().await;
+        let same_connection = connection_tool_lock("agent-tool-lock-a");
+        let other_connection = connection_tool_lock("agent-tool-lock-b");
+
+        assert!(same_connection.try_lock().is_err(), "same connection must serialize tool calls");
+        assert!(other_connection.try_lock().is_ok(), "different connections must remain concurrent");
+
+        let waiter = tokio::spawn(async move { same_connection.lock_owned().await });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        drop(first);
+
+        assert!(connection_tool_lock("agent-tool-lock-a").try_lock().is_ok());
+    }
     #[cfg(unix)]
     use crate::connection::PoolKind;
     #[cfg(unix)]
@@ -1257,6 +1456,7 @@ for line in sys.stdin:
             database: Some(database.to_string()),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -1284,6 +1484,7 @@ for line in sys.stdin:
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -1291,6 +1492,7 @@ for line in sys.stdin:
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],
@@ -1386,6 +1588,7 @@ for line in sys.stdin:
             "db.items.updateMany({tenant: 7}, {$set: {active: false}})",
             "db.items.deleteMany({tenant: 7})",
             "db.items.createIndex({tenant: 1})",
+            "db.runCommand({compact: 'items'})",
             r#"db.items.aggregate([{"$out":"items_backup"}])"#,
         ]
         .into_iter()
@@ -1430,6 +1633,52 @@ for line in sys.stdin:
             SqlRisk::Transaction,
             AgentSqlPermissions { allow_writes: true, allow_dangerous: true, confirmed_write_sql: None }
         ));
+    }
+
+    #[test]
+    fn unconfirmed_sql_tool_describes_the_confirmation_flow() {
+        let execute_query = all_tools(DatabaseType::Postgres, AgentSqlPermissions::default())
+            .into_iter()
+            .find(|tool| tool.name == "execute_query")
+            .expect("PostgreSQL Agent mode should expose execute_query");
+
+        assert!(execute_query.description.contains("no specific SQL has been confirmed yet"));
+        assert!(execute_query.description.contains("does not mean the database itself is read-only"));
+        assert!(execute_query.description.contains("propose the exact SQL in one ```sql code block"));
+        assert!(!sql_risk_allowed(SqlRisk::Write, AgentSqlPermissions::default()));
+        assert!(!sql_risk_allowed(SqlRisk::Ddl, AgentSqlPermissions::default()));
+    }
+
+    #[test]
+    fn write_confirmation_is_required_only_for_unconfirmed_write_or_ddl() {
+        let permissions = AgentSqlPermissions::default();
+        assert!(write_requires_confirmation("INSERT INTO users (id) VALUES (1)", DatabaseType::Postgres, &permissions)
+            .unwrap());
+        assert!(write_requires_confirmation("CREATE TABLE users (id INT)", DatabaseType::Mysql, &permissions).unwrap());
+        assert!(!write_requires_confirmation("SELECT * FROM users", DatabaseType::Postgres, &permissions).unwrap());
+
+        let confirmed = confirmed_write_sql_permissions(false, true, Some("CREATE TABLE users (id INT)".to_string()));
+        assert!(
+            !write_requires_confirmation("CREATE TABLE users (id INT)", DatabaseType::Postgres, &confirmed).unwrap()
+        );
+    }
+
+    #[test]
+    fn confirmed_postgres_article_tags_insert_is_write_enabled_for_nonproduction_agent() {
+        let sql = "INSERT INTO \"public\".\"article_tags\" (article_id, tag_id)\nVALUES (1, 4), (2, 4), (3, 8), (4, 5), (4, 6);";
+        let permissions = confirmed_write_sql_permissions(false, true, Some(sql.to_string()));
+
+        assert!(permissions.allow_writes);
+        assert!(permissions.allow_dangerous);
+        assert!(sql_risk_allowed(SqlRisk::Write, permissions.clone()));
+        assert!(sql_matches_confirmed_write(sql, &permissions.confirmed_write_sql));
+
+        let execute_query = all_tools(DatabaseType::Postgres, permissions)
+            .into_iter()
+            .find(|tool| tool.name == "execute_query")
+            .expect("PostgreSQL Agent mode should expose execute_query");
+        assert!(execute_query.description.contains("writes"));
+        assert!(!execute_query.description.contains("Write operations (INSERT/UPDATE/DELETE/DDL) are blocked"));
     }
 
     #[test]
@@ -1623,7 +1872,11 @@ for line in sys.stdin:
         let state = Arc::new(AppState::new(storage));
         let connection = agent_test_connection("dameng-1", "Dameng", DatabaseType::Dameng, "APPDB");
         state.configs.write().await.insert(connection.id.clone(), connection);
-        state.connections.write().await.insert("dameng-1:APPDB".to_string(), PoolKind::agent(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("dameng-1:APPDB".to_string(), PoolKind::agent(client));
+            })
+            .await;
 
         let read = ToolCall {
             id: "read".to_string(),
@@ -1687,7 +1940,11 @@ for line in sys.stdin:
         let state = Arc::new(AppState::new(storage));
         let connection = agent_test_connection("mysql-1", "MySQL", DatabaseType::Mysql, "rs_main");
         state.configs.write().await.insert(connection.id.clone(), connection);
-        state.connections.write().await.insert("mysql-1:rs_main".to_string(), PoolKind::agent(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("mysql-1:rs_main".to_string(), PoolKind::agent(client));
+            })
+            .await;
 
         let sql = "SHOW TRIGGERS FROM `rs_main` LIKE 'trg_order_items_after_%';";
         let call = ToolCall {
@@ -1719,7 +1976,7 @@ for line in sys.stdin:
 
     #[test]
     fn build_browse_query_qdrant() {
-        let q = build_browse_query(&DatabaseType::Qdrant, "articles", "", 10).unwrap();
+        let q = build_browse_query(&DatabaseType::Qdrant, "articles", "", "", 10).unwrap();
         assert!(q.starts_with("POST /collections/articles/points/scroll"));
         assert!(q.contains("\"limit\":10"));
         assert!(q.contains("\"with_payload\":true"));
@@ -1727,13 +1984,13 @@ for line in sys.stdin:
 
     #[test]
     fn build_browse_query_qdrant_encodes_url_chars() {
-        let q = build_browse_query(&DatabaseType::Qdrant, "my collection", "", 10).unwrap();
+        let q = build_browse_query(&DatabaseType::Qdrant, "my collection", "", "", 10).unwrap();
         assert!(q.starts_with("POST /collections/my%20collection/points/scroll"));
     }
 
     #[test]
     fn build_browse_query_milvus() {
-        let q = build_browse_query(&DatabaseType::Milvus, "articles", "custom_db", 20).unwrap();
+        let q = build_browse_query(&DatabaseType::Milvus, "articles", "custom_db", "", 20).unwrap();
         assert!(q.starts_with("POST /v2/vectordb/entities/query"));
         assert!(q.contains("\"dbName\":\"custom_db\""));
         assert!(q.contains("\"collectionName\":\"articles\""));
@@ -1743,40 +2000,46 @@ for line in sys.stdin:
 
     #[test]
     fn build_browse_query_milvus_default_db() {
-        let q = build_browse_query(&DatabaseType::Milvus, "articles", "", 10).unwrap();
+        let q = build_browse_query(&DatabaseType::Milvus, "articles", "", "", 10).unwrap();
         assert!(q.contains("\"dbName\":\"default\""));
     }
 
     #[test]
     fn build_browse_query_weaviate() {
-        let q = build_browse_query(&DatabaseType::Weaviate, "Articles", "", 5).unwrap();
+        let q = build_browse_query(&DatabaseType::Weaviate, "Articles", "", "", 5).unwrap();
         assert_eq!(q, "GET /v1/objects?class=Articles&limit=5");
     }
 
     #[test]
     fn build_browse_query_weaviate_encodes_query_param() {
-        let q = build_browse_query(&DatabaseType::Weaviate, "A&B", "", 5).unwrap();
+        let q = build_browse_query(&DatabaseType::Weaviate, "A&B", "", "", 5).unwrap();
         assert!(q.contains("class=A%26B"));
     }
 
     #[test]
     fn build_browse_query_chromadb() {
-        let q = build_browse_query(&DatabaseType::ChromaDb, "uuid-123", "", 15).unwrap();
-        assert!(
-            q.starts_with("POST /api/v2/tenants/default_tenant/databases/default_database/collections/uuid-123/get")
-        );
+        let q = build_browse_query(&DatabaseType::ChromaDb, "uuid-123", "cloud/db", "tenant /eu", 15).unwrap();
+        assert!(q.starts_with("POST /api/v2/tenants/tenant%20%2Feu/databases/cloud%2Fdb/collections/uuid-123/get"));
         assert!(q.contains("\"limit\":15"));
     }
 
     #[test]
+    fn build_browse_query_chromadb_keeps_local_defaults() {
+        let q = build_browse_query(&DatabaseType::ChromaDb, "uuid-123", "", "", 15).unwrap();
+        assert!(
+            q.starts_with("POST /api/v2/tenants/default_tenant/databases/default_database/collections/uuid-123/get")
+        );
+    }
+
+    #[test]
     fn build_browse_query_rejects_empty_collection() {
-        let result = build_browse_query(&DatabaseType::Qdrant, "  ", "", 10);
+        let result = build_browse_query(&DatabaseType::Qdrant, "  ", "", "", 10);
         assert!(result.is_err());
     }
 
     #[test]
     fn build_browse_query_rejects_unsupported_type() {
-        let result = build_browse_query(&DatabaseType::Postgres, "articles", "", 10);
+        let result = build_browse_query(&DatabaseType::Postgres, "articles", "", "", 10);
         assert!(result.is_err());
     }
 

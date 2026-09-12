@@ -16,6 +16,7 @@ fn col(name: &str, data_type: &str) -> ColumnInfo {
     ColumnInfo {
         name: name.to_string(),
         data_type: data_type.to_string(),
+        resolved_schema: None,
         is_nullable: false,
         column_default: None,
         is_primary_key: false,
@@ -253,6 +254,7 @@ fn rollback_graph_direct_consistency_check() {
         diff_type: "added".to_string(),
         object_type: None,
         name: "users".to_string(),
+        target_name: None,
         columns: Some(vec![]),
         indexes: None,
         foreign_keys: None,

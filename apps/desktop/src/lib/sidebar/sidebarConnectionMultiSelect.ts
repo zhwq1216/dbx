@@ -21,6 +21,16 @@ export type ConnectionMultiSelectionTarget = {
   connectionMultiSelectActive: boolean;
 };
 
+export type TreeNodeSelection = {
+  nodeIds: string[];
+  activeNodeId: string | null;
+  anchorNodeId: string | null;
+};
+
+export function isExitConnectionMultiSelectionShortcut(event: Pick<KeyboardEvent, "key" | "metaKey" | "ctrlKey" | "altKey" | "shiftKey">): boolean {
+  return event.key === "Escape" && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
+}
+
 export function emptyConnectionMultiSelection(): ConnectionMultiSelection {
   return { connectionIds: [], activeConnectionId: null, anchorConnectionId: null, active: false };
 }
@@ -49,6 +59,20 @@ export function applyConnectionMultiSelection(target: ConnectionMultiSelectionTa
   target.selectedTreeNodeId = selection.activeConnectionId;
   target.treeSelectionAnchorId = selection.anchorConnectionId;
   target.connectionMultiSelectActive = selection.active;
+}
+
+/**
+ * Keep modifier-key connection and connection-group selection aligned with the
+ * checkbox mode. Mixed tree selections remain regular tree selections because
+ * type-specific bulk actions must never consume nodes of another kind.
+ */
+export function applyTreeNodeSelection(target: ConnectionMultiSelectionTarget, selection: TreeNodeSelection, connectionIds: ReadonlySet<string>, connectionGroupIds: ReadonlySet<string> = new Set()): void {
+  target.selectedTreeNodeIds = selection.nodeIds;
+  target.selectedTreeNodeId = selection.activeNodeId;
+  target.treeSelectionAnchorId = selection.anchorNodeId;
+  const containsOnlyConnections = selection.nodeIds.every((id) => connectionIds.has(id));
+  const containsOnlyConnectionGroups = selection.nodeIds.every((id) => connectionGroupIds.has(id));
+  target.connectionMultiSelectActive = selection.nodeIds.length > 0 && (containsOnlyConnections || containsOnlyConnectionGroups);
 }
 
 export function releaseConnectionFromMultiSelection(target: ConnectionMultiSelectionTarget, connectionId: string): void {

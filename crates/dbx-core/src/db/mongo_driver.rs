@@ -10,10 +10,13 @@ use serde::{Deserialize, Serialize};
 
 use super::with_connection_timeout;
 use crate::document_ops::{MongoGridFsBucketInfo, MongoGridFsFileInfo};
+use crate::models::connection::DatabaseConnectionInfo;
 use crate::types::IndexInfo;
 use futures::{io::AsyncReadExt, io::AsyncWriteExt, TryStreamExt};
 use percent_encoding::percent_decode_str;
 use std::{collections::HashSet, time::Duration};
+
+use crate::mongo_oidc::MongoOidcBrowserOpener;
 
 pub use super::document_result::DocumentQueryResult;
 /// Backward-compatible name for callers of Mongo-specific APIs.
@@ -66,12 +69,36 @@ pub struct MongoCloneCollectionResult {
 }
 
 pub async fn connect(url: &str, timeout: Duration, idle_timeout: Duration) -> Result<Client, String> {
+    connect_with_oidc(url, timeout, idle_timeout, None).await
+}
+
+pub async fn connect_with_oidc(
+    url: &str,
+    timeout: Duration,
+    idle_timeout: Duration,
+    oidc_browser_opener: Option<MongoOidcBrowserOpener>,
+) -> Result<Client, String> {
     let url = normalize_mongo_uri_direct_connection(url);
     let is_multi_host = is_multi_host_mongo_uri(&url);
     let parse_timeout = if is_multi_host { std::cmp::max(timeout * 2, Duration::from_secs(10)) } else { timeout };
 
     with_connection_timeout("MongoDB", parse_timeout, async {
         let mut options = ClientOptions::parse(&url).await.map_err(|e| format!("MongoDB connection failed: {e}"))?;
+        if let Some(credential) = options.credential.as_mut().filter(|credential| {
+            credential
+                .mechanism
+                .as_ref()
+                .is_some_and(|mechanism| matches!(mechanism, mongodb::options::AuthMechanism::MongoDbOidc))
+        }) {
+            // ENVIRONMENT selects the driver's built-in machine flow. Only
+            // install DBX's browser callback for interactive human OIDC.
+            if !mongo_oidc_uses_machine_environment(credential.mechanism_properties.as_ref()) {
+                let opener = oidc_browser_opener.ok_or_else(|| {
+                    "MongoDB OIDC browser authentication is only available in the DBX desktop app".to_string()
+                })?;
+                credential.oidc_callback = crate::mongo_oidc::human_callback(opener);
+            }
+        }
         options.connect_timeout = Some(timeout);
         options.server_selection_timeout =
             if is_multi_host { Some(std::cmp::max(timeout * 2, Duration::from_secs(10))) } else { Some(timeout) };
@@ -85,7 +112,7 @@ pub async fn connect(url: &str, timeout: Duration, idle_timeout: Duration) -> Re
         // set discovery. This is essential when connecting through a TCP proxy
         // or NAT where the driver would otherwise receive internal IPs from
         // the replica set handshake and fail to connect.
-        if !is_multi_host {
+        if !is_multi_host && options.load_balanced != Some(true) && options.direct_connection.is_none() {
             options.direct_connection = Some(true);
         }
         Client::with_options(options).map_err(|e| format!("MongoDB connection failed: {e}"))
@@ -152,6 +179,28 @@ fn mongo_url_param_is_direct_connection_true(part: &str) -> bool {
 }
 
 pub async fn test_connection(client: &Client, timeout: Duration, database: Option<&str>) -> Result<(), String> {
+    test_connection_with_timeout(client, timeout, database).await
+}
+
+pub async fn test_connection_for_url(
+    client: &Client,
+    url: &str,
+    timeout: Duration,
+    database: Option<&str>,
+) -> Result<(), String> {
+    let timeout = if mongo_uri_uses_oidc(url) {
+        timeout.saturating_add(crate::mongo_oidc::OIDC_BROWSER_AUTH_TIMEOUT)
+    } else {
+        timeout
+    };
+    test_connection_with_timeout(client, timeout, database).await
+}
+
+async fn test_connection_with_timeout(
+    client: &Client,
+    timeout: Duration,
+    database: Option<&str>,
+) -> Result<(), String> {
     let database = database.map(str::trim).filter(|value| !value.is_empty()).unwrap_or("admin");
     let client = client.clone();
     let database = database.to_string();
@@ -166,11 +215,63 @@ pub async fn test_connection(client: &Client, timeout: Duration, database: Optio
     .await
 }
 
+pub fn mongo_uri_uses_oidc(uri: &str) -> bool {
+    uri.split_once('?')
+        .map(|(_, query)| {
+            query.split('#').next().unwrap_or("").split('&').any(|part| {
+                let Some((key, value)) = part.split_once('=') else {
+                    return false;
+                };
+                percent_decode_str(key).decode_utf8_lossy().eq_ignore_ascii_case("authMechanism")
+                    && percent_decode_str(value).decode_utf8_lossy().eq_ignore_ascii_case("MONGODB-OIDC")
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn mongo_oidc_uses_machine_environment(properties: Option<&mongodb::bson::Document>) -> bool {
+    properties.is_some_and(|properties| properties.contains_key("ENVIRONMENT"))
+}
+
 pub async fn server_version(client: &Client, database: &str) -> Result<String, String> {
     let database = database.trim();
     let database = if database.is_empty() { "admin" } else { database };
     let result = client.database(database).run_command(doc! { "buildInfo": 1 }).await.map_err(|e| e.to_string())?;
     server_version_from_build_info(&result)
+}
+
+pub async fn database_connection_info(
+    client: &Client,
+    database: Option<&str>,
+) -> Result<DatabaseConnectionInfo, String> {
+    let version = server_version(client, database.unwrap_or("admin")).await?;
+    Ok(DatabaseConnectionInfo {
+        product_name: Some("MongoDB".to_string()),
+        product_version: Some(version),
+        current_database: database.map(str::to_string),
+        driver_name: Some("MongoDB Rust driver".to_string()),
+        ..Default::default()
+    })
+}
+
+pub async fn run_command(client: &Client, database: &str, command_json: &str) -> Result<MongoDocumentResult, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(command_json).map_err(|error| format!("Invalid MongoDB command JSON: {error}"))?;
+    let command = json_object_to_document_extended_json(&value)
+        .map_err(|error| format!("Invalid MongoDB command document: {error}"))?;
+    if command.is_empty() {
+        return Err("MongoDB runCommand requires a non-empty command document".to_string());
+    }
+    let result = client.database(database).run_command(command).await.map_err(|error| error.to_string())?;
+    let (document, extended_document) = document_json_views(result);
+    Ok(MongoDocumentResult {
+        documents: vec![document],
+        raw_documents: None,
+        extended_documents: Some(vec![extended_document]),
+        total: 1,
+        total_is_exact: true,
+        next_cursor: None,
+    })
 }
 
 fn server_version_from_build_info(result: &Document) -> Result<String, String> {
@@ -802,6 +903,191 @@ fn index_info_from_model(model: IndexModel) -> IndexInfo {
         index_type,
         included_columns: None,
         comment: None,
+        key_is_expression: Vec::new(),
+        column_opclasses: vec![],
+        constraint_backed: false,
+    }
+}
+
+/// One key of a MongoDB index, with the direction/type kept as the server reports it
+/// (`1`, `-1`, `text`, `2dsphere`, `hashed`, …).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MongoIndexKey {
+    pub field: String,
+    pub direction: String,
+}
+
+/// Full MongoDB index specification straight from `listIndexes`.
+///
+/// The shared [`IndexInfo`] cannot carry `sparse`, `expireAfterSeconds`, `background`
+/// or `bucketSize`, so index management reads this MongoDB-specific shape instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MongoIndexSpec {
+    pub name: String,
+    pub keys: Vec<MongoIndexKey>,
+    pub is_unique: bool,
+    pub is_primary: bool,
+    pub is_sparse: bool,
+    /// TTL in seconds; `None` when the index does not expire.
+    pub expire_after_seconds: Option<i64>,
+    /// Partial index condition, serialized as JSON.
+    pub partial_filter_expression: Option<String>,
+    /// Ignored by MongoDB 4.2+, still reported by older servers.
+    pub background: bool,
+    /// Only meaningful for geoHaystack indexes, removed in MongoDB 4.4+.
+    pub bucket_size: Option<i64>,
+    pub hidden: bool,
+    /// `false` when the properties above could not be read (Legacy Agent fallback),
+    /// so callers can avoid presenting defaults as if the server had reported them.
+    pub properties_complete: bool,
+    /// Options this build does not model, serialized as JSON for display only.
+    pub extra_options: Option<String>,
+}
+
+/// Index-spec fields this build maps explicitly; everything else lands in `extra_options`.
+/// `v` and `ns` are server bookkeeping, listed here only to keep them out of that bucket.
+const MODELED_INDEX_FIELDS: &[&str] = &[
+    "name",
+    "key",
+    "v",
+    "ns",
+    "unique",
+    "sparse",
+    "expireAfterSeconds",
+    "partialFilterExpression",
+    "background",
+    "bucketSize",
+    "hidden",
+];
+
+/// Read every index of a collection with all of its options preserved.
+pub async fn list_index_specs(
+    client: &Client,
+    database: &str,
+    collection: &str,
+) -> Result<Vec<MongoIndexSpec>, String> {
+    let database = validate_mongo_namespace_name(database, "Database")?;
+    let collection = validate_mongo_namespace_name(collection, "Collection")?;
+    // Raw command rather than `Collection::list_indexes`, whose IndexModel drops
+    // sparse/TTL/background. The driver cursor owns getMore and killCursors.
+    let mut cursor = client
+        .database(database)
+        .run_cursor_command(doc! { "listIndexes": collection })
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut specs = Vec::new();
+    while let Some(document) = cursor.try_next().await.map_err(|e| e.to_string())? {
+        specs.push(index_spec_from_document(&document));
+    }
+    Ok(specs)
+}
+
+/// Canonicalize an index key direction so `1.0` and `1` read the same downstream.
+fn index_key_direction(value: &Bson) -> String {
+    match value {
+        Bson::String(value) => value.clone(),
+        Bson::Int32(value) => value.to_string(),
+        Bson::Int64(value) => value.to_string(),
+        Bson::Double(value) if value.fract() == 0.0 && value.is_finite() => (*value as i64).to_string(),
+        value => value.to_string(),
+    }
+}
+
+/// MongoDB accepts booleans and truthy numbers for index flags.
+fn index_flag(document: &Document, field: &str) -> bool {
+    match document.get(field) {
+        Some(Bson::Boolean(value)) => *value,
+        Some(Bson::Int32(value)) => *value != 0,
+        Some(Bson::Int64(value)) => *value != 0,
+        Some(Bson::Double(value)) => *value != 0.0,
+        _ => false,
+    }
+}
+
+/// TTL and bucket size arrive as any BSON number depending on server version.
+fn index_number(document: &Document, field: &str) -> Option<i64> {
+    match document.get(field) {
+        Some(Bson::Int32(value)) => Some(i64::from(*value)),
+        Some(Bson::Int64(value)) => Some(*value),
+        Some(Bson::Double(value)) if value.is_finite() => Some(*value as i64),
+        _ => None,
+    }
+}
+
+/// Map one `listIndexes` document onto [`MongoIndexSpec`].
+pub fn index_spec_from_document(document: &Document) -> MongoIndexSpec {
+    let keys = match document.get("key") {
+        Some(Bson::Document(keys)) => keys
+            .iter()
+            .map(|(field, value)| MongoIndexKey { field: field.clone(), direction: index_key_direction(value) })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    let name =
+        document.get_str("name").ok().map(str::to_string).filter(|name| !name.trim().is_empty()).unwrap_or_else(|| {
+            keys.iter().map(|key| format!("{}_{}", key.field, key.direction)).collect::<Vec<_>>().join("_")
+        });
+    let partial_filter_expression = match document.get("partialFilterExpression") {
+        Some(Bson::Document(filter)) => Some(bson_to_json(&Bson::Document(filter.clone())).to_string()),
+        _ => None,
+    };
+    let extra: Document = document
+        .iter()
+        .filter(|(field, _)| !MODELED_INDEX_FIELDS.contains(&field.as_str()))
+        .map(|(field, value)| (field.clone(), value.clone()))
+        .collect();
+    let extra_options = (!extra.is_empty()).then(|| bson_to_json(&Bson::Document(extra)).to_string());
+
+    let is_primary = name == "_id_";
+    MongoIndexSpec {
+        is_primary,
+        name,
+        keys,
+        is_unique: index_flag(document, "unique") || is_primary,
+        is_sparse: index_flag(document, "sparse"),
+        expire_after_seconds: index_number(document, "expireAfterSeconds"),
+        partial_filter_expression,
+        background: index_flag(document, "background"),
+        bucket_size: index_number(document, "bucketSize"),
+        hidden: index_flag(document, "hidden"),
+        properties_complete: true,
+        extra_options,
+    }
+}
+
+/// Degrade a shared [`IndexInfo`] into a spec for drivers that cannot report the
+/// full option set. `properties_complete` stays `false` so nothing is presented as
+/// server truth that was never read.
+pub fn index_spec_from_index_info(info: &IndexInfo) -> MongoIndexSpec {
+    let keys = match info.index_type.as_deref().map(str::trim).filter(|spec| !spec.is_empty()) {
+        Some(spec) => spec
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| match part.rsplit_once(':') {
+                Some((field, direction)) if !field.trim().is_empty() => {
+                    MongoIndexKey { field: field.trim().to_string(), direction: direction.trim().to_string() }
+                }
+                _ => MongoIndexKey { field: part.to_string(), direction: String::new() },
+            })
+            .collect::<Vec<_>>(),
+        None => {
+            info.columns.iter().map(|field| MongoIndexKey { field: field.clone(), direction: String::new() }).collect()
+        }
+    };
+    MongoIndexSpec {
+        name: info.name.clone(),
+        keys,
+        is_unique: info.is_unique,
+        is_primary: info.is_primary,
+        is_sparse: false,
+        expire_after_seconds: None,
+        partial_filter_expression: info.filter.clone(),
+        background: false,
+        bucket_size: None,
+        hidden: false,
+        properties_complete: false,
+        extra_options: None,
     }
 }
 
@@ -996,6 +1282,7 @@ async fn find_documents_with_total(
         extended_documents: Some(extended_documents),
         total,
         total_is_exact,
+        next_cursor: None,
     })
 }
 
@@ -1152,6 +1439,7 @@ pub async fn find_documents_extended_json(
         raw_documents: None,
         total,
         total_is_exact,
+        next_cursor: None,
     })
 }
 
@@ -1220,6 +1508,7 @@ pub async fn aggregate_documents(
             extended_documents: Some(vec![extended]),
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         });
     }
 
@@ -1277,6 +1566,7 @@ async fn drain_document_cursor(
         extended_documents: Some(extended_documents),
         total,
         total_is_exact: true,
+        next_cursor: None,
     })
 }
 
@@ -1337,6 +1627,7 @@ pub async fn distinct(
         extended_documents: Some(extended_documents),
         total,
         total_is_exact: true,
+        next_cursor: None,
     })
 }
 
@@ -1905,6 +2196,7 @@ fn single_document_result(document: Option<Document>) -> MongoDocumentResult {
             extended_documents: Some(vec![Bson::Document(document).into_canonical_extjson()]),
             total: 1,
             total_is_exact: true,
+            next_cursor: None,
         },
         None => MongoDocumentResult {
             documents: Vec::new(),
@@ -1912,6 +2204,7 @@ fn single_document_result(document: Option<Document>) -> MongoDocumentResult {
             extended_documents: Some(Vec::new()),
             total: 0,
             total_is_exact: true,
+            next_cursor: None,
         },
     }
 }
@@ -2364,6 +2657,11 @@ fn json_filter_value_to_bson(value: &serde_json::Value, field_name: Option<&str>
         }
         serde_json::Value::Object(obj) => {
             if obj.len() == 1 {
+                if obj.contains_key("$regularExpression") {
+                    if let Ok(Some(value)) = parse_extended_json_value(obj) {
+                        return value;
+                    }
+                }
                 if let Some(serde_json::Value::String(hex)) = obj.get("$oid") {
                     if let Ok(oid) = ObjectId::parse_str(hex) {
                         return Bson::ObjectId(oid);
@@ -2452,6 +2750,22 @@ fn expand_object_id_string_array(items: &[serde_json::Value]) -> Bson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_oidc_auth_mechanism_in_mongo_uri() {
+        assert!(mongo_uri_uses_oidc("mongodb://localhost/test?authSource=%24external&authMechanism=MONGODB-OIDC"));
+        assert!(mongo_uri_uses_oidc(
+            "mongodb://localhost/test?authMechanism%3Dignored=x&authMechanism=mongodb-oidc#fragment"
+        ));
+        assert!(!mongo_uri_uses_oidc("mongodb://localhost/test?authSource=admin&authMechanism=SCRAM-SHA-256"));
+    }
+
+    #[test]
+    fn preserves_mongodb_driver_machine_oidc_environment() {
+        assert!(mongo_oidc_uses_machine_environment(Some(&mongodb::bson::doc! { "ENVIRONMENT": "k8s" })));
+        assert!(!mongo_oidc_uses_machine_environment(Some(&mongodb::bson::doc! { "TOKEN_RESOURCE": "resource" })));
+        assert!(!mongo_oidc_uses_machine_environment(None));
+    }
 
     #[test]
     fn parses_find_collation_options() {
@@ -3211,6 +3525,161 @@ mod tests {
     }
 
     #[test]
+    fn index_spec_from_document_reports_every_modeled_property() {
+        let spec = index_spec_from_document(&doc! {
+            "v": 2,
+            "key": { "expiresAt": 1 },
+            "name": "expires_ttl",
+            "unique": true,
+            "sparse": true,
+            "expireAfterSeconds": 3600,
+            "partialFilterExpression": { "archived": false },
+            "hidden": true,
+        });
+
+        assert_eq!(spec.name, "expires_ttl");
+        assert_eq!(spec.keys, vec![MongoIndexKey { field: "expiresAt".to_string(), direction: "1".to_string() }]);
+        assert!(spec.is_unique);
+        assert!(spec.is_sparse);
+        assert!(!spec.is_primary);
+        assert_eq!(spec.expire_after_seconds, Some(3600));
+        assert_eq!(spec.partial_filter_expression.as_deref(), Some("{\"archived\":false}"));
+        assert!(spec.hidden);
+        assert!(spec.properties_complete);
+        assert_eq!(spec.extra_options, None);
+    }
+
+    #[test]
+    fn index_spec_from_document_canonicalizes_whole_doubles_and_marks_the_default_index() {
+        let spec = index_spec_from_document(&doc! {
+            "key": { "_id": 1.0 },
+            "name": "_id_",
+        });
+
+        assert!(spec.is_primary);
+        assert_eq!(spec.keys, vec![MongoIndexKey { field: "_id".to_string(), direction: "1".to_string() }]);
+        assert!(spec.is_unique, "the default _id index is unique even when the server omits the flag");
+    }
+
+    #[test]
+    fn index_spec_from_document_keeps_non_numeric_key_directions_literal() {
+        let spec = index_spec_from_document(&doc! {
+            "key": { "content": "text", "location": "2dsphere" },
+            "name": "content_text_location_2dsphere",
+        });
+
+        assert_eq!(
+            spec.keys,
+            vec![
+                MongoIndexKey { field: "content".to_string(), direction: "text".to_string() },
+                MongoIndexKey { field: "location".to_string(), direction: "2dsphere".to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn index_spec_from_document_accepts_numeric_truthiness_for_flags() {
+        let spec = index_spec_from_document(&doc! {
+            "key": { "email": 1 },
+            "name": "email_1",
+            "unique": 1,
+            "sparse": 0,
+            "background": 1,
+        });
+
+        assert!(spec.is_unique);
+        assert!(!spec.is_sparse);
+        assert!(spec.background);
+    }
+
+    #[test]
+    fn index_spec_from_document_collects_unmodeled_options_without_losing_them() {
+        let spec = index_spec_from_document(&doc! {
+            "key": { "location": "2dsphere" },
+            "name": "location_2dsphere",
+            "2dsphereIndexVersion": 3,
+            "collation": { "locale": "en" },
+        });
+
+        let extra = spec.extra_options.expect("unmodeled options must be preserved");
+        assert!(extra.contains("2dsphereIndexVersion"), "{extra}");
+        assert!(extra.contains("collation"), "{extra}");
+        assert!(!extra.contains("\"name\""), "modeled options must not be duplicated: {extra}");
+        assert!(!extra.contains("\"key\""), "modeled options must not be duplicated: {extra}");
+    }
+
+    #[test]
+    fn index_spec_from_document_derives_a_name_when_the_server_omits_it() {
+        let spec = index_spec_from_document(&doc! { "key": { "email": 1, "createdAt": -1 } });
+
+        assert_eq!(spec.name, "email_1_createdAt_-1");
+    }
+
+    #[test]
+    fn index_spec_from_document_reads_int64_and_double_ttl_values() {
+        let from_int64 =
+            index_spec_from_document(&doc! { "key": { "a": 1 }, "name": "a_1", "expireAfterSeconds": Bson::Int64(90) });
+        let from_double = index_spec_from_document(
+            &doc! { "key": { "a": 1 }, "name": "a_1", "expireAfterSeconds": Bson::Double(90.0) },
+        );
+
+        assert_eq!(from_int64.expire_after_seconds, Some(90));
+        assert_eq!(from_double.expire_after_seconds, Some(90));
+    }
+
+    #[test]
+    fn index_spec_from_index_info_marks_properties_as_incomplete() {
+        let spec = index_spec_from_index_info(&IndexInfo {
+            name: "email_1".to_string(),
+            columns: vec!["email".to_string()],
+            is_unique: true,
+            is_primary: false,
+            filter: Some("{\"archived\":false}".to_string()),
+            index_type: Some("email: 1".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            constraint_backed: false,
+        });
+
+        assert_eq!(spec.name, "email_1");
+        assert_eq!(spec.keys, vec![MongoIndexKey { field: "email".to_string(), direction: "1".to_string() }]);
+        assert!(spec.is_unique);
+        assert_eq!(spec.partial_filter_expression.as_deref(), Some("{\"archived\":false}"));
+        // The Legacy Agent cannot report these, so the flag tells the UI not to
+        // present the false values as though they came from the server.
+        assert!(!spec.properties_complete);
+        assert!(!spec.is_sparse);
+        assert_eq!(spec.expire_after_seconds, None);
+    }
+
+    #[test]
+    fn index_spec_from_index_info_falls_back_to_columns_without_an_index_type() {
+        let spec = index_spec_from_index_info(&IndexInfo {
+            name: "compound".to_string(),
+            columns: vec!["a".to_string(), "b".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            constraint_backed: false,
+        });
+
+        assert_eq!(
+            spec.keys,
+            vec![
+                MongoIndexKey { field: "a".to_string(), direction: String::new() },
+                MongoIndexKey { field: "b".to_string(), direction: String::new() },
+            ]
+        );
+    }
+
+    #[test]
     fn mongo_namespace_validation_preserves_whitespace_and_rejects_only_empty_names() {
         assert_eq!(validate_mongo_namespace_name("  app  ", "Database").unwrap(), "  app  ");
         assert_eq!(validate_mongo_namespace_name(" users ", "Collection").unwrap(), " users ");
@@ -3441,6 +3910,9 @@ mod tests {
                 index_type: Some("_id: 1".to_string()),
                 included_columns: None,
                 comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_email_unique".to_string(),
@@ -3451,6 +3923,9 @@ mod tests {
                 index_type: Some("email: 1".to_string()),
                 included_columns: None,
                 comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                constraint_backed: false,
             },
             IndexInfo {
                 name: "users_status_idx".to_string(),
@@ -3461,6 +3936,9 @@ mod tests {
                 index_type: Some("status: 1".to_string()),
                 included_columns: None,
                 comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: vec![],
+                constraint_backed: false,
             },
         ];
         let after = vec![before[0].clone(), before[2].clone()];
@@ -3505,6 +3983,25 @@ mod tests {
         assert!(matches!(doc.get("_id"), Some(Bson::ObjectId(oid)) if oid.to_hex() == "507f1f77bcf86cd799439011"));
         assert!(matches!(doc.get("created_at"), Some(Bson::DateTime(_))));
         assert!(matches!(doc.get("count"), Some(Bson::Int64(42))));
+    }
+
+    #[test]
+    fn json_filter_to_document_parses_extended_json_regex() {
+        let value = serde_json::json!({
+            "packagingRatio": {
+                "$regularExpression": {
+                    "pattern": "^[^:：]*盒",
+                    "options": "im",
+                }
+            }
+        });
+        let doc = json_filter_to_document(&value).unwrap();
+
+        assert!(matches!(
+            doc.get("packagingRatio"),
+            Some(Bson::RegularExpression(regex))
+                if regex.pattern == "^[^:：]*盒" && regex.options == "im"
+        ));
     }
 
     #[test]

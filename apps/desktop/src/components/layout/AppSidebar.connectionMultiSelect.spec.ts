@@ -135,7 +135,10 @@ const mountedApps: Array<{ unmount: () => void; host: HTMLElement }> = [];
 function createStore() {
   return reactive({
     connections: [{ id: "conn-visible" }, { id: "conn-hidden" }, { id: "conn-next" }],
-    sidebarLayout: { groups: [{ id: "group-a", name: "Group A" }] },
+    sidebarLayout: {
+      groups: [{ id: "group-a", name: "Group A" }],
+      order: [{ type: "group", id: "group-a", children: [] }],
+    },
     selectedTreeNodeIds: [] as string[],
     selectedTreeNodeId: null as string | null,
     treeSelectionAnchorId: null as string | null,
@@ -210,6 +213,44 @@ describe("AppSidebar connection multi-select moves", () => {
     expect(mocks.store.moveConnectionToGroup.mock.calls[mocks.store.moveConnectionToGroup.mock.calls.length - 1]).toEqual(["conn-next", "group-a"]);
     expect(mocks.store.moveConnectionToGroup).toHaveBeenCalledTimes(3);
     expect(mocks.store.selectedTreeNodeIds).toEqual([]);
+  });
+
+  it("shows the selected count beside the connection title instead of as a toolbar item", async () => {
+    setSelection(["conn-visible", "conn-hidden"]);
+    const host = await mountSidebar();
+
+    const count = host.querySelector("[data-connection-selection-count]");
+    expect(count?.textContent?.trim()).toBe("connectionGroup.selectedConnections");
+    expect(count?.previousElementSibling?.textContent?.trim()).toBe("sidebar.connections");
+  });
+
+  it("exits connection multi-select when Escape is pressed in the sidebar", async () => {
+    setSelection(["conn-visible", "conn-hidden"]);
+    const host = await mountSidebar();
+    const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+
+    host.querySelector<HTMLElement>(".app-sidebar-panel")!.dispatchEvent(event);
+    await nextTick();
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(mocks.store.selectedTreeNodeIds).toEqual([]);
+    expect(mocks.store.selectedTreeNodeId).toBeNull();
+    expect(mocks.store.treeSelectionAnchorId).toBeNull();
+    expect(mocks.store.connectionMultiSelectActive).toBe(false);
+  });
+
+  it("does not exit connection multi-select when Escape comes from an input", async () => {
+    setSelection(["conn-visible", "conn-hidden"]);
+    const host = await mountSidebar();
+    click(host.querySelector('[data-tooltip="connectionGroup.createGroup"] button'));
+    await nextTick();
+    const input = host.querySelector<HTMLInputElement>("[data-dialog] input");
+
+    input!.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+    await nextTick();
+
+    expect(mocks.store.selectedTreeNodeIds).toEqual(["conn-visible", "conn-hidden"]);
+    expect(mocks.store.connectionMultiSelectActive).toBe(true);
   });
 
   it("keeps selection on cancel and releases it after creating a new group", async () => {

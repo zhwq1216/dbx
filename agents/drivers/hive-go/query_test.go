@@ -302,6 +302,72 @@ func TestExecuteQueryUsesHiveServerResultSetSignal(t *testing.T) {
 	}
 }
 
+func TestQueryResultsPreserveHiveServerLabelsWithoutDotSplitting(t *testing.T) {
+	columns := []string{"id", "customer.id", "total + 1", "id"}
+	columnTypes := []string{"BIGINT", "BIGINT", "DOUBLE", "BIGINT"}
+	behavior := &scriptedBehavior{}
+	behavior.query = func(ctx context.Context, _ string) (driver.Rows, error) {
+		return newScriptedRows(ctx, columns, columnTypes, [][]driver.Value{{int64(1), int64(2), float64(3), int64(4)}, {int64(5), int64(6), float64(7), int64(8)}}), nil
+	}
+	server := newScriptedServer(t, behavior)
+
+	ordinary, err := server.executeQuery(queryOptions{SQL: "SELECT * FROM labels"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(ordinary.Columns, columns) || !reflect.DeepEqual(ordinary.ColumnTypes, []string{"bigint", "bigint", "double", "bigint"}) {
+		t.Fatalf("ordinary metadata changed: %#v", ordinary)
+	}
+	if len(ordinary.Rows) != 2 || ordinary.Rows[0][0] != "1" || ordinary.Rows[0][3] != "4" {
+		t.Fatalf("ordinary values changed: %#v", ordinary.Rows)
+	}
+
+	first, err := server.executeQueryPage(queryOptions{SQL: "SELECT * FROM labels", MaxRows: 2}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SessionID == nil || !first.HasMore || !reflect.DeepEqual(first.Columns, columns) {
+		t.Fatalf("first page metadata changed: %#v", first)
+	}
+	second, err := server.fetchQueryPage(*first.SessionID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.HasMore || second.SessionID != nil || !reflect.DeepEqual(second.Columns, columns) {
+		t.Fatalf("cached page metadata changed: %#v", second)
+	}
+}
+
+func TestPagedQueryPreservesDuplicateLeadingValuesAcrossPages(t *testing.T) {
+	behavior := &scriptedBehavior{}
+	behavior.query = func(ctx context.Context, _ string) (driver.Rows, error) {
+		return newScriptedRows(
+			ctx,
+			[]string{"group_id", "row_id"},
+			[]string{"BIGINT", "BIGINT"},
+			[][]driver.Value{{int64(1), int64(101)}, {int64(1), int64(102)}, {int64(1), int64(103)}},
+		), nil
+	}
+	server := newScriptedServer(t, behavior)
+
+	first, err := server.executeQueryPage(queryOptions{SQL: "SELECT group_id, row_id FROM repeated_values", MaxRows: 3}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SessionID == nil || !first.HasMore {
+		t.Fatalf("expected an open cursor after the first page: %#v", first)
+	}
+	second, err := server.fetchQueryPage(*first.SessionID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allRows := append(append([][]any{}, first.Rows...), second.Rows...)
+	expected := [][]any{{"1", "101"}, {"1", "102"}, {"1", "103"}}
+	if !reflect.DeepEqual(allRows, expected) || second.HasMore {
+		t.Fatalf("duplicate leading values changed across cursor pages: %#v", allRows)
+	}
+}
+
 func TestPagedQueryTruncatesAndPreservesLegacyJDBCValueSemantics(t *testing.T) {
 	largeValue := strings.Repeat("x", 256*1024)
 	createdAt := time.Date(2026, time.August, 11, 10, 11, 12, 345000000, time.UTC)
@@ -470,31 +536,24 @@ func TestRuntimeSessionsRemainIsolated(t *testing.T) {
 	}
 }
 
-func TestTransactionFallbackDoesNotReplayFailedStatements(t *testing.T) {
+func TestTransactionRejectsUnsupportedDriverBeforeStatementsRun(t *testing.T) {
 	behavior := &scriptedBehavior{}
 	behavior.exec = func(_ context.Context, query string) (driver.Result, error) {
-		if strings.Contains(query, "second") {
-			return nil, io.EOF
-		}
-		return driver.RowsAffected(1), nil
+		return nil, fmt.Errorf("must not execute %q", query)
 	}
 	server := newScriptedServer(t, behavior)
 	_, err := server.executeStatements(rawParams(map[string]any{
 		"statements": []string{"INSERT first", "INSERT second", "INSERT third"},
 	}), true)
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected connection failure, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "does not support rollbackable transactions") {
+		t.Fatalf("expected unsupported transaction error, got %v", err)
 	}
 	_, executions, beginCalls, _ := behavior.snapshot()
-	if !reflect.DeepEqual(executions, []string{"INSERT first", "INSERT second"}) {
-		t.Fatalf("failed transaction was replayed or continued: %v", executions)
+	if len(executions) != 0 {
+		t.Fatalf("unsupported transaction executed statements: %v", executions)
 	}
 	if beginCalls == 0 {
-		t.Fatal("transaction capability was not attempted before fallback")
-	}
-	rpcErr := classifyRPCError("execute_transaction", "session-a", err)
-	if rpcErr.Data.Category != "connection" || rpcErr.Data.SessionDisposition != "quarantine" {
-		t.Fatalf("unexpected connection failure classification: %#v", rpcErr)
+		t.Fatal("transaction capability was not checked")
 	}
 }
 

@@ -3,18 +3,18 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{watch, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use mysql_async::prelude::Queryable;
 use mysql_async::Row as MysqlRow;
 
 use crate::agent_connection::{
-    agent_connect_params, agent_connect_params_with_role, h2_file_path_from_jdbc_url, is_h2_file_connection,
-    mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver, oracle_alternate_connect_config_labels,
-    oracle_alternate_connect_configs, oracle_error_with_driver_hint, should_retry_mongo_with_legacy_driver,
-    trino_like_jdbc_connection_string, AgentSessionRole,
+    agent_connect_params, agent_connect_params_with_role, h2_file_path_from_jdbc_url, hive_uses_zookeeper_discovery,
+    is_h2_file_connection, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
+    oracle_alternate_connect_config_labels, oracle_alternate_connect_configs, oracle_error_with_driver_hint,
+    should_retry_mongo_with_legacy_driver, trino_like_jdbc_connection_string, AgentSessionRole,
 };
-use crate::agent_manager::{JavaRuntimeMode, DEFAULT_JRE_KEY};
+use crate::agent_manager::{AgentManager, JavaRuntimeMode, DEFAULT_JRE_KEY};
 use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::database_capabilities;
 use crate::db;
@@ -26,9 +26,12 @@ use crate::models::connection::{
     database_info_from_protocol_value, parse_jdbc_host_port, parse_mongo_first_host, rewrite_jdbc_url_host,
     ConnectionConfig, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType, TransportLayerConfig,
 };
+use crate::mongo_oidc::MongoOidcBrowserOpener;
+use crate::nacos::config::{NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD};
 use crate::path_utils::expand_tilde;
 use crate::plugins::{PluginDriverSession, PluginRegistry, PluginRuntimeEnv};
 use crate::query_cancel::RunningQueries;
+use crate::session_credentials::SessionCredentialStore;
 use crate::storage::{normalize_duckdb_worker_max_processes, Storage, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
 use crate::task_supervisor::TaskSupervisor;
 
@@ -43,6 +46,9 @@ const DEFAULT_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const ACCESS_AGENT_CONNECT_TIMEOUT_SECS: u64 = 30;
 const POOL_CLOSE_TIMEOUT_SECS: u64 = 3;
 const HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const METADATA_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const METADATA_POOL_DEFAULT_LIMIT: usize = 6;
+pub(crate) const METADATA_POOL_SQLSERVER_LIMIT: usize = 1;
 
 mod duckdb_types {
     #[cfg(feature = "duckdb-sidecar")]
@@ -62,21 +68,8 @@ pub enum MysqlMode {
     OceanBaseOracle,
 }
 
-fn is_oceanbase_mysql_config(config: &ConnectionConfig) -> bool {
-    config.db_type == DatabaseType::Mysql
-        && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("oceanbase"))
-}
-
-pub(crate) fn oceanbase_mysql_query_timeout_sql(config: &ConnectionConfig, timeout_secs: u64) -> Option<String> {
-    if !is_oceanbase_mysql_config(config) || timeout_secs == 0 {
-        return None;
-    }
-    let timeout_us = timeout_secs.saturating_mul(1_000_000);
-    Some(format!("SET ob_query_timeout = {timeout_us}"))
-}
-
 fn oceanbase_mysql_setup_queries(config: &ConnectionConfig) -> Vec<String> {
-    oceanbase_mysql_query_timeout_sql(config, config.query_timeout_secs).into_iter().collect()
+    db::oceanbase_mysql::query_timeout_sql(config, config.query_timeout_secs).into_iter().collect()
 }
 
 fn mysql_pool_setup_queries(config: &ConnectionConfig, url: &str) -> Vec<String> {
@@ -89,6 +82,7 @@ fn mysql_pool_setup_queries(config: &ConnectionConfig, url: &str) -> Vec<String>
     queries
 }
 
+#[derive(Clone)]
 pub enum PoolKind {
     Mysql(db::mysql::MySqlPool, MysqlMode),
     Postgres(deadpool_postgres::Pool),
@@ -96,16 +90,19 @@ pub enum PoolKind {
     Rqlite(db::rqlite_driver::RqliteClient),
     Turso(db::turso_driver::TursoClient),
     CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
-    Redis(db::redis_driver::RedisConnection),
+    Redis(Arc<db::redis_driver::RedisConnection>),
     DuckDbWorker(DuckDbWorkerHandle),
     MongoDb(mongodb::Client),
+    DynamoDb(db::dynamodb_driver::DynamoDbClient),
     ClickHouse(db::clickhouse_driver::ChClient),
     SqlServer(Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>),
     Elasticsearch(db::elasticsearch_driver::EsClient),
     Easysearch(db::easysearch_driver::EasysearchClient),
+    Meilisearch(db::meilisearch_driver::MeilisearchClient),
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
+    InfluxDb3(db::influxdb3_driver::Influxdb3Client),
     VictoriaMetrics(db::victoriametrics_driver::VictoriaMetricsClient),
     Agent(Arc<db::agent_driver::PooledAgentClient>),
     ExternalDriver {
@@ -137,17 +134,130 @@ impl PoolKind {
     }
 }
 
+#[derive(Clone)]
+struct PoolPublication(Arc<()>);
+
+impl PoolPublication {
+    fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[derive(Clone)]
+struct PoolPublicationSnapshot {
+    pool: PoolKind,
+    publication: PoolPublication,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct StalePoolCleanupBarriers {
+    before_removal: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+    after_removal: Option<(Arc<tokio::sync::Barrier>, Arc<tokio::sync::Barrier>)>,
+}
+
+/// Internal pool registry that assigns an opaque identity to every published
+/// entry. The identity belongs to the registry publication rather than to the
+/// driver handle, so replacing an entry always creates a new generation even
+/// when the replacement reuses a cloned handle.
+#[doc(hidden)]
+pub struct ConnectionPoolRegistry {
+    pools: HashMap<String, PoolKind>,
+    publications: HashMap<String, PoolPublication>,
+}
+
+impl ConnectionPoolRegistry {
+    fn new() -> Self {
+        Self { pools: HashMap::new(), publications: HashMap::new() }
+    }
+
+    pub fn insert(&mut self, pool_key: String, pool: PoolKind) -> Option<PoolKind> {
+        self.publications.insert(pool_key.clone(), PoolPublication::new());
+        self.pools.insert(pool_key, pool)
+    }
+
+    pub fn remove(&mut self, pool_key: &str) -> Option<PoolKind> {
+        self.publications.remove(pool_key);
+        self.pools.remove(pool_key)
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.publications.clear();
+        self.pools.clear();
+    }
+
+    fn drain(&mut self) -> std::collections::hash_map::Drain<'_, String, PoolKind> {
+        self.publications.clear();
+        self.pools.drain()
+    }
+
+    fn snapshot(&self, pool_key: &str) -> Option<PoolPublicationSnapshot> {
+        Some(PoolPublicationSnapshot {
+            pool: self.pools.get(pool_key)?.clone(),
+            publication: self.publications.get(pool_key)?.clone(),
+        })
+    }
+
+    fn remove_if_publication(&mut self, pool_key: &str, expected: &PoolPublication) -> Option<PoolKind> {
+        let is_current = self.publications.get(pool_key).is_some_and(|current| current.is_same(expected));
+        is_current.then(|| self.remove(pool_key)).flatten()
+    }
+}
+
+impl std::ops::Deref for ConnectionPoolRegistry {
+    type Target = HashMap<String, PoolKind>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pools
+    }
+}
+
 enum ConnectionDatabaseInfoSource {
     Agent(Arc<db::agent_driver::PooledAgentClient>),
-    ExternalDriver { config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
+    MongoAgent(Arc<db::agent_driver::PooledAgentClient>, Option<String>),
+    ExternalDriver {
+        config: Arc<ConnectionConfig>,
+        session: Arc<PluginDriverSession>,
+    },
     NativeMysql(db::mysql::MySqlPool),
     NativeHBase(db::hbase_driver::HBaseClient),
+    NativeMongo(mongodb::Client, Option<String>),
+    Meilisearch(db::meilisearch_driver::MeilisearchClient),
+    VictoriaMetrics(db::victoriametrics_driver::VictoriaMetricsClient),
+    Redis(String),
+    Nacos,
+    Consul(Box<crate::consul::ConsulClient>),
+    #[cfg(feature = "mq-admin")]
+    MessageQueue,
 }
 
 /// Held connection for a manual transaction session
 pub enum TxnConnection {
     Postgres(Box<deadpool_postgres::Object>),
-    Mysql(mysql_async::Conn),
+    /// A dedicated MySQL connection. Cancellation may consume and discard this
+    /// connection instead of trying to reuse it after an interrupted result set.
+    Mysql(Option<mysql_async::Conn>),
+    /// Dedicated agent multi_session workload client with an open sticky TX.
+    Agent {
+        client: Arc<db::agent_driver::PooledAgentClient>,
+        /// Client-session id used when opening the dedicated agent pool.
+        client_session_id: String,
+        database: Option<String>,
+        cleanup_guard: ClientSessionPoolCleanupGuard,
+    },
+    /// Dedicated external-driver process whose shared JDBC connection owns the TX.
+    ExternalDriver {
+        session: Arc<PluginDriverSession>,
+        config: Arc<ConnectionConfig>,
+        client_session_id: String,
+        database: Option<String>,
+        cleanup_guard: ClientSessionPoolCleanupGuard,
+    },
 }
 
 pub struct TransactionSession {
@@ -183,13 +293,19 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Snowflake
             | DatabaseType::Trino
             | DatabaseType::Hive
+            | DatabaseType::Kyuubi
+            | DatabaseType::Impala
+            | DatabaseType::Argo
             | DatabaseType::Spark
             | DatabaseType::Db2
             | DatabaseType::Informix
             | DatabaseType::Neo4j
             | DatabaseType::Cassandra
             | DatabaseType::Bigquery
+            | DatabaseType::Spanner
             | DatabaseType::Kylin
+            | DatabaseType::Ignite
+            | DatabaseType::Ignite3
             | DatabaseType::Sundb
             | DatabaseType::Oscar
             | DatabaseType::Tdengine
@@ -203,7 +319,7 @@ macro_rules! agent_connection_pool_database_type {
 }
 
 pub struct AppState {
-    pub connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    connections: Arc<RwLock<ConnectionPoolRegistry>>,
     task_supervisor: TaskSupervisor,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     draining_pools: Arc<std::sync::Mutex<HashMap<String, watch::Sender<bool>>>>,
@@ -223,8 +339,24 @@ pub struct AppState {
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     pub transaction_sessions: Arc<RwLock<HashMap<String, TransactionSession>>>,
+    /// `save_password=false` 连接本次运行期的临时密码（内存，进程退出即丢，
+    /// 绝不落盘）。键为 `(owner_scope, connection_id)`：桌面端 owner 为空串，
+    /// Web 端 owner 为已认证会话 token，不同登录会话互不可见。建池/池重建/
+    /// AI/元数据从它读取，前端通过状态接口查询。
+    pub session_credentials: SessionCredentialStore,
+    /// In-memory, never-persisted 1/5 minute write overrides for read-only connections.
+    pub write_unlock_windows: crate::write_unlock::WriteUnlockWindows,
+    metadata_gates: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    mongo_oidc_browser_opener: std::sync::RwLock<Option<MongoOidcBrowserOpener>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
+}
+
+fn transport_layers_through_last_ssh(layers: &[TransportLayerConfig]) -> Result<&[TransportLayerConfig], String> {
+    let Some(last_ssh_index) = layers.iter().rposition(|layer| matches!(layer, TransportLayerConfig::Ssh(_))) else {
+        return Err("Connection has no enabled SSH tunnel layer".to_string());
+    };
+    Ok(&layers[..=last_ssh_index])
 }
 
 /// 活跃时间以进程内单调时钟的相对毫秒存储（AtomicU64）：热路径每条查询都要
@@ -250,6 +382,55 @@ struct PoolActivity {
 struct ConnectionAttemptState {
     server_attempt: u64,
     client_attempt: Option<u64>,
+}
+
+pub(crate) fn metadata_concurrency_limit(db_type: DatabaseType, max_connections: usize) -> usize {
+    if db_type == DatabaseType::SqlServer {
+        METADATA_POOL_SQLSERVER_LIMIT
+    } else {
+        max_connections.saturating_sub(2).clamp(1, METADATA_POOL_DEFAULT_LIMIT)
+    }
+}
+
+pub(crate) fn uses_metadata_gate(db_type: DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Mysql | DatabaseType::Postgres | DatabaseType::SqlServer)
+}
+
+/// Session-scoped metadata gate allowance for a database type.
+///
+/// A non-empty `client_session_id` normally means the caller opened a
+/// dedicated single-connection session pool (for example MySQL tab sessions),
+/// so the gate allows only one in-flight metadata operation. PostgreSQL is the
+/// exception: `get_or_create_pool_for_session` builds a fresh full-size
+/// (10-connection) pool for each export session, so an allowance of 1 would
+/// serialize the database-export metadata prefetch (4 concurrent DDL/column
+/// lookups) and make three of them time out after METADATA_POOL_ACQUIRE_TIMEOUT
+/// with "DBX metadata pool is busy". Returning the pool's real capacity here
+/// flows into metadata_concurrency_limit, which caps the effective gate at
+/// METADATA_POOL_DEFAULT_LIMIT (6) -- still enough for the 4-wide prefetch and
+/// still isolated from the UI/base pool.
+fn metadata_gate_session_allowance(db_type: DatabaseType) -> usize {
+    if db_type == DatabaseType::Postgres {
+        // Matches db::postgres::connect's Pool::builder().max_size(10).
+        10
+    } else {
+        // MySQL and other session-scoped pools are single-connection.
+        1
+    }
+}
+
+fn metadata_gate_key(
+    connection_id: &str,
+    database: Option<&str>,
+    db_type: DatabaseType,
+    client_session_id: Option<&str>,
+) -> String {
+    let session = if db_type == DatabaseType::SqlServer {
+        ""
+    } else {
+        client_session_id.map(str::trim).filter(|session| !session.is_empty()).unwrap_or_default()
+    };
+    format!("{connection_id}\0{}\0{}", database.unwrap_or_default(), session)
 }
 
 struct PoolDrainGuard {
@@ -295,20 +476,20 @@ impl PoolActivity {
 
 pub struct PoolActivityTouch {
     pool_key: String,
-    connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    connections: Arc<RwLock<ConnectionPoolRegistry>>,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     task_supervisor: TaskSupervisor,
 }
 
 #[derive(Clone)]
 struct PoolRoutingControl {
-    connections: Arc<RwLock<HashMap<String, PoolKind>>>,
+    connections: Arc<RwLock<ConnectionPoolRegistry>>,
     pool_activity: Arc<RwLock<HashMap<String, PoolActivity>>>,
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
     task_supervisor: TaskSupervisor,
 }
 
-pub(crate) struct ClientSessionPoolCleanupGuard {
+pub struct ClientSessionPoolCleanupGuard {
     pool_key: String,
     routing: PoolRoutingControl,
     armed: bool,
@@ -367,12 +548,20 @@ impl PoolRoutingControl {
             let mut removed = vec![(pool_key.to_string(), pool)];
             if replace_agent_runtime {
                 let sibling_keys = shared_runtime_sibling_keys(&connections, &removed[0].1);
-                for key in sibling_keys {
-                    if let Some(pool) = connections.remove(&key) {
-                        removed.push((key, pool));
+                let protects_manual_txn = sibling_keys.iter().any(|key| is_manual_transaction_pool_key(key))
+                    || is_manual_transaction_pool_key(pool_key);
+                if protects_manual_txn {
+                    log::warn!(
+                        "Skipping shared Agent runtime kill for '{pool_key}' because a manual-transaction session is active on the same runtime"
+                    );
+                } else {
+                    for key in sibling_keys {
+                        if let Some(pool) = connections.remove(&key) {
+                            removed.push((key, pool));
+                        }
                     }
+                    fail_stop_removed_agent_pool(pool_key, &removed[0].1);
                 }
-                fail_stop_removed_agent_pool(pool_key, &removed[0].1);
             }
             removed
         };
@@ -385,10 +574,17 @@ impl PoolRoutingControl {
         &self,
         pool_key: &str,
         expected_client: &Arc<db::agent_driver::PooledAgentClient>,
+        expected_publication: Option<&PoolPublication>,
         replace_agent_runtime: bool,
     ) -> bool {
         let removed = {
             let mut connections = self.connections.write().await;
+            let publication_is_current = expected_publication.is_none_or(|expected| {
+                connections.publications.get(pool_key).is_some_and(|current| current.is_same(expected))
+            });
+            if !publication_is_current {
+                return false;
+            }
             let is_current = matches!(
                 connections.get(pool_key),
                 Some(PoolKind::Agent(current)) if Arc::ptr_eq(current, expected_client)
@@ -404,14 +600,30 @@ impl PoolRoutingControl {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                let removed = runtime_keys
-                    .into_iter()
-                    .filter_map(|key| connections.remove(&key).map(|pool| (key, pool)))
-                    .collect::<Vec<_>>();
-                if !expected_client.fail_stop() {
-                    log::warn!("Failed to terminate the shared Agent runtime while detaching pool '{pool_key}'");
+                // Sticky manual-transaction sessions pin work on the shared runtime.
+                // Prefer quarantining only the failed route over killing every sibling TX.
+                let protects_manual_txn = runtime_keys.iter().any(|key| is_manual_transaction_pool_key(key))
+                    || is_manual_transaction_pool_key(pool_key);
+                if protects_manual_txn {
+                    log::warn!(
+                        "Agent pool '{pool_key}' requested runtime replacement, but a manual-transaction session shares the runtime; detaching only this pool"
+                    );
+                    if is_current {
+                        let pool = connections.remove(pool_key).expect("current Agent pool must still exist");
+                        vec![(pool_key.to_string(), pool)]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    let removed = runtime_keys
+                        .into_iter()
+                        .filter_map(|key| connections.remove(&key).map(|pool| (key, pool)))
+                        .collect::<Vec<_>>();
+                    if !expected_client.fail_stop() {
+                        log::warn!("Failed to terminate the shared Agent runtime while detaching pool '{pool_key}'");
+                    }
+                    removed
                 }
-                removed
             } else {
                 let pool = connections.remove(pool_key).expect("current Agent pool must still exist");
                 vec![(pool_key.to_string(), pool)]
@@ -443,20 +655,43 @@ impl PoolRoutingControl {
             PoolKind::Agent(client) => Some(client.clone()),
             _ => None,
         };
+        let protects_manual_txn = match agent_client.as_ref() {
+            Some(client) if client.uses_shared_runtime() => {
+                let connections = {
+                    let registry = self.connections.read().await;
+                    registry.pools.clone()
+                };
+                connections.iter().any(|(key, pool)| {
+                    is_manual_transaction_pool_key(key)
+                        && matches!(pool, PoolKind::Agent(sibling) if client.shares_runtime_with(sibling))
+                })
+            }
+            _ => false,
+        };
         match tokio::time::timeout(Duration::from_secs(POOL_CLOSE_TIMEOUT_SECS), close_pool_kind(pool)).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 log::warn!("Failed to close connection pool '{pool_key}': {error}");
-                if let Some(client) = agent_client.filter(|_| should_replace_agent_runtime(&error)) {
+                if protects_manual_txn {
+                    log::warn!(
+                        "Leaving shared Agent runtime running after close failure for '{pool_key}' to protect sibling sessions"
+                    );
+                } else if let Some(client) = agent_client.filter(|_| should_replace_agent_runtime(&error)) {
                     self.replace_runtime_after_close_failure(&pool_key, &client).await;
                 }
             }
             Err(_) => {
-                log::warn!(
-                    "Timed out closing connection pool '{pool_key}' after {POOL_CLOSE_TIMEOUT_SECS}s; replacing a shared Agent runtime when present."
-                );
-                if let Some(client) = agent_client {
-                    self.replace_runtime_after_close_failure(&pool_key, &client).await;
+                if protects_manual_txn {
+                    log::warn!(
+                        "Timed out closing shared Agent pool '{pool_key}' after {POOL_CLOSE_TIMEOUT_SECS}s; leaving the runtime running so sibling sessions (e.g. manual transactions) stay alive"
+                    );
+                } else {
+                    log::warn!(
+                        "Timed out closing connection pool '{pool_key}' after {POOL_CLOSE_TIMEOUT_SECS}s; replacing a shared Agent runtime when present."
+                    );
+                    if let Some(client) = agent_client {
+                        self.replace_runtime_after_close_failure(&pool_key, &client).await;
+                    }
                 }
             }
         }
@@ -621,15 +856,19 @@ pub fn upsert_connection_url_param(params: Option<&str>, key: &str, value: &str)
     parts.join("&")
 }
 
-pub fn prestosql_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str, port: u16) -> ConnectionConfig {
+pub fn prestosql_jdbc_config_for_endpoint(
+    config: &ConnectionConfig,
+    host: &str,
+    port: u16,
+) -> Result<ConnectionConfig, String> {
     let mut jdbc_config = config.clone();
     jdbc_config.connection_string =
-        Some(trino_like_jdbc_connection_string(config, host, port, config.effective_database().unwrap_or("")));
+        Some(trino_like_jdbc_connection_string(config, host, port, config.effective_database().unwrap_or(""))?);
     jdbc_config.url_params = None;
     if jdbc_config.jdbc_driver_class.as_deref().is_none_or(|value| value.trim().is_empty()) {
         jdbc_config.jdbc_driver_class = Some(PRESTOSQL_JDBC_DRIVER_CLASS.to_string());
     }
-    jdbc_config
+    Ok(jdbc_config)
 }
 
 pub fn gaussdb_uses_m_jdbc_driver(config: &ConnectionConfig) -> bool {
@@ -663,6 +902,17 @@ pub fn gaussdb_m_jdbc_config_for_endpoint(config: &ConnectionConfig, host: &str,
     });
     let params = upsert_connection_url_param(Some(raw_params), "sslmode", &sslmode);
     let params = upsert_connection_url_param(Some(&params), "ssl", if sslmode == "disable" { "false" } else { "true" });
+    let target_server_type = config
+        .external_config
+        .as_ref()
+        .and_then(|ext| ext.get("gaussdbTargetServerType"))
+        .and_then(|v| v.as_str())
+        .filter(|v| *v == "master" || *v == "slave" || *v == "any");
+    let params = if let Some(value) = target_server_type {
+        upsert_connection_url_param(Some(&params), "targetServerType", value)
+    } else {
+        params
+    };
     if !params.is_empty() {
         jdbc_url.push('?');
         jdbc_url.push_str(&params);
@@ -950,6 +1200,46 @@ fn mysql_metadata_fallback_url(
 }
 
 impl AppState {
+    /// Return an owned pool handle. The registry read lock is released before
+    /// the caller can perform any asynchronous database operation.
+    pub async fn pool_handle(&self, pool_key: &str) -> Option<PoolKind> {
+        self.connections.read().await.get(pool_key).cloned()
+    }
+
+    async fn pool_publication_snapshot(&self, pool_key: &str) -> Option<PoolPublicationSnapshot> {
+        self.connections.read().await.snapshot(pool_key)
+    }
+
+    async fn connection_pool_publication_snapshots(&self) -> Vec<(String, PoolPublicationSnapshot)> {
+        let connections = self.connections.read().await;
+        connections
+            .pools
+            .keys()
+            .filter_map(|pool_key| connections.snapshot(pool_key).map(|snapshot| (pool_key.clone(), snapshot)))
+            .collect()
+    }
+
+    /// Return an owned snapshot for operations that need to inspect multiple
+    /// entries. Cloning handles is cheap and prevents registry guards from
+    /// leaking into asynchronous database work.
+    pub async fn connection_pools_snapshot(&self) -> HashMap<String, PoolKind> {
+        self.connections.read().await.pools.clone()
+    }
+
+    /// Inspect the registry while holding its read lock. The callback is
+    /// deliberately synchronous so no database I/O can run under the lock.
+    pub async fn with_connection_pools<R>(&self, inspect: impl FnOnce(&HashMap<String, PoolKind>) -> R) -> R {
+        let connections = self.connections.read().await;
+        inspect(&connections.pools)
+    }
+
+    /// Mutate the registry atomically. The callback is deliberately
+    /// synchronous; asynchronous cleanup must use values returned from it.
+    pub async fn update_connection_pools<R>(&self, update: impl FnOnce(&mut ConnectionPoolRegistry) -> R) -> R {
+        let mut connections = self.connections.write().await;
+        update(&mut connections)
+    }
+
     fn pool_routing_control(&self) -> PoolRoutingControl {
         PoolRoutingControl {
             connections: self.connections.clone(),
@@ -957,6 +1247,43 @@ impl AppState {
             postgres_cancel_contexts: self.postgres_cancel_contexts.clone(),
             task_supervisor: self.task_supervisor.clone(),
         }
+    }
+
+    /// save_password=false 连接：持久化/运行态 config 的 password 恒为空，从本次
+    /// 运行期会话凭据仓库补主密码，使手动/编辑器/AI/元数据/池重建复用首次输入，
+    /// 不再反复弹窗。会话凭据只在内存中，进程退出即丢；"断开并忘记"后仓库为空，
+    /// 此处自然回到空密码（需重新输入）。
+    ///
+    /// owner 作用域取自 [`crate::session_credentials::current_credential_owner`]：
+    /// Web 请求由鉴权中间件注入会话 token，桌面端/后台任务为空串。这样不同登录
+    /// 会话只会读取各自输入的密码，不会跨会话复用。
+    pub fn apply_session_credential(
+        &self,
+        config: &ConnectionConfig,
+        db_config: &mut ConnectionConfig,
+        connection_id: &str,
+    ) {
+        if !config.save_password && db_config.password.is_empty() {
+            let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
+            if let Some(session_password) = self.session_credentials.get(&owner, connection_id) {
+                db_config.password = session_password;
+            }
+        }
+    }
+
+    /// no-save 连接复用已有池时，若该池由"另一个 owner 会话"创建，则不应复用
+    /// （否则会话 B 会直接使用会话 A 输入的临时密码建立的连接）。返回 `true`
+    /// 表示需要销毁旧池、以当前 owner 的凭据重建。
+    async fn pool_credential_owner_mismatch(&self, config: &ConnectionConfig, pool_key: &str) -> bool {
+        if config.save_password {
+            return false;
+        }
+        let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
+        if owner.is_empty() {
+            // 桌面端/未注入 owner：单用户场景，按既有逻辑复用。
+            return false;
+        }
+        self.session_credentials.pool_owner_mismatch(pool_key, &owner)
     }
 
     async fn handle_shared_connection_open_error(
@@ -1019,7 +1346,7 @@ impl AppState {
     ) -> Self {
         let data_dir = storage.data_dir().to_path_buf();
         Self {
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(RwLock::new(ConnectionPoolRegistry::new())),
             task_supervisor: TaskSupervisor::new(),
             pool_activity: Arc::new(RwLock::new(HashMap::new())),
             draining_pools: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1040,9 +1367,74 @@ impl AppState {
             duckdb_worker_max_processes: AtomicUsize::new(DUCKDB_WORKER_MAX_PROCESSES_DEFAULT),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
+            session_credentials: SessionCredentialStore::new(),
+            write_unlock_windows: crate::write_unlock::WriteUnlockWindows::default(),
+            metadata_gates: Arc::new(Mutex::new(HashMap::new())),
+            mongo_oidc_browser_opener: std::sync::RwLock::new(None),
             #[cfg(feature = "mq-admin")]
             mq_registry: crate::mq::MqAdminRegistry::new(),
         }
+    }
+
+    pub fn set_mongo_oidc_browser_opener(&self, opener: MongoOidcBrowserOpener) {
+        *self.mongo_oidc_browser_opener.write().expect("MongoDB OIDC browser opener lock poisoned") = Some(opener);
+    }
+
+    pub fn mongo_oidc_browser_opener(&self) -> Option<MongoOidcBrowserOpener> {
+        self.mongo_oidc_browser_opener.read().expect("MongoDB OIDC browser opener lock poisoned").clone()
+    }
+
+    pub(crate) async fn acquire_metadata_permit(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        db_type: DatabaseType,
+        client_session_id: Option<&str>,
+    ) -> Result<OwnedSemaphorePermit, String> {
+        let key = metadata_gate_key(connection_id, database, db_type, client_session_id);
+        let has_session = client_session_id.map(str::trim).is_some_and(|session| !session.is_empty());
+        let max_connections = if has_session { metadata_gate_session_allowance(db_type) } else { 10 };
+        let limit = metadata_concurrency_limit(db_type, max_connections);
+        let gate = {
+            let mut gates = self.metadata_gates.lock().await;
+            gates.entry(key.clone()).or_insert_with(|| Arc::new(Semaphore::new(limit))).clone()
+        };
+        let started = Instant::now();
+        let queued = gate.available_permits() == 0;
+        let permit = match tokio::time::timeout(METADATA_POOL_ACQUIRE_TIMEOUT, gate.acquire_owned()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(crate::query::METADATA_POOL_BUSY_ERROR.to_string()),
+            Err(_) => {
+                log::warn!(
+                    "[metadata:pool:busy] connection_id={} database={} wait_ms={} limit={}",
+                    connection_id,
+                    database.unwrap_or_default(),
+                    started.elapsed().as_millis(),
+                    limit
+                );
+                return Err(crate::query::METADATA_POOL_BUSY_ERROR.to_string());
+            }
+        };
+        if queued {
+            log::debug!(
+                "[metadata:pool:acquired] connection_id={} database={} wait_ms={} limit={}",
+                connection_id,
+                database.unwrap_or_default(),
+                started.elapsed().as_millis(),
+                limit
+            );
+        }
+        Ok(permit)
+    }
+
+    async fn clear_metadata_gates_for_connection(&self, connection_id: &str) {
+        let prefix = format!("{connection_id}\0");
+        self.metadata_gates.lock().await.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    async fn clear_metadata_gate_for_database(&self, connection_id: &str, database: Option<&str>) {
+        let prefix = format!("{connection_id}\0{}\0", database.unwrap_or_default());
+        self.metadata_gates.lock().await.retain(|key, _| !key.starts_with(&prefix));
     }
 
     pub fn jdbc_unavailable_error(&self) -> String {
@@ -1169,7 +1561,7 @@ impl AppState {
         if sqlserver_uses_legacy_driver(config) {
             let legacy_config = sqlserver_legacy_agent_config(config);
             let connect_params =
-                agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""));
+                agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""))?;
             let mut client = self
                 .agent_manager
                 .spawn(&legacy_config.db_type, legacy_config.driver_profile.as_deref())
@@ -1213,7 +1605,7 @@ impl AppState {
         if sqlserver_uses_legacy_driver(config) {
             let legacy_config = sqlserver_legacy_agent_config(config);
             let connect_params =
-                agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""));
+                agent_connect_params(&legacy_config, host, port, legacy_config.effective_database().unwrap_or(""))?;
             let mut client = self
                 .agent_manager
                 .spawn(&legacy_config.db_type, legacy_config.driver_profile.as_deref())
@@ -1316,13 +1708,19 @@ impl AppState {
             // candidate never reaches this point, so the existing route keeps its state.
             routing.stop_keepalive(&pool_key);
             activity.insert(pool_key.clone(), PoolActivity::now());
-            self.start_keepalive_task(
-                &pool_key,
-                &pool,
-                config,
-                #[cfg(feature = "mq-admin")]
-                mq_keepalive_adapter.clone(),
-            );
+            // Manual-transaction sessions pin a sticky connection/TX. Keepalive
+            // detach on these pools was able to tear down the shared agent runtime
+            // (and any open TX) when close timed out — skip probes for them.
+            let skip_keepalive = pool_key.contains(":session:manual-txn-");
+            if !skip_keepalive {
+                self.start_keepalive_task(
+                    &pool_key,
+                    &pool,
+                    config,
+                    #[cfg(feature = "mq-admin")]
+                    mq_keepalive_adapter.clone(),
+                );
+            }
             break Ok(connections.insert(pool_key.clone(), pool));
         };
         let previous = match previous {
@@ -1338,11 +1736,22 @@ impl AppState {
         if let Some(pool) = previous {
             routing.close_pool_with_timeout(pool_key.clone(), pool).await;
         }
-        let route_is_available =
-            self.connections.read().await.get(&pool_key).is_some_and(PoolKind::is_available_for_routing);
+        let route_is_available = self
+            .with_connection_pools(|connections| {
+                connections.get(&pool_key).is_some_and(PoolKind::is_available_for_routing)
+            })
+            .await;
         if !route_is_available {
             routing.detach_pool_by_key(&pool_key, true).await;
             return Err("Agent runtime is unavailable while publishing the connection pool".to_string());
+        }
+        // 记录 no-save 池由哪个 owner 会话创建，供多会话复用判定使用
+        // （见 pool_credential_owner_mismatch）。已保存密码连接始终共享池，不记录。
+        if !config.save_password {
+            let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
+            if !owner.is_empty() {
+                self.session_credentials.record_pool_owner(&pool_key, &owner);
+            }
         }
         Ok(())
     }
@@ -1627,6 +2036,35 @@ impl AppState {
         }
     }
 
+    /// Cancels the tasks whose frontend consumer lives in the webview renderer
+    /// session that is about to be reloaded after a WebView2 renderer process
+    /// failure.
+    ///
+    /// A renderer reload keeps the application process alive, so only the tasks
+    /// bound to the (now-dying) renderer session must be torn down. All of those
+    /// (SQL execution, counts/explains and exports) are registered in
+    /// [`Self::running_queries`], so this narrow boundary is exactly
+    /// [`RunningQueries::cancel_all`]: it signals their cancellation tokens and
+    /// fires any registered interrupts, which is what the underlying drivers
+    /// (and `query_result_export`) poll to stop work on the database.
+    ///
+    /// Connection pools, tunnels, transaction sessions and daemons are
+    /// *application-scoped* and are reused by the reloaded frontend, so they are
+    /// deliberately NOT closed here — closing them is the job of
+    /// [`Self::shutdown`] on a full application restart. This keeps a renderer
+    /// reload from evicting a pool and tearing down tunnels that the reloaded
+    /// page still needs.
+    ///
+    /// Returns the number of tasks signalled for cancellation (0 when there was
+    /// nothing running).
+    pub fn cancel_webview_reload_session_tasks(&self) -> usize {
+        let cancelled = self.running_queries.cancel_all();
+        if cancelled > 0 {
+            log::info!("cancelled {cancelled} webview-session query/export tasks before renderer reload");
+        }
+        cancelled
+    }
+
     #[cfg(test)]
     pub fn supervised_task_count(&self) -> usize {
         self.task_supervisor.active_count()
@@ -1729,29 +2167,31 @@ impl AppState {
 
         loop {
             self.wait_for_pool_drain(&pool_key).await;
-            let conns = self.connections.read().await;
-            if conns.contains_key(&pool_key) {
-                drop(conns);
+            if self.pool_handle(&pool_key).await.is_some() {
                 if self.remove_pool_if_duckdb_isolation_mismatch(&pool_key).await {
                     // Recreate below using the current DuckDB isolation mode.
+                } else if self.pool_credential_owner_mismatch(&config, &pool_key).await {
+                    // 创建该 no-save 池的是另一个登录会话：销毁旧池，用当前会话的
+                    // 凭据重建，避免跨会话复用他人输入的临时密码。
+                    self.remove_stale_connection_pool(&pool_key).await;
+                    break;
                 } else if !validate_existing_pool || !self.remove_stale_connection_pool(&pool_key).await {
                     self.touch_pool_activity(&pool_key).await;
                     return Ok(pool_key);
                 }
                 break;
             }
-            drop(conns);
-
             // A reclaim may have removed the pool after the first drain check. Wait
             // for its confirmed close or rollback before deciding to create a new one.
             self.wait_for_pool_drain(&pool_key).await;
-            if self.connections.read().await.contains_key(&pool_key) {
+            if self.pool_handle(&pool_key).await.is_some() {
                 continue;
             }
             break;
         }
 
-        let db_config = database_connection_config_with_catalog(&config, database, catalog);
+        let mut db_config = database_connection_config_with_catalog(&config, database, catalog);
+        self.apply_session_credential(&config, &mut db_config, connection_id);
 
         validate_h2_file_connection(&db_config)?;
         self.ensure_current_connection_attempt(connection_id, connection_attempt).await?;
@@ -1808,7 +2248,15 @@ impl AppState {
             | DatabaseType::Kwdb
             | DatabaseType::Questdb
             | DatabaseType::OpenGauss => {
-                let pg_pool = db::postgres::connect(&url, connect_timeout).await?;
+                // A session pool must have one physical client: sequential
+                // statements can otherwise lose temp tables/SET state when a
+                // pool checkout selects another PostgreSQL connection.
+                let pg_pool = db::postgres::connect_with_max_connections(
+                    &url,
+                    connect_timeout,
+                    postgres_pool_max_connections_for_session(client_session_id),
+                )
+                .await?;
                 // Build TLS cancel context for reconstructing TLS connection during cancel
                 if let Some(ctx) = db::postgres::build_postgres_cancel_context(&url) {
                     self.postgres_cancel_contexts.write().await.insert(pool_key.clone(), ctx);
@@ -1816,29 +2264,44 @@ impl AppState {
                 PoolKind::Postgres(pg_pool)
             }
             DatabaseType::Sqlite => {
-                let sqlite_path = expand_tilde(&db_config.host);
-                db::sqlite::validate_persistent_attachments(
-                    &sqlite_path,
-                    &db_config.password,
-                    !db_config.attached_databases.is_empty(),
-                )?;
-                let extensions = db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
-                    .into_iter()
-                    .map(|mut extension| {
-                        extension.path = expand_tilde(&extension.path);
-                        extension
-                    })
-                    .collect();
-                let pool = db::sqlite::connect_path_with_cipher_key_and_extensions(
-                    &sqlite_path,
-                    &db_config.password,
-                    extensions,
-                )
-                .await?;
-                for attached in &db_config.attached_databases {
-                    db::sqlite::attach_database(&pool, &attached.name, &expand_tilde(&attached.path))?;
+                if db::sqlite_worker::sqlite_ssh_worker_requested(&db_config) {
+                    let transport_layers = self.resolved_transport_layers(&db_config).await?;
+                    let worker = db::sqlite_worker::connect_sqlite_worker(
+                        &self.tunnels,
+                        &self.agent_manager,
+                        self.storage.data_dir(),
+                        connection_id,
+                        &db_config,
+                        &transport_layers,
+                    )
+                    .await?;
+                    PoolKind::Sqlite(db::sqlite::SqliteHandle::from_worker(worker))
+                } else {
+                    let sqlite_path = expand_tilde(&db_config.host);
+                    db::sqlite::validate_persistent_attachments(
+                        &sqlite_path,
+                        &db_config.password,
+                        !db_config.attached_databases.is_empty(),
+                    )?;
+                    let extensions =
+                        db::sqlite::sqlite_extension_specs_from_url_params(db_config.url_params.as_deref())
+                            .into_iter()
+                            .map(|mut extension| {
+                                extension.path = expand_tilde(&extension.path);
+                                extension
+                            })
+                            .collect();
+                    let pool = db::sqlite::connect_path_with_cipher_key_and_extensions(
+                        &sqlite_path,
+                        &db_config.password,
+                        extensions,
+                    )
+                    .await?;
+                    for attached in &db_config.attached_databases {
+                        db::sqlite::attach_database(&pool, &attached.name, &expand_tilde(&attached.path))?;
+                    }
+                    PoolKind::Sqlite(pool)
                 }
-                PoolKind::Sqlite(pool)
             }
             DatabaseType::Rqlite => {
                 let client = db::rqlite_driver::RqliteClient::new(
@@ -1879,7 +2342,7 @@ impl AppState {
                         db::redis_driver::connect_standalone(&db_config, &host, port, connect_timeout).await?,
                     ))
                 };
-                PoolKind::Redis(con)
+                PoolKind::Redis(Arc::new(con))
             }
             #[cfg(feature = "duckdb-sidecar")]
             DatabaseType::DuckDb => self.create_duckdb_pool(&db_config).await?,
@@ -1888,16 +2351,25 @@ impl AppState {
                 return Err("DuckDB support is not compiled in this build.".to_string());
             }
             DatabaseType::MongoDb => {
-                if mongo_uses_legacy_driver(&db_config) {
+                let uses_oidc = db::mongo_driver::mongo_uri_uses_oidc(&url);
+                if mongo_uses_legacy_driver(&db_config) && !uses_oidc {
                     log::info!("Using configured MongoDB legacy driver for connection_id={connection_id}");
-                    let connect_params = serde_json::json!({ "connection": agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or("")) });
+                    let connect_params = serde_json::json!({ "connection": agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""))? });
                     let mut client = self.agent_manager.spawn(&DatabaseType::MongoDb, Some("mongodb-legacy")).await?;
                     client.connect(connect_params).await.map_err(|err| mongo_legacy_error_with_auth_hint(&err))?;
                     PoolKind::agent(client)
                 } else {
-                    let native_err = match db::mongo_driver::connect(&url, connect_timeout, idle_timeout).await {
-                        Ok(client) => match db::mongo_driver::test_connection(
+                    let native_err = match db::mongo_driver::connect_with_oidc(
+                        &url,
+                        connect_timeout,
+                        idle_timeout,
+                        self.mongo_oidc_browser_opener(),
+                    )
+                    .await
+                    {
+                        Ok(client) => match db::mongo_driver::test_connection_for_url(
                             &client,
+                            &url,
                             connect_timeout,
                             db_config.effective_database(),
                         )
@@ -1905,7 +2377,7 @@ impl AppState {
                         {
                             Ok(()) => {
                                 // Re-check: another task may have created the pool while we were connecting.
-                                if self.connections.read().await.contains_key(&pool_key) {
+                                if self.pool_handle(&pool_key).await.is_some() {
                                     self.pool_routing_control()
                                         .close_pool_with_timeout(pool_key.clone(), PoolKind::MongoDb(client))
                                         .await;
@@ -1931,11 +2403,26 @@ impl AppState {
                         },
                         Err(e) => e,
                     };
-                    if should_retry_mongo_with_legacy_driver(&native_err) {
+                    if !uses_oidc && should_retry_mongo_with_legacy_driver(&native_err) {
                         log::info!("Native MongoDB driver failed ({native_err}), falling back to agent driver");
-                        let connect_params = serde_json::json!({ "connection": agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or("")) });
+                        let connect_params = serde_json::json!({ "connection": agent_connect_params(&db_config, &host, port, db_config.effective_database().unwrap_or(""))? });
+                        let legacy_agent_key =
+                            AgentManager::db_type_to_agent_key(&DatabaseType::MongoDb, Some("mongodb-legacy"))
+                                .ok_or_else(|| "MongoDB (Legacy) Agent mapping is unavailable".to_string())?;
+                        crate::agent_service::ensure_agent_driver_ready(&self.agent_manager, legacy_agent_key)
+                            .await
+                            .map_err(|err| {
+                                format!("{native_err}\n\nFailed to prepare MongoDB (Legacy) fallback driver: {err}")
+                            })?;
                         let mut client =
-                            self.agent_manager.spawn(&DatabaseType::MongoDb, Some("mongodb-legacy")).await?;
+                            self.agent_manager.spawn(&DatabaseType::MongoDb, Some("mongodb-legacy")).await.map_err(
+                                |err| {
+                                    format!(
+                                        "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
+                                        mongo_legacy_error_with_auth_hint(&err)
+                                    )
+                                },
+                            )?;
                         client.connect(connect_params).await.map_err(|err| {
                             format!(
                                 "{native_err}\n\nFallback with MongoDB (Legacy) driver failed: {}",
@@ -1947,6 +2434,11 @@ impl AppState {
                         return Err(native_err);
                     }
                 }
+            }
+            DatabaseType::DynamoDb => {
+                let client = db::dynamodb_driver::connect(&db_config, &host, port)?;
+                db::dynamodb_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::DynamoDb(client)
             }
             DatabaseType::ClickHouse => {
                 let username = if db_config.username.is_empty() { None } else { Some(db_config.username.clone()) };
@@ -1989,6 +2481,18 @@ impl AppState {
                 db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Easysearch(client)
             }
+            DatabaseType::Meilisearch => {
+                let client = db::meilisearch_driver::MeilisearchClient::new_for_config(
+                    &url,
+                    Some(&db_config.password),
+                    db_config.ssl,
+                    db_config.url_params.as_deref(),
+                    db_config.external_config.as_ref(),
+                    connect_timeout,
+                )?;
+                db::meilisearch_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::Meilisearch(client)
+            }
             DatabaseType::Hbase => {
                 let client = db::hbase_driver::HBaseClient::new(
                     &url,
@@ -2025,6 +2529,11 @@ impl AppState {
                 db::influxdb_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::InfluxDb(client)
             }
+            DatabaseType::InfluxDb3 => {
+                let client = db::influxdb3_driver::Influxdb3Client::new_for_config(&url, &db_config, connect_timeout)?;
+                db::influxdb3_driver::test_connection(&client, connect_timeout).await?;
+                PoolKind::InfluxDb3(client)
+            }
             DatabaseType::VictoriaMetrics => {
                 let client = db::victoriametrics_driver::VictoriaMetricsClient::new_for_config(
                     &url,
@@ -2058,7 +2567,7 @@ impl AppState {
                     port,
                     db_config.effective_database().unwrap_or(""),
                     session_role,
-                );
+                )?;
                 if db_config.db_type != DatabaseType::ZooKeeper {
                     let agent_session_id = uuid::Uuid::new_v4().simple().to_string();
                     let mut initial_result = self
@@ -2093,7 +2602,7 @@ impl AppState {
                                         port,
                                         db_config.effective_database().unwrap_or(""),
                                         session_role,
-                                    ),
+                                    )?,
                                     agent_connect_timeout(&db_config),
                                 )
                                 .await;
@@ -2102,7 +2611,7 @@ impl AppState {
                             }
                         }
                     }
-                    let client = match initial_result {
+                    let mut client = match initial_result {
                         Ok(client) => client,
                         Err(err) => {
                             let alternate_configs = oracle_alternate_connect_configs(&db_config, &err);
@@ -2125,7 +2634,7 @@ impl AppState {
                                                 port,
                                                 db_config.effective_database().unwrap_or(""),
                                                 session_role,
-                                            ),
+                                            )?,
                                             Some(agent_connect_timeout(&db_config)),
                                         )
                                         .await?;
@@ -2148,7 +2657,7 @@ impl AppState {
                                         port,
                                         alternate_config.effective_database().unwrap_or(""),
                                         session_role,
-                                    );
+                                    )?;
                                     match self
                                         .spawn_routed_shared_agent_client(
                                             &alternate_config.db_type,
@@ -2176,6 +2685,14 @@ impl AppState {
                             }
                         }
                     };
+                    if db_config.db_type == DatabaseType::Kingbase {
+                        let identifier_quote = client
+                            .connection_info(Some(agent_connect_timeout(&db_config)))
+                            .await
+                            .ok()
+                            .map(|info| info.identifier_quote);
+                        client.set_identifier_quote(identifier_quote);
+                    }
                     PoolKind::agent(client)
                 } else {
                     // ZooKeeper JVM properties are connection-scoped; shared agent daemons must not inherit them.
@@ -2220,7 +2737,7 @@ impl AppState {
                                             port,
                                             alternate_config.effective_database().unwrap_or(""),
                                             session_role,
-                                        ),
+                                        )?,
                                         Some(agent_connect_timeout(&alternate_config)),
                                     )
                                     .await
@@ -2248,14 +2765,14 @@ impl AppState {
                 }
             }
             DatabaseType::PrestoSql => {
-                let jdbc_config = prestosql_jdbc_config_for_endpoint(&db_config, &host, port);
+                let jdbc_config = prestosql_jdbc_config_for_endpoint(&db_config, &host, port)?;
                 self.external_driver_pool("jdbc", &jdbc_config).await?
             }
             DatabaseType::Jdbc => {
                 let mut jdbc_config = db_config.clone();
                 if host != config.host || port != config.port {
                     if let Some(ref url) = jdbc_config.connection_string {
-                        jdbc_config.connection_string = Some(rewrite_jdbc_url_host(url, &host, port));
+                        jdbc_config.connection_string = Some(rewrite_jdbc_url_host(url, &host, port)?);
                     }
                 }
                 self.external_driver_pool("jdbc", &jdbc_config).await?
@@ -2270,7 +2787,7 @@ impl AppState {
                 // Temporary "__test_*" probes must not retain agents in the registry.
                 // reconnect fast-path caching only applies to durable connection ids;
                 // drain_connection_pools no longer drops MQ adapters (reconnect reuse).
-                if connection_id.starts_with("__test_") {
+                if connection_id.starts_with(crate::runtime_config::TEST_PROBE_ID_PREFIX) {
                     let adapter = self.mq_registry.build_transient_config(mqc, agent_launch).await?;
                     adapter.test_connection().await?;
                     if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
@@ -2389,41 +2906,49 @@ impl AppState {
     pub async fn test_tunnel_profile(&self, profile: &TransportLayerConfig) -> Result<String, String> {
         match profile {
             TransportLayerConfig::Ssh(ssh) => {
-                let ssh = crate::ssh_config::resolve_ssh_tunnel_config(ssh);
-                if ssh.host.trim().is_empty() {
+                // A `~/.ssh/config` alias declaring `ProxyJump` resolves to more
+                // than one hop; every other alias (the common case) resolves to
+                // exactly one, matching `resolve_ssh_tunnel_config`.
+                let chain = crate::ssh_config::resolve_ssh_tunnel_chain(ssh);
+                let leaf = chain.last().expect("resolve_ssh_tunnel_chain always returns at least one hop");
+                if leaf.host.trim().is_empty() {
                     return Err("SSH host is required.".to_string());
                 }
-                let timeout = if ssh.connect_timeout_secs == 0 {
-                    crate::models::connection::default_ssh_connect_timeout_secs()
-                } else {
-                    ssh.connect_timeout_secs
-                };
                 // A throwaway id so the probe never reuses or evicts a live tunnel, and
                 // a sentinel forward target: SSH auth completes on connect, before any
                 // channel to this target is opened, so it need not be reachable.
                 let probe_id = format!("__tunnel_profile_test__:{}", uuid::Uuid::new_v4());
-                let result = self
-                    .tunnels
-                    .start_tunnel(
-                        &probe_id,
-                        &ssh.host,
-                        ssh.port,
-                        &ssh.host,
-                        ssh.port,
-                        &ssh.user,
-                        &ssh.password,
-                        &ssh.key_path,
-                        &ssh.key_passphrase,
-                        ssh.use_ssh_agent,
-                        &ssh.ssh_agent_sock_path,
-                        &ssh.auth_method,
-                        timeout,
-                        "127.0.0.1",
-                        1,
-                        false,
-                        ssh.allow_exec_channel_proxy,
-                    )
-                    .await;
+                let result = if chain.len() == 1 {
+                    let timeout = if leaf.connect_timeout_secs == 0 {
+                        crate::models::connection::default_ssh_connect_timeout_secs()
+                    } else {
+                        leaf.connect_timeout_secs
+                    };
+                    self.tunnels
+                        .start_tunnel(
+                            &probe_id,
+                            &leaf.host,
+                            leaf.port,
+                            &leaf.host,
+                            leaf.port,
+                            &leaf.user,
+                            &leaf.password,
+                            &leaf.key_path,
+                            &leaf.key_passphrase,
+                            leaf.use_ssh_agent,
+                            &leaf.ssh_agent_sock_path,
+                            &leaf.auth_method,
+                            timeout,
+                            "127.0.0.1",
+                            1,
+                            false,
+                            leaf.allow_exec_channel_proxy,
+                        )
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.tunnels.start_chain(&probe_id, &chain, &leaf.host, leaf.port).await.map(|_| ())
+                };
                 self.tunnels.stop_tunnel(&probe_id).await;
                 result.map(|_| "SSH tunnel connection successful".to_string())
             }
@@ -2450,19 +2975,50 @@ impl AppState {
         }
     }
 
+    /// Tests the enabled SSH chain without opening a database connection.
+    /// Layers before the final SSH hop are included because they may be
+    /// required to reach that hop; layers after it are unrelated to SSH auth.
+    pub async fn test_connection_ssh_tunnel(&self, config: &ConnectionConfig) -> Result<String, String> {
+        let resolved_layers = self.resolved_transport_layers(config).await?;
+        let test_layers = transport_layers_through_last_ssh(&resolved_layers)?;
+        let probe_id = format!("__connection_ssh_test__:{}", uuid::Uuid::new_v4());
+        let result = db::transport_layer_tunnel::start_transport_layers(
+            &probe_id,
+            test_layers,
+            "127.0.0.1",
+            1,
+            &self.tunnels,
+            &self.proxy_tunnels,
+            &self.http_tunnels,
+        )
+        .await;
+        db::transport_layer_tunnel::stop_transport_layers(
+            &probe_id,
+            test_layers.len(),
+            &self.tunnels,
+            &self.proxy_tunnels,
+            &self.http_tunnels,
+        )
+        .await;
+        result.map(|_| "SSH tunnel connection successful".to_string())
+    }
+
     pub async fn connection_host_port(
         &self,
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<(String, u16), String> {
         let transport_layers = self.resolved_transport_layers(config).await?;
-        if transport_layers.is_empty() {
+        if transport_layers.is_empty() || db::sqlite_worker::sqlite_ssh_worker_requested(config) {
             return Ok((config.host.clone(), config.port));
         }
         if config.uses_oracle_tns() {
             // A TNS descriptor may contain several failover addresses, so rewriting it
             // through one local tunnel endpoint would silently break Oracle Net routing.
             return Err("Oracle TNS connections cannot be combined with SSH, proxy, or HTTP tunnel layers. Remove the transport layer or use Service Name/SID mode.".to_string());
+        }
+        if hive_uses_zookeeper_discovery(config) {
+            return Err("Hive ZooKeeper service discovery cannot be combined with SSH, proxy, or HTTP tunnel layers because discovered HiveServer2 nodes would bypass the configured transport. Remove the transport layer or use a direct HiveServer2 host and port.".to_string());
         }
 
         #[cfg(feature = "mq-admin")]
@@ -2841,13 +3397,39 @@ impl AppState {
         connection_id: &str,
         config: &ConnectionConfig,
     ) -> Result<crate::nacos::config::NacosAdminConfig, String> {
-        let nacos_config = crate::nacos::config::NacosAdminConfig::from_connection(config)?;
+        let mut nacos_config = crate::nacos::config::NacosAdminConfig::from_connection(config)?;
+        if !config.save_password {
+            let owner = crate::session_credentials::current_credential_owner().unwrap_or_default();
+            let primary_password = self
+                .session_credentials
+                .get_for_purpose(&owner, connection_id, NACOS_PRIMARY_SESSION_PASSWORD)
+                .or_else(|| self.session_credentials.get(&owner, connection_id));
+            if let (Some(password), crate::nacos::config::NacosAuthConfig::UsernamePassword { password: target, .. }) =
+                (primary_password, &mut nacos_config.auth)
+            {
+                *target = password;
+            }
+            if let (
+                Some(password),
+                crate::nacos::config::NacosRNacosConsoleAuth::UsernamePassword { password: target, .. },
+            ) = (
+                self.session_credentials.get_for_purpose(&owner, connection_id, NACOS_CONSOLE_SESSION_PASSWORD),
+                &mut nacos_config.rnacos_console_auth,
+            ) {
+                *target = password;
+            }
+        }
         if !config.has_effective_transport_layers() {
             return Ok(nacos_config);
         }
 
         let (host, port) = self.connection_host_port(connection_id, config).await?;
         let nacos_config = nacos_config.with_server_endpoint(&host, port)?;
+        let transport_layers = self.resolved_transport_layers(config).await?;
+        if transport_layers.is_empty() {
+            return Ok(nacos_config);
+        }
+
         if nacos_config.rnacos_console_addr.is_empty() {
             return Ok(nacos_config);
         }
@@ -2861,10 +3443,6 @@ impl AppState {
         let console_port = console_url
             .port_or_known_default()
             .ok_or_else(|| "r-nacos console address does not include a port".to_string())?;
-        let transport_layers = self.resolved_transport_layers(config).await?;
-        if transport_layers.is_empty() {
-            return Ok(nacos_config);
-        }
         let console_transport_id = rnacos_console_transport_id(connection_id);
         let local_port = match db::transport_layer_tunnel::start_transport_layers(
             &console_transport_id,
@@ -2906,32 +3484,85 @@ impl AppState {
         }
     }
 
+    pub async fn replace_nacos_session_credential(
+        &self,
+        owner_scope: &str,
+        connection_id: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        let username = username.trim();
+        if username.is_empty() || password.is_empty() {
+            return Err("Nacos username and replacement password are required".to_string());
+        }
+        let config = self.configs.read().await.get(connection_id).cloned().ok_or("Connection not found")?;
+        if config.db_type != DatabaseType::Nacos {
+            return Err("Connection is not a Nacos connection".to_string());
+        }
+        if config.save_password {
+            return Err("Connection saves its password; update the persisted connection instead".to_string());
+        }
+        let nacos_config = crate::nacos::config::NacosAdminConfig::from_connection(&config)?;
+        let primary_matches = matches!(
+            &nacos_config.auth,
+            crate::nacos::config::NacosAuthConfig::UsernamePassword { username: current, .. } if current == username
+        );
+        let console_matches = matches!(
+            &nacos_config.rnacos_console_auth,
+            crate::nacos::config::NacosRNacosConsoleAuth::UsernamePassword { username: current, .. } if current == username
+        );
+        if !primary_matches && !console_matches {
+            return Err(format!("Nacos user {username} is not used by this connection"));
+        }
+        if primary_matches {
+            let _ = self.session_credentials.set(owner_scope, connection_id, password);
+            self.session_credentials.set_for_purpose(
+                owner_scope,
+                connection_id,
+                NACOS_PRIMARY_SESSION_PASSWORD,
+                password,
+            );
+        }
+        if console_matches {
+            self.session_credentials.set_for_purpose(
+                owner_scope,
+                connection_id,
+                NACOS_CONSOLE_SESSION_PASSWORD,
+                password,
+            );
+        }
+        self.nacos_registry.drop_connection(connection_id).await;
+        Ok(())
+    }
+
     async fn remove_stale_connection_pool(&self, pool_key: &str) -> bool {
         if self.running_queries.is_pool_active(pool_key) {
             return false;
         }
 
+        let Some(checked) = self.pool_publication_snapshot(pool_key).await else {
+            return false;
+        };
         let stale = {
-            let connections = self.connections.read().await;
-            let Some(pool) = connections.get(pool_key) else {
-                return false;
-            };
-            match pool {
+            match &checked.pool {
                 PoolKind::Mysql(pool, _) => {
                     let pool = pool.clone();
-                    drop(connections);
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get_conn()).await {
-                        // Pool saturation means active work, not a dead connection. Removing this pool would
-                        // start a competing reconnect while foreground queries and metadata are still running.
-                        Err(_) => {
-                            log::debug!("MySQL connection pool '{pool_key}' is busy; skipping health probe");
+                    match db::mysql::checkout_mysql_conn(&pool, HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT).await {
+                        // The 500 ms probe budget is intentionally shorter than a foreground checkout. A timeout
+                        // while waiting, creating, or recycling is inconclusive: slow remote handshakes and active
+                        // metadata exports can legitimately exceed it. Removing the pool here would start competing
+                        // reconnects while useful work is still running.
+                        Err(err @ db::PoolCheckoutError::Timeout { .. }) => {
+                            log::debug!(
+                                "MySQL connection pool '{pool_key}' did not finish a health checkout; keeping pool: {err}"
+                            );
                             false
                         }
-                        Ok(Err(err)) => {
+                        Err(err) => {
                             log::warn!("MySQL connection pool '{pool_key}' is stale: {err}");
                             true
                         }
-                        Ok(Ok(mut conn)) => {
+                        Ok(mut conn) => {
                             let timeout = crate::db::connection_timeout();
                             match tokio::time::timeout(timeout, conn.ping()).await {
                                 Ok(Ok(())) => false,
@@ -2949,10 +3580,15 @@ impl AppState {
                 }
                 PoolKind::Postgres(pool) => {
                     let pool = pool.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
-                    match tokio::time::timeout(HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT, pool.get()).await {
-                        Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                    match db::postgres::checkout_postgres_client_classified(
+                        &pool,
+                        None,
+                        HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT,
+                    )
+                    .await
+                    {
+                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
                             Ok(Ok(_)) => false,
                             Ok(Err(err)) => {
                                 log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
@@ -2963,19 +3599,20 @@ impl AppState {
                                 true
                             }
                         },
-                        Ok(Err(err)) => {
+                        Err(err) if err.is_pool_saturation() => {
+                            log::debug!(
+                                "PostgreSQL connection pool '{pool_key}' is busy; skipping health probe: {err}"
+                            );
+                            false
+                        }
+                        Err(err) => {
                             log::warn!("PostgreSQL connection pool '{pool_key}' is stale: {err}");
                             true
-                        }
-                        Err(_) => {
-                            log::debug!("PostgreSQL connection pool '{pool_key}' is busy; skipping health probe");
-                            false
                         }
                     }
                 }
                 PoolKind::SqlServer(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let mut client = client.lock().await;
                     match db::sqlserver::test_connection(&mut client).await {
                         Ok(()) => false,
@@ -2994,7 +3631,6 @@ impl AppState {
                 },
                 PoolKind::MongoDb(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let (connect_timeout, database) = {
                         let configs = self.configs.read().await;
                         let config = config_for_pool_key(pool_key, &configs);
@@ -3013,9 +3649,19 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::DynamoDb(client) => {
+                    let client = client.clone();
+                    let timeout = crate::db::connection_timeout();
+                    match db::dynamodb_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("DynamoDB connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
                 PoolKind::ClickHouse(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::clickhouse_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3027,7 +3673,6 @@ impl AppState {
                 }
                 PoolKind::Elasticsearch(client) => {
                     let mut client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::elasticsearch_driver::test_connection(&mut client, timeout).await {
                         Ok(()) => false,
@@ -3039,7 +3684,6 @@ impl AppState {
                 }
                 PoolKind::Easysearch(client) => {
                     let mut client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::easysearch_driver::test_connection(&mut client, timeout).await {
                         Ok(()) => false,
@@ -3049,9 +3693,19 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::Meilisearch(client) => {
+                    let client = client.clone();
+                    let timeout = crate::db::connection_timeout();
+                    match db::meilisearch_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("Meilisearch connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
                 PoolKind::HBase(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::hbase_driver::test_connection(&client, timeout).await {
                         Ok(_) => false,
@@ -3063,7 +3717,6 @@ impl AppState {
                 }
                 PoolKind::VectorDb(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::vector_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3075,7 +3728,6 @@ impl AppState {
                 }
                 PoolKind::InfluxDb(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::influxdb_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3085,9 +3737,19 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::InfluxDb3(client) => {
+                    let client = client.clone();
+                    let timeout = crate::db::connection_timeout();
+                    match db::influxdb3_driver::test_connection(&client, timeout).await {
+                        Ok(()) => false,
+                        Err(err) => {
+                            log::warn!("InfluxDB 3 connection pool '{pool_key}' is stale: {err}");
+                            true
+                        }
+                    }
+                }
                 PoolKind::VictoriaMetrics(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::victoriametrics_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3099,7 +3761,6 @@ impl AppState {
                 }
                 PoolKind::Rqlite(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::rqlite_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3111,7 +3772,6 @@ impl AppState {
                 }
                 PoolKind::Turso(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::turso_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3123,7 +3783,6 @@ impl AppState {
                 }
                 PoolKind::CloudflareD1(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let timeout = crate::db::connection_timeout();
                     match db::cloudflare_d1_driver::test_connection(&client, timeout).await {
                         Ok(()) => false,
@@ -3135,7 +3794,6 @@ impl AppState {
                 }
                 PoolKind::Agent(client) => {
                     let client = client.clone();
-                    drop(connections);
                     let Ok(mut agent) = client.try_lock() else {
                         log::debug!("Agent connection pool '{pool_key}' is busy; skipping health probe");
                         return false;
@@ -3154,12 +3812,18 @@ impl AppState {
                                 "Agent connection pool '{pool_key}' requested runtime replacement during health probe: {err}"
                             );
                             drop(agent);
-                            return self.detach_agent_pool_if_current(pool_key, &client, true).await;
+                            return self
+                                .pool_routing_control()
+                                .detach_agent_pool_if_current(pool_key, &client, Some(&checked.publication), true)
+                                .await;
                         }
                         Err(err) => {
                             log::warn!("Agent connection pool '{pool_key}' is stale: {err}");
                             drop(agent);
-                            return self.detach_agent_pool_if_current(pool_key, &client, false).await;
+                            return self
+                                .pool_routing_control()
+                                .detach_agent_pool_if_current(pool_key, &client, Some(&checked.publication), false)
+                                .await;
                         }
                     }
                 }
@@ -3178,16 +3842,66 @@ impl AppState {
             return false;
         }
 
-        self.stop_keepalive_task(pool_key).await;
-        self.pool_activity.write().await.remove(pool_key);
-        self.postgres_cancel_contexts.write().await.remove(pool_key);
-        let removed = self.connections.write().await.remove(pool_key);
-        if let Some(pool) = removed {
-            self.pool_routing_control().close_pool_with_timeout(pool_key.to_string(), pool).await;
-            true
-        } else {
-            false
+        self.remove_stale_pool_if_current(pool_key, &checked.publication).await
+    }
+    async fn remove_stale_pool_if_current(&self, pool_key: &str, checked_publication: &PoolPublication) -> bool {
+        self.remove_stale_pool_if_current_inner(
+            pool_key,
+            checked_publication,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    async fn remove_stale_pool_if_current_inner(
+        &self,
+        pool_key: &str,
+        checked_publication: &PoolPublication,
+        #[cfg(test)] cleanup_barriers: Option<StalePoolCleanupBarriers>,
+    ) -> bool {
+        #[cfg(test)]
+        if let Some((cleanup_ready, continue_cleanup)) =
+            cleanup_barriers.as_ref().and_then(|barriers| barriers.before_removal.as_ref())
+        {
+            cleanup_ready.wait().await;
+            continue_cleanup.wait().await;
         }
+
+        let routing = self.pool_routing_control();
+        let removed = loop {
+            let mut connections = self.connections.write().await;
+            let is_current =
+                connections.publications.get(pool_key).is_some_and(|current| current.is_same(checked_publication));
+            if !is_current {
+                log::debug!(
+                    "Connection pool '{pool_key}' was replaced while its health check was running; keeping the current route"
+                );
+                return false;
+            }
+            let Ok(mut activity) = self.pool_activity.try_write() else {
+                drop(connections);
+                tokio::task::yield_now().await;
+                continue;
+            };
+            let removed = connections
+                .remove_if_publication(pool_key, checked_publication)
+                .expect("checked pool publication must remain current while routing is locked");
+            #[cfg(test)]
+            if let Some((route_removed, continue_cleanup)) =
+                cleanup_barriers.as_ref().and_then(|barriers| barriers.after_removal.as_ref())
+            {
+                route_removed.wait().await;
+                continue_cleanup.wait().await;
+            }
+            routing.stop_keepalive(pool_key);
+            activity.remove(pool_key);
+            break removed;
+        };
+
+        self.postgres_cancel_contexts.write().await.remove(pool_key);
+        routing.close_pool_with_timeout(pool_key.to_string(), removed).await;
+        true
     }
 
     pub async fn reconnect_pool(&self, connection_id: &str, database: Option<&str>) -> Result<String, String> {
@@ -3322,6 +4036,21 @@ impl AppState {
         .await
     }
 
+    pub(crate) async fn workload_session_pool_cleanup_guard(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: &str,
+    ) -> Option<ClientSessionPoolCleanupGuard> {
+        self.client_session_pool_cleanup_guard_for_role(
+            connection_id,
+            database,
+            client_session_id,
+            AgentSessionRole::Workload,
+        )
+        .await
+    }
+
     async fn client_session_pool_cleanup_guard_for_role(
         &self,
         connection_id: &str,
@@ -3397,8 +4126,7 @@ impl AppState {
             pool_key_for_session_role(config.as_ref(), base_pool_key, client_session_id, AgentSessionRole::Metadata);
         if let Some(session_id) = agent_session_id {
             let expected_client = {
-                let connections = self.connections.read().await;
-                match connections.get(&pool_key) {
+                match self.pool_handle(&pool_key).await.as_ref() {
                     Some(PoolKind::Agent(client)) if client.matches_session_id(session_id) => Some(client.clone()),
                     Some(PoolKind::Agent(_)) => return false,
                     _ => None,
@@ -3422,7 +4150,9 @@ impl AppState {
         expected_client: &Arc<db::agent_driver::PooledAgentClient>,
         replace_agent_runtime: bool,
     ) -> bool {
-        self.pool_routing_control().detach_agent_pool_if_current(pool_key, expected_client, replace_agent_runtime).await
+        self.pool_routing_control()
+            .detach_agent_pool_if_current(pool_key, expected_client, None, replace_agent_runtime)
+            .await
     }
 
     async fn take_client_session_pool(
@@ -3449,7 +4179,7 @@ impl AppState {
         self.stop_keepalive_task(&pool_key).await;
         self.pool_activity.write().await.remove(&pool_key);
         self.postgres_cancel_contexts.write().await.remove(&pool_key);
-        let removed = self.connections.write().await.remove(&pool_key);
+        let removed = self.update_connection_pools(|connections| connections.remove(&pool_key)).await;
         Ok(removed.map(|pool| (pool_key, pool)))
     }
 
@@ -3469,7 +4199,7 @@ impl AppState {
     async fn reclaim_idle_base_pool_for_session(&self, connection_id: &str, preferred_base_pool_key: &str) -> bool {
         let pool_prefix = format!("{connection_id}:");
         let activity = self.pool_activity.read().await;
-        let connections = self.connections.read().await;
+        let connections = self.connection_pools_snapshot().await;
         let mut candidates: Vec<(String, (usize, u64))> = connections
             .iter()
             .filter_map(|(key, pool)| {
@@ -3546,8 +4276,7 @@ impl AppState {
             config_for_pool_key(pool_key, &configs).cloned()
         };
         let client = {
-            let connections = self.connections.read().await;
-            match connections.get(pool_key) {
+            match self.pool_handle(pool_key).await.as_ref() {
                 Some(PoolKind::Agent(client)) => Some(client.clone()),
                 _ => None,
             }
@@ -3617,6 +4346,7 @@ impl AppState {
         }
         drop(conns);
         let closed = !removed.is_empty();
+        self.clear_metadata_gate_for_database(connection_id, database).await;
         for (key, pool) in removed {
             self.pool_routing_control().close_pool_with_timeout(key, pool).await;
         }
@@ -3625,7 +4355,7 @@ impl AppState {
 
     pub async fn active_agent_connection_driver_keys(&self) -> HashSet<String> {
         let configs = self.configs.read().await;
-        let connections = self.connections.read().await;
+        let connections = self.connection_pools_snapshot().await;
         let mut keys = HashSet::new();
 
         for (pool_key, pool) in connections.iter() {
@@ -3694,8 +4424,7 @@ impl AppState {
             ExternalDriver { config: Arc<ConnectionConfig>, session: Arc<PluginDriverSession> },
         }
         let source = {
-            let connections = self.connections.read().await;
-            match connections.get(&pool_key) {
+            match self.pool_handle(&pool_key).await.as_ref() {
                 Some(PoolKind::Postgres(pool)) if config.db_type == DatabaseType::Gaussdb => {
                     Some(IdentifierQuoteSource::NativeGaussdb(pool.clone()))
                 }
@@ -3750,8 +4479,10 @@ impl AppState {
             .ok_or_else(|| format!("Connection config not found: {connection_id}"))?;
         let pool_key = self.get_or_create_pool(connection_id, database).await?;
         let source = {
-            let connections = self.connections.read().await;
-            match connections.get(&pool_key) {
+            match self.pool_handle(&pool_key).await.as_ref() {
+                Some(PoolKind::Agent(client)) if config.db_type == DatabaseType::MongoDb => {
+                    Some(ConnectionDatabaseInfoSource::MongoAgent(client.clone(), database.map(str::to_string)))
+                }
                 Some(PoolKind::Agent(client)) => Some(ConnectionDatabaseInfoSource::Agent(client.clone())),
                 Some(PoolKind::ExternalDriver { config, session, .. }) => {
                     Some(ConnectionDatabaseInfoSource::ExternalDriver {
@@ -3761,6 +4492,18 @@ impl AppState {
                 }
                 Some(PoolKind::Mysql(pool, _)) => Some(ConnectionDatabaseInfoSource::NativeMysql(pool.clone())),
                 Some(PoolKind::HBase(client)) => Some(ConnectionDatabaseInfoSource::NativeHBase(client.clone())),
+                Some(PoolKind::MongoDb(client)) => {
+                    Some(ConnectionDatabaseInfoSource::NativeMongo(client.clone(), database.map(str::to_string)))
+                }
+                Some(PoolKind::Meilisearch(client)) => Some(ConnectionDatabaseInfoSource::Meilisearch(client.clone())),
+                Some(PoolKind::VictoriaMetrics(client)) => {
+                    Some(ConnectionDatabaseInfoSource::VictoriaMetrics(client.clone()))
+                }
+                Some(PoolKind::Redis(_)) => Some(ConnectionDatabaseInfoSource::Redis(pool_key.clone())),
+                Some(PoolKind::Nacos) => Some(ConnectionDatabaseInfoSource::Nacos),
+                Some(PoolKind::Consul(client)) => Some(ConnectionDatabaseInfoSource::Consul(Box::new(client.clone()))),
+                #[cfg(feature = "mq-admin")]
+                Some(PoolKind::MessageQueue) => Some(ConnectionDatabaseInfoSource::MessageQueue),
                 _ => None,
             }
         };
@@ -3769,6 +4512,17 @@ impl AppState {
             Some(ConnectionDatabaseInfoSource::Agent(client)) => {
                 let mut agent = client.lock().await;
                 Ok(agent.connection_info(Some(db::connection_timeout())).await?.database_info)
+            }
+            Some(ConnectionDatabaseInfoSource::MongoAgent(client, database)) => {
+                let mut agent = client.lock().await;
+                let version = agent.mongo_server_version::<String>(database.as_deref().unwrap_or("admin")).await?;
+                Ok(Some(DatabaseConnectionInfo {
+                    product_name: Some("MongoDB".to_string()),
+                    product_version: Some(version),
+                    current_database: database,
+                    driver_name: Some("MongoDB legacy Agent".to_string()),
+                    ..Default::default()
+                }))
             }
             Some(ConnectionDatabaseInfoSource::ExternalDriver { config, session }) => {
                 let response = session
@@ -3785,6 +4539,38 @@ impl AppState {
             }
             Some(ConnectionDatabaseInfoSource::NativeHBase(client)) => {
                 db::hbase_driver::database_connection_info(&client).await
+            }
+            Some(ConnectionDatabaseInfoSource::NativeMongo(client, database)) => {
+                db::mongo_driver::database_connection_info(&client, database.as_deref()).await.map(Some)
+            }
+            Some(ConnectionDatabaseInfoSource::Meilisearch(client)) => {
+                db::meilisearch_driver::database_connection_info(&client).await.map(Some)
+            }
+            Some(ConnectionDatabaseInfoSource::VictoriaMetrics(client)) => {
+                db::victoriametrics_driver::database_connection_info(&client, db::connection_timeout()).await.map(Some)
+            }
+            Some(ConnectionDatabaseInfoSource::Redis(pool_key)) => match self.pool_handle(&pool_key).await.as_ref() {
+                Some(PoolKind::Redis(redis)) => db::redis_driver::database_connection_info(redis).await.map(Some),
+                _ => Ok(None),
+            },
+            Some(ConnectionDatabaseInfoSource::Nacos) => {
+                let admin_config = self.nacos_admin_config_for_connection(connection_id, &config).await?;
+                let admin = self.nacos_registry.get_or_build_config(connection_id, admin_config).await?;
+                Ok(crate::nacos::service::database_info_from_connection(&admin.test_connection().await?))
+            }
+            Some(ConnectionDatabaseInfoSource::Consul(client)) => {
+                let identity = client.agent_self().await?;
+                Ok(Some(DatabaseConnectionInfo {
+                    product_name: Some("Consul".to_string()),
+                    product_version: identity.version,
+                    server_comment: Some(format!("Agent {}", identity.node)),
+                    driver_name: Some("Consul HTTP API".to_string()),
+                    ..Default::default()
+                }))
+            }
+            #[cfg(feature = "mq-admin")]
+            Some(ConnectionDatabaseInfoSource::MessageQueue) => {
+                Ok(crate::mq::service::mq_database_connection_info(self, connection_id).await?)
             }
             None => Ok(None),
         }
@@ -3828,6 +4614,8 @@ impl AppState {
         self.tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         self.proxy_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
         self.http_tunnels.stop_tunnels_with_prefix(&redis_sentinel_prefix).await;
+        let sqlite_worker_prefix = db::sqlite_worker::sqlite_worker_chain_id(connection_id);
+        self.tunnels.stop_tunnels_with_prefix(&sqlite_worker_prefix).await;
         db::transport_layer_tunnel::stop_transport_layers(
             connection_id,
             layer_count,
@@ -3869,11 +4657,8 @@ impl AppState {
         let pool_key = base_pool_key_for(db_type, connection_id, None, false);
 
         // Check if pool exists first
-        {
-            let connections = self.connections.read().await;
-            if !connections.contains_key(&pool_key) {
-                return Err("No active connection pool found".to_string());
-            }
+        if self.pool_handle(&pool_key).await.is_none() {
+            return Err("No active connection pool found".to_string());
         }
 
         // `remove_stale_connection_pool` returns true if the pool was stale (and removed)
@@ -3886,55 +4671,50 @@ impl AppState {
     pub async fn refresh_connections(&self) {
         // Clone pool handles under a short-lived read lock, then release it
         // before performing I/O-heavy health checks to avoid blocking writers.
-        // Redis pools are handled separately because RedisConnection cannot be cloned.
-        let (checks, redis_keys): (Vec<(String, PoolKind)>, Vec<String>) = {
-            let conns = self.connections.read().await;
-            let mut checks = Vec::with_capacity(conns.len());
-            let mut redis_keys = Vec::new();
-            for (key, pool) in conns.iter() {
-                match pool {
-                    PoolKind::Redis(_) => redis_keys.push(key.clone()),
-                    _ => checks.push((key.clone(), clone_pool_kind(pool))),
-                }
-            }
-            (checks, redis_keys)
-        };
+        let checks = self.connection_pool_publication_snapshots().await;
 
         let mut failed_agent_checks = Vec::new();
         let mut dead_pools = Vec::new();
         let timeout = crate::db::connection_timeout();
 
         // Check cloned pools (async I/O, no lock held)
-        for (key, pool) in &checks {
+        for (key, checked) in &checks {
+            let pool = &checked.pool;
             let healthy = match pool {
                 PoolKind::Mysql(p, _) => match db::mysql::get_conn_with_health_check(p).await {
                     Ok(_) => true,
+                    Err(e) if crate::query::is_pool_saturation_error(&e) => {
+                        log::debug!("MySQL connection pool '{key}' is busy; skipping health probe: {e}");
+                        true
+                    }
                     Err(e) => {
                         log::warn!("MySQL connection pool '{key}' is unhealthy: {e}");
                         false
                     }
                 },
-                PoolKind::Postgres(p) => match tokio::time::timeout(timeout, p.get()).await {
-                    Ok(Ok(client)) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
-                        Ok(Ok(_)) => true,
-                        Ok(Err(e)) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                PoolKind::Postgres(p) => {
+                    match db::postgres::checkout_postgres_client_classified(p, None, timeout).await {
+                        Ok(client) => match tokio::time::timeout(timeout, client.simple_query("SELECT 1")).await {
+                            Ok(Ok(_)) => true,
+                            Ok(Err(e)) => {
+                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
+                                false
+                            }
+                            Err(_) => {
+                                log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
+                                false
+                            }
+                        },
+                        Err(error) if error.is_pool_saturation() => {
+                            log::debug!("PostgreSQL connection pool '{key}' is busy; skipping health probe: {error}");
+                            true
+                        }
+                        Err(error) => {
+                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {error}");
                             false
                         }
-                        Err(_) => {
-                            log::warn!("PostgreSQL connection pool '{key}' is unhealthy: health check timed out");
-                            false
-                        }
-                    },
-                    Ok(Err(e)) => {
-                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: {e}");
-                        false
                     }
-                    Err(_) => {
-                        log::warn!("PostgreSQL connection pool '{key}' is unhealthy: get connection timed out");
-                        false
-                    }
-                },
+                }
                 PoolKind::SqlServer(client) => {
                     let mut client = client.lock().await;
                     match db::sqlserver::test_connection(&mut client).await {
@@ -3949,6 +4729,13 @@ impl AppState {
                     Ok(()) => true,
                     Err(e) => {
                         log::warn!("MongoDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::DynamoDb(client) => match db::dynamodb_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("DynamoDB connection pool '{key}' is unhealthy: {e}");
                         false
                     }
                 },
@@ -3979,6 +4766,16 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::Meilisearch(client) => {
+                    let client = client.clone();
+                    match db::meilisearch_driver::test_connection(&client, timeout).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            log::warn!("Meilisearch connection pool '{key}' is unhealthy: {e}");
+                            false
+                        }
+                    }
+                }
                 PoolKind::HBase(client) => match db::hbase_driver::test_connection(client, timeout).await {
                     Ok(_) => true,
                     Err(e) => {
@@ -3997,6 +4794,13 @@ impl AppState {
                     Ok(()) => true,
                     Err(e) => {
                         log::warn!("InfluxDB connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
+                PoolKind::InfluxDb3(client) => match db::influxdb3_driver::test_connection(client, timeout).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("InfluxDB 3 connection pool '{key}' is unhealthy: {e}");
                         false
                     }
                 },
@@ -4050,6 +4854,7 @@ impl AppState {
                             failed_agent_checks.push((
                                 key.clone(),
                                 client.clone(),
+                                checked.publication.clone(),
                                 RecoveryPolicy::decide(&e, RecoveryScope::Keepalive).replaces_runtime(),
                             ));
                             false
@@ -4064,32 +4869,26 @@ impl AppState {
                 | PoolKind::Consul(_) => true,
                 #[cfg(feature = "mq-admin")]
                 PoolKind::Mqtt(_) => true,
-                PoolKind::Redis(_) => unreachable!("Redis handled separately"),
+                PoolKind::Redis(redis) => match db::redis_driver::test_connection(redis).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("Redis connection pool '{key}' is unhealthy: {e}");
+                        false
+                    }
+                },
             };
             if !healthy && !matches!(pool, PoolKind::Agent(_)) {
-                dead_pools.push((key.clone(), agent_pool_identity(pool)));
-            }
-        }
-
-        // Check Redis pools (read lock held briefly, no cloning needed)
-        {
-            let conns = self.connections.read().await;
-            for key in &redis_keys {
-                if let Some(PoolKind::Redis(redis)) = conns.get(key) {
-                    match db::redis_driver::test_connection(redis).await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log::warn!("Redis connection pool '{key}' is unhealthy: {e}");
-                            dead_pools.push((key.clone(), None));
-                        }
-                    }
-                }
+                dead_pools.push((key.clone(), checked.publication.clone()));
             }
         }
 
         let mut detached_pool_keys = Vec::new();
-        for (key, client, replace_runtime) in failed_agent_checks {
-            if self.detach_agent_pool_if_current(&key, &client, replace_runtime).await {
+        for (key, client, publication, replace_runtime) in failed_agent_checks {
+            if self
+                .pool_routing_control()
+                .detach_agent_pool_if_current(&key, &client, Some(&publication), replace_runtime)
+                .await
+            {
                 detached_pool_keys.push(key);
             }
         }
@@ -4098,20 +4897,11 @@ impl AppState {
         if !dead_pools.is_empty() {
             let mut conns = self.connections.write().await;
             let mut removed = Vec::with_capacity(dead_pools.len());
-            for (key, expected_agent) in &dead_pools {
-                let still_checked_pool = match expected_agent {
-                    Some(expected) => matches!(
-                        conns.get(key),
-                        Some(PoolKind::Agent(current)) if Arc::ptr_eq(current, expected)
-                    ),
-                    None => true,
-                };
-                if still_checked_pool {
-                    if let Some(pool) = conns.remove(key) {
-                        removed.push((key.clone(), pool));
-                    }
+            for (key, publication) in &dead_pools {
+                if let Some(pool) = conns.remove_if_publication(key, publication) {
+                    removed.push((key.clone(), pool));
                 } else {
-                    log::debug!("Skipping stale Agent health result for replaced pool '{key}'");
+                    log::debug!("Skipping stale refresh health result for replaced pool '{key}'");
                 }
             }
             drop(conns);
@@ -4138,11 +4928,13 @@ impl AppState {
 
     pub async fn remove_connection_pools(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
+        self.clear_metadata_gates_for_connection(connection_id).await;
         self.pool_routing_control().close_removed(removed).await;
     }
 
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         let removed = self.drain_connection_pools(connection_id).await;
+        self.clear_metadata_gates_for_connection(connection_id).await;
         self.pool_routing_control().close_removed_in_background(removed);
     }
 
@@ -4155,11 +4947,13 @@ impl AppState {
     }
 
     async fn drain_all_connection_pools(&self) -> Vec<(String, PoolKind)> {
-        let pool_keys = self.connections.read().await.keys().cloned().collect::<Vec<_>>();
+        let pool_keys = self.connection_pools_snapshot().await.keys().cloned().collect::<Vec<_>>();
         self.stop_keepalive_tasks(&pool_keys).await;
         self.pool_activity.write().await.clear();
+        self.session_credentials.clear_pool_owners();
         self.postgres_cancel_contexts.write().await.clear();
         self.draining_pools.lock().unwrap_or_else(|error| error.into_inner()).clear();
+        self.metadata_gates.lock().await.clear();
         self.connections.write().await.drain().collect()
     }
 
@@ -4196,6 +4990,7 @@ impl AppState {
                 cancel_contexts.remove(key);
             }
         }
+        self.session_credentials.remove_pool_owners(&keys_to_remove);
         let mut conns = self.connections.write().await;
         let mut removed = Vec::with_capacity(keys_to_remove.len());
         for key in keys_to_remove {
@@ -4295,6 +5090,7 @@ enum KeepaliveTarget {
     HBase(db::hbase_driver::HBaseClient),
     VectorDb(db::vector_driver::VectorClient),
     InfluxDb(db::influxdb_driver::InfluxdbClient),
+    InfluxDb3(db::influxdb3_driver::Influxdb3Client),
     VictoriaMetrics(db::victoriametrics_driver::VictoriaMetricsClient),
     Agent(Arc<db::agent_driver::PooledAgentClient>),
     #[cfg(feature = "mq-admin")]
@@ -4349,7 +5145,7 @@ impl KeepaliveTarget {
 }
 
 async fn remove_keepalive_pool_if_current(
-    connections: &Arc<RwLock<HashMap<String, PoolKind>>>,
+    connections: &Arc<RwLock<ConnectionPoolRegistry>>,
     pool_key: &str,
     target: &KeepaliveTarget,
 ) -> Option<PoolKind> {
@@ -4363,13 +5159,13 @@ async fn remove_keepalive_pool_if_current(
 
 async fn detach_keepalive_target_if_current(
     routing: &PoolRoutingControl,
-    connections: &Arc<RwLock<HashMap<String, PoolKind>>>,
+    connections: &Arc<RwLock<ConnectionPoolRegistry>>,
     pool_key: &str,
     target: &KeepaliveTarget,
     replace_agent_runtime: bool,
 ) -> bool {
     if let KeepaliveTarget::Agent(expected) = target {
-        return routing.detach_agent_pool_if_current(pool_key, expected, replace_agent_runtime).await;
+        return routing.detach_agent_pool_if_current(pool_key, expected, None, replace_agent_runtime).await;
     }
     let Some(pool) = remove_keepalive_pool_if_current(connections, pool_key, target).await else {
         return false;
@@ -4395,6 +5191,7 @@ fn keepalive_target_from_pool(pool: &PoolKind, config: &ConnectionConfig) -> Opt
         PoolKind::HBase(client) => Some(KeepaliveTarget::HBase(client.clone())),
         PoolKind::VectorDb(client) => Some(KeepaliveTarget::VectorDb(client.clone())),
         PoolKind::InfluxDb(client) => Some(KeepaliveTarget::InfluxDb(client.clone())),
+        PoolKind::InfluxDb3(client) => Some(KeepaliveTarget::InfluxDb3(client.clone())),
         PoolKind::VictoriaMetrics(client) => Some(KeepaliveTarget::VictoriaMetrics(client.clone())),
         PoolKind::Agent(client) => Some(KeepaliveTarget::Agent(client.clone())),
         _ => None,
@@ -4441,6 +5238,9 @@ async fn ping_keepalive_target(target: &mut KeepaliveTarget, timeout: Duration) 
         }
         KeepaliveTarget::InfluxDb(client) => {
             db::influxdb_driver::test_connection(client, timeout).await.map_err(Into::into)
+        }
+        KeepaliveTarget::InfluxDb3(client) => {
+            db::influxdb3_driver::test_connection(client, timeout).await.map_err(Into::into)
         }
         KeepaliveTarget::VictoriaMetrics(client) => {
             db::victoriametrics_driver::test_connection(client, timeout).await.map_err(Into::into)
@@ -4613,6 +5413,14 @@ fn mysql_pool_max_connections_for_session(client_session_id: Option<&str>) -> us
     }
 }
 
+fn postgres_pool_max_connections_for_session(client_session_id: Option<&str>) -> usize {
+    if normalize_client_session_id(client_session_id).is_some() {
+        1
+    } else {
+        10
+    }
+}
+
 fn redis_cluster_transport_prefix(connection_id: &str) -> String {
     format!("{connection_id}:redis-cluster:")
 }
@@ -4653,6 +5461,10 @@ fn is_session_scoped_pool_key(pool_key: &str) -> bool {
     pool_key.contains(":session:")
 }
 
+fn is_manual_transaction_pool_key(pool_key: &str) -> bool {
+    pool_key.contains(":session:manual-txn-")
+}
+
 pub(crate) fn config_for_pool_key<'a>(
     pool_key: &str,
     configs: &'a HashMap<String, ConnectionConfig>,
@@ -4684,6 +5496,80 @@ fn session_scoped_pool_key_for(
     session_scoped_pool_key(base_pool_key, client_session_id)
 }
 
+/// 两个运行态连接配置是否视为同一连接（用于决定是否销毁连接池）。
+///
+/// 仅当双方都是 `save_password=false` 时才忽略 `password` 字段的差异：这类连接
+/// 在 connect 时运行态配置可能携带会话密码，持久化同步后为空，这种空值差异不应
+/// 触发池重建。若任一方 `save_password=true`，密码是真实的连接参数，任何密码变更
+/// （包括用户保存了新密码）都必须销毁旧池，否则旧池会继续用旧密码认证。
+pub fn connection_configs_pool_equivalent(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
+    if a == b {
+        return true;
+    }
+    if !a.save_password && !b.save_password {
+        let mut a = a.clone();
+        a.password.clear();
+        let mut b = b.clone();
+        b.password.clear();
+        return a == b;
+    }
+    false
+}
+
+/// Whether transient credentials can safely survive a persisted config update.
+///
+/// This comparison is intentionally conservative: only presentation, local
+/// visibility, and runtime-policy fields are ignored. Endpoint, account,
+/// transport, TLS, driver, and unclassified external-config changes still
+/// invalidate credentials. Nacos managed namespaces are a local discovery
+/// scope and therefore do not change which account a transient password
+/// belongs to.
+pub fn connection_configs_session_credentials_compatible(a: &ConnectionConfig, b: &ConnectionConfig) -> bool {
+    fn normalize(mut config: ConnectionConfig) -> ConnectionConfig {
+        config.name.clear();
+        config.note.clear();
+        config.driver_label = None;
+        config.default_schema = None;
+        config.visible_databases = None;
+        config.visible_schemas = None;
+        config.show_system_schemas = false;
+        config.color = None;
+        config.docs_notes_path = None;
+        config.connect_timeout_secs = 0;
+        config.query_timeout_secs = 0;
+        config.idle_timeout_secs = 0;
+        config.keepalive_interval_secs = 0;
+        config.redis_key_separator.clear();
+        config.redis_scan_page_size = None;
+        config.redis_database_aliases.clear();
+        config.one_time = false;
+        config.read_only = false;
+        config.is_production = false;
+        config.production_databases.clear();
+        config.database_info = None;
+
+        if config.db_type == DatabaseType::Nacos {
+            if let Some(external) = config.external_config.as_mut().and_then(serde_json::Value::as_object_mut) {
+                external.remove("managedNamespaces");
+                external.remove("managed_namespaces");
+                if !config.save_password {
+                    for key in ["auth", "rnacosConsoleAuth", "rnacos_console_auth"] {
+                        if let Some(auth) = external.get_mut(key).and_then(serde_json::Value::as_object_mut) {
+                            auth.insert("password".to_string(), serde_json::Value::String(String::new()));
+                        }
+                    }
+                }
+            }
+        }
+        if !config.save_password {
+            config.password.clear();
+        }
+        config
+    }
+
+    normalize(a.clone()) == normalize(b.clone())
+}
+
 fn pool_key_for_session_role(
     config: Option<&ConnectionConfig>,
     base_pool_key: String,
@@ -4700,38 +5586,9 @@ fn pool_key_for_session_role(
     }
 }
 
+#[cfg(test)]
 fn clone_pool_kind(pool: &PoolKind) -> PoolKind {
-    match pool {
-        PoolKind::Mysql(p, mode) => PoolKind::Mysql(p.clone(), *mode),
-        PoolKind::Postgres(p) => PoolKind::Postgres(p.clone()),
-        PoolKind::Sqlite(p) => PoolKind::Sqlite(p.clone()),
-        PoolKind::Rqlite(client) => PoolKind::Rqlite(client.clone()),
-        PoolKind::Turso(client) => PoolKind::Turso(client.clone()),
-        PoolKind::CloudflareD1(client) => PoolKind::CloudflareD1(client.clone()),
-        #[cfg(feature = "duckdb-sidecar")]
-        PoolKind::DuckDbWorker(client) => PoolKind::DuckDbWorker(client.clone()),
-        #[cfg(not(feature = "duckdb-sidecar"))]
-        PoolKind::DuckDbWorker(_) => PoolKind::DuckDbWorker(()),
-        PoolKind::MongoDb(client) => PoolKind::MongoDb(client.clone()),
-        PoolKind::ClickHouse(client) => PoolKind::ClickHouse(client.clone()),
-        PoolKind::SqlServer(client) => PoolKind::SqlServer(client.clone()),
-        PoolKind::Elasticsearch(client) => PoolKind::Elasticsearch(client.clone()),
-        PoolKind::Easysearch(client) => PoolKind::Easysearch(client.clone()),
-        PoolKind::HBase(client) => PoolKind::HBase(client.clone()),
-        PoolKind::VectorDb(client) => PoolKind::VectorDb(client.clone()),
-        PoolKind::InfluxDb(client) => PoolKind::InfluxDb(client.clone()),
-        PoolKind::VictoriaMetrics(client) => PoolKind::VictoriaMetrics(client.clone()),
-        PoolKind::Agent(client) => PoolKind::Agent(client.clone()),
-        PoolKind::ExternalDriver { driver_id, config, session } => {
-            PoolKind::ExternalDriver { driver_id: driver_id.clone(), config: config.clone(), session: session.clone() }
-        }
-        PoolKind::MessageQueue => PoolKind::MessageQueue,
-        PoolKind::Nacos => PoolKind::Nacos,
-        PoolKind::Consul(client) => PoolKind::Consul(client.clone()),
-        #[cfg(feature = "mq-admin")]
-        PoolKind::Mqtt(client) => PoolKind::Mqtt(Arc::clone(client)),
-        PoolKind::Redis(_) => panic!("clone_pool_kind not supported for Redis — handled separately"),
-    }
+    pool.clone()
 }
 
 async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
@@ -4740,7 +5597,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
             let _ = p.disconnect().await;
         }
         PoolKind::Postgres(p) => p.close(),
-        PoolKind::Sqlite(_) => {}
+        PoolKind::Sqlite(pool) => {
+            pool.shutdown().await;
+        }
         PoolKind::Rqlite(_) => {}
         PoolKind::Turso(_) => {}
         PoolKind::CloudflareD1(_) => {}
@@ -4756,6 +5615,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
         PoolKind::MongoDb(client) => {
             drop(client);
         }
+        PoolKind::DynamoDb(client) => {
+            drop(client);
+        }
         PoolKind::ClickHouse(client) => {
             drop(client);
         }
@@ -4768,6 +5630,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
         PoolKind::Easysearch(client) => {
             drop(client);
         }
+        PoolKind::Meilisearch(client) => {
+            drop(client);
+        }
         PoolKind::HBase(client) => {
             drop(client);
         }
@@ -4775,6 +5640,9 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
             drop(client);
         }
         PoolKind::InfluxDb(client) => {
+            drop(client);
+        }
+        PoolKind::InfluxDb3(client) => {
             drop(client);
         }
         PoolKind::VictoriaMetrics(client) => {
@@ -4895,13 +5763,6 @@ fn should_validate_existing_pool_before_reuse(db_type: DatabaseType) -> bool {
     // checked out for actual work. An eager probe here would add a database
     // round-trip before every request and can compete with active Agent leases.
     db_type != DatabaseType::Postgres && !matches!(db_type, agent_connection_pool_database_type!())
-}
-
-fn agent_pool_identity(pool: &PoolKind) -> Option<Arc<db::agent_driver::PooledAgentClient>> {
-    match pool {
-        PoolKind::Agent(client) => Some(client.clone()),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -5123,16 +5984,17 @@ async fn detect_ob_oracle_mode(config: &ConnectionConfig, pool: &db::mysql::MySq
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_connect_timeout, connection_probe_endpoints, connection_remote_endpoint, connection_url_for_endpoint,
+        agent_connect_timeout, connection_configs_pool_equivalent, connection_configs_session_credentials_compatible,
+        connection_probe_endpoints, connection_remote_endpoint, connection_url_for_endpoint,
         database_connection_config, database_connection_config_with_catalog,
         gaussdb_identifier_quote_from_query_result, gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver,
         kafka_single_loopback_bootstrap_endpoint, metadata_connection_config, mysql_metadata_fallback_url,
-        mysql_pool_setup_queries, oceanbase_mysql_query_timeout_sql, oceanbase_mysql_setup_queries,
-        prestosql_jdbc_config_for_endpoint, redacted_connection_url_for_endpoint, redis_sentinel_transport_id,
-        redis_sentinel_transport_prefix, sqlserver_legacy_agent_config, sqlserver_legacy_driver_error,
-        sqlserver_uses_legacy_driver, task_client_session_id, upsert_connection_url_param, uses_bare_mysql_pool,
+        mysql_pool_setup_queries, oceanbase_mysql_setup_queries, prestosql_jdbc_config_for_endpoint,
+        redacted_connection_url_for_endpoint, redis_sentinel_transport_id, redis_sentinel_transport_prefix,
+        sqlserver_legacy_agent_config, sqlserver_legacy_driver_error, sqlserver_uses_legacy_driver,
+        task_client_session_id, transport_layers_through_last_ssh, upsert_connection_url_param, uses_bare_mysql_pool,
         uses_tcp_probe, validate_connection_url_params, validate_h2_database_path, AppState, MysqlMode, PoolKind,
-        GAUSSDB_M_JDBC_DRIVER_CLASS, GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
+        TxnConnection, GAUSSDB_M_JDBC_DRIVER_CLASS, GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -5148,6 +6010,7 @@ mod tests {
     use crate::query;
     use crate::schema;
     use crate::storage::Storage;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn mysql_config(database: Option<&str>) -> ConnectionConfig {
@@ -5168,6 +6031,7 @@ mod tests {
             database: database.map(str::to_string),
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -5195,6 +6059,7 @@ mod tests {
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -5202,6 +6067,7 @@ mod tests {
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
             one_time: false,
+            save_password: true,
             read_only: false,
             is_production: false,
             production_databases: vec![],
@@ -5242,6 +6108,225 @@ mod tests {
     }
 
     #[test]
+    fn connection_configs_pool_equivalent_ignores_password_differences() {
+        let mut a = mysql_config(None);
+        a.save_password = false;
+        a.password = "session-secret".to_string();
+        // 持久化同步后 password 为空（save_password=false）：视为同一连接，不销毁池。
+        let mut b = a.clone();
+        b.password.clear();
+        assert!(connection_configs_pool_equivalent(&a, &b));
+        assert!(connection_configs_pool_equivalent(&b, &a));
+
+        // 两个非空但不同的密码：同样忽略（密码不应触发池重建）。
+        let mut c = a.clone();
+        c.password = "changed-secret".to_string();
+        assert!(connection_configs_pool_equivalent(&a, &c));
+    }
+
+    #[test]
+    fn connection_configs_pool_equivalent_detects_saved_password_change() {
+        let mut a = mysql_config(None);
+        a.save_password = true;
+        a.password = "old-secret".to_string();
+        let mut b = a.clone();
+        b.password = "new-secret".to_string();
+        // save_password=true：密码是真实连接参数，保存新密码后旧池不得继续用旧密码认证。
+        assert!(!connection_configs_pool_equivalent(&a, &b));
+        assert!(!connection_configs_pool_equivalent(&b, &a));
+    }
+
+    #[test]
+    fn connection_configs_pool_equivalent_detects_real_parameter_changes() {
+        let mut a = mysql_config(None);
+        a.password = "secret".to_string();
+        // host / port / username / database 等真实连接参数变化应视为不同连接（销毁池）。
+        let mut host = a.clone();
+        host.host = "other-host".to_string();
+        assert!(!connection_configs_pool_equivalent(&a, &host));
+
+        let mut port = a.clone();
+        port.port = 5433;
+        assert!(!connection_configs_pool_equivalent(&a, &port));
+
+        let mut user = a.clone();
+        user.username = "other-user".to_string();
+        assert!(!connection_configs_pool_equivalent(&a, &user));
+
+        let mut ssl = a.clone();
+        ssl.ssl = true;
+        assert!(!connection_configs_pool_equivalent(&a, &ssl));
+
+        // 完全相等（含相同密码）→ true。
+        assert!(connection_configs_pool_equivalent(&a, &a.clone()));
+    }
+
+    #[test]
+    fn session_credentials_survive_nacos_scope_and_display_updates() {
+        let mut initial = mysql_config(None);
+        initial.db_type = DatabaseType::Nacos;
+        initial.save_password = false;
+        initial.password = "old-session-secret".to_string();
+        initial.visible_databases = Some(vec!["namespace-a".to_string()]);
+        initial.external_config = Some(serde_json::json!({
+            "implementation": "nacos",
+            "versionMode": "v3",
+            "apiPlane": "admin",
+            "serverAddr": "http://127.0.0.1:8848",
+            "managedNamespaces": ["namespace-a"],
+            "auth": {
+                "kind": "usernamePassword",
+                "username": "ordinary-user",
+                "password": "old-session-secret"
+            }
+        }));
+
+        let mut updated = initial.clone();
+        updated.name = "Renamed Nacos".to_string();
+        updated.note = "Local note".to_string();
+        updated.visible_databases = Some(vec!["namespace-a".to_string(), "namespace-b".to_string()]);
+        updated.external_config.as_mut().unwrap()["managedNamespaces"] =
+            serde_json::json!(["namespace-a", "namespace-b"]);
+        updated.external_config.as_mut().unwrap()["auth"]["password"] = serde_json::json!("new-session-secret");
+
+        assert!(connection_configs_session_credentials_compatible(&initial, &updated));
+
+        let mut scrubbed = updated.clone();
+        scrubbed.external_config.as_mut().unwrap()["auth"].as_object_mut().unwrap().remove("password");
+        assert!(connection_configs_session_credentials_compatible(&initial, &scrubbed));
+
+        updated.external_config.as_mut().unwrap()["serverAddr"] = serde_json::json!("http://127.0.0.1:8080");
+        assert!(!connection_configs_session_credentials_compatible(&initial, &updated));
+    }
+
+    #[test]
+    fn session_credentials_do_not_survive_nacos_account_updates() {
+        let mut initial = mysql_config(None);
+        initial.db_type = DatabaseType::Nacos;
+        initial.save_password = false;
+        initial.external_config = Some(serde_json::json!({
+            "serverAddr": "http://127.0.0.1:8848",
+            "auth": { "kind": "usernamePassword", "username": "user-a", "password": "secret" }
+        }));
+        let mut updated = initial.clone();
+        updated.external_config.as_mut().unwrap()["auth"]["username"] = serde_json::json!("user-b");
+
+        assert!(!connection_configs_session_credentials_compatible(&initial, &updated));
+    }
+
+    #[tokio::test]
+    async fn apply_session_credential_injects_saved_password_only_for_no_save_connections() {
+        let dir = std::env::temp_dir().join(format!("dbx-core-session-cred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+        let _ = state.session_credentials.set("", "conn-a", "s3cret");
+
+        let mut config = mysql_config(None);
+        config.id = "conn-a".to_string();
+        config.save_password = false;
+        config.password.clear();
+
+        // save_password=false + db_config 密码为空 → 从会话凭据仓库注入。
+        let mut db_config = metadata_connection_config(&config);
+        state.apply_session_credential(&config, &mut db_config, &config.id);
+        assert_eq!(db_config.password, "s3cret");
+
+        // save_password=true → 不注入（走持久化水合的密码，若为空则保持空）。
+        config.save_password = true;
+        let mut db_config = metadata_connection_config(&config);
+        state.apply_session_credential(&config, &mut db_config, &config.id);
+        assert_eq!(db_config.password, "");
+
+        // 无会话凭据 → 保持空密码（"断开并忘记"后重新输入）。
+        state.session_credentials.remove("", "conn-a");
+        config.save_password = false;
+        let mut db_config = metadata_connection_config(&config);
+        state.apply_session_credential(&config, &mut db_config, &config.id);
+        assert_eq!(db_config.password, "");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn apply_session_credential_reads_owner_scoped_credentials_only() {
+        let dir = std::env::temp_dir().join(format!("dbx-core-session-cred-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+
+        let mut config = mysql_config(None);
+        config.id = "conn-a".to_string();
+        config.save_password = false;
+        config.password.clear();
+
+        // 会话 X 输入了密码，会话 Y 未输入：Y 的请求（owner=token-y）不得注入 X 的密码。
+        let _ = state.session_credentials.set("token-x", "conn-a", "x-secret");
+        crate::session_credentials::with_credential_owner(Some("token-y".to_string()), async {
+            let mut db_config = metadata_connection_config(&config);
+            state.apply_session_credential(&config, &mut db_config, &config.id);
+            assert_eq!(db_config.password, "");
+        })
+        .await;
+
+        // 会话 X 自身能读到自己的密码。
+        crate::session_credentials::with_credential_owner(Some("token-x".to_string()), async {
+            let mut db_config = metadata_connection_config(&config);
+            state.apply_session_credential(&config, &mut db_config, &config.id);
+            assert_eq!(db_config.password, "x-secret");
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn pool_credential_owner_mismatch_prevents_cross_session_pool_reuse() {
+        let dir = std::env::temp_dir().join(format!("dbx-core-pool-owner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.join("plugins"));
+
+        let mut config = mysql_config(None);
+        config.id = "conn-a".to_string();
+        config.save_password = false;
+
+        // 模拟会话 X 创建的 no-save 池。
+        state.session_credentials.record_pool_owner("conn-a", "token-x");
+
+        // 同一会话 X 复用 → 无冲突。
+        crate::session_credentials::with_credential_owner(Some("token-x".to_string()), async {
+            assert!(!state.pool_credential_owner_mismatch(&config, "conn-a").await);
+        })
+        .await;
+
+        // 另一会话 Y 请求同一 no-save 池 → 冲突，需以 Y 的凭据重建，避免复用 X 的密码。
+        crate::session_credentials::with_credential_owner(Some("token-y".to_string()), async {
+            assert!(state.pool_credential_owner_mismatch(&config, "conn-a").await);
+        })
+        .await;
+
+        // owner 标记缺失时按不可信处理，避免全局配置失效与异步移除旧池之间复用旧池。
+        state.session_credentials.clear_connection("conn-a");
+        crate::session_credentials::with_credential_owner(Some("token-x".to_string()), async {
+            assert!(state.pool_credential_owner_mismatch(&config, "conn-a").await);
+        })
+        .await;
+
+        // 桌面端（无 owner）单用户 → 不冲突，按既有逻辑复用。
+        assert!(!state.pool_credential_owner_mismatch(&config, "conn-a").await);
+
+        // 已保存密码连接始终共享池 → 不冲突。
+        config.save_password = true;
+        crate::session_credentials::with_credential_owner(Some("token-y".to_string()), async {
+            assert!(!state.pool_credential_owner_mismatch(&config, "conn-a").await);
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn task_client_session_ids_are_stable_and_isolated() {
         assert_eq!(task_client_session_id("table-export", "job-1"), "table-export:job-1");
         assert_ne!(task_client_session_id("table-export", "job-1"), task_client_session_id("database-export", "job-1"));
@@ -5277,7 +6362,7 @@ mod tests {
         config.host = "presto.example.com".to_string();
         config.port = 9090;
 
-        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "127.0.0.1", 19090);
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "127.0.0.1", 19090).unwrap();
 
         assert_eq!(jdbc_config.connection_string.as_deref(), Some("jdbc:presto://127.0.0.1:19090/hive/default"));
         assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some(PRESTOSQL_JDBC_DRIVER_CLASS));
@@ -5290,7 +6375,7 @@ mod tests {
         config.jdbc_driver_class = Some("custom.PrestoDriver".to_string());
         config.jdbc_driver_paths = vec!["D:\\software\\jar\\presto-jdbc-350.jar".to_string()];
 
-        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 9090);
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 9090).unwrap();
 
         assert_eq!(jdbc_config.jdbc_driver_class.as_deref(), Some("custom.PrestoDriver"));
         assert_eq!(jdbc_config.jdbc_driver_paths, vec!["D:\\software\\jar\\presto-jdbc-350.jar"]);
@@ -5305,7 +6390,7 @@ mod tests {
             "SSL=true&SSLKeyStorePassword=secret&SSLKeyStorePath=D:/keystore/presto/presto_keystore.jks".to_string(),
         );
 
-        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 8443);
+        let jdbc_config = prestosql_jdbc_config_for_endpoint(&config, "presto.example.com", 8443).unwrap();
 
         assert_eq!(
             jdbc_config.connection_string.as_deref(),
@@ -5363,6 +6448,32 @@ mod tests {
         assert_eq!(
             gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
             Some("jdbc:gaussdb://db.internal:8000/postgres?currentSchema=legacy&sslmode=prefer&ssl=true")
+        );
+    }
+
+    #[test]
+    fn gaussdb_m_jdbc_target_server_type_preserves_url_params_and_allows_explicit_override() {
+        let mut config = mysql_config(Some("postgres"));
+        config.db_type = DatabaseType::Gaussdb;
+        config.driver_profile = Some(GAUSSDB_M_JDBC_DRIVER_PROFILE.to_string());
+
+        let default_url = gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.unwrap();
+        assert!(!default_url.to_ascii_lowercase().contains("targetservertype="));
+
+        config.url_params = Some("targetServerType=slave&currentSchema=app".to_string());
+        assert_eq!(
+            gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
+            Some(
+                "jdbc:gaussdb://db.internal:8000/postgres?targetServerType=slave&currentSchema=app&sslmode=prefer&ssl=true"
+            )
+        );
+
+        config.external_config = Some(serde_json::json!({ "gaussdbTargetServerType": "master" }));
+        assert_eq!(
+            gaussdb_m_jdbc_config_for_endpoint(&config, "db.internal", 8000).connection_string.as_deref(),
+            Some(
+                "jdbc:gaussdb://db.internal:8000/postgres?currentSchema=app&sslmode=prefer&ssl=true&targetServerType=master"
+            )
         );
     }
 
@@ -5455,7 +6566,7 @@ mod tests {
         config.password = "in4mix".to_string();
         config.url_params = Some("INFORMIXSERVER=informix;CLIENT_LOCALE=en_US.utf8".to_string());
 
-        let params = agent_connect_params(&config, "172.26.128.159", 20013, "testdb");
+        let params = agent_connect_params(&config, "172.26.128.159", 20013, "testdb").unwrap();
 
         assert_eq!(params["host"], "172.26.128.159");
         assert_eq!(params["port"], 20013);
@@ -5471,7 +6582,7 @@ mod tests {
         config.db_type = DatabaseType::SqlServer;
         config.external_config = Some(serde_json::json!({ "portExplicit": true }));
 
-        let params = agent_connect_params(&config, r"db.example.com\SQLEXPRESS", 1433, "master");
+        let params = agent_connect_params(&config, r"db.example.com\SQLEXPRESS", 1433, "master").unwrap();
 
         assert_eq!(params["port_explicit"], true);
     }
@@ -5529,7 +6640,7 @@ mod tests {
         config.password = "secret".to_string();
         config.url_params = Some("authSource=admin&authMechanism=SCRAM-SHA-1".to_string());
 
-        let params = agent_connect_params(&config, "172.22.4.42", 27017, "RestCloud_V45PUB_Gateway");
+        let params = agent_connect_params(&config, "172.22.4.42", 27017, "RestCloud_V45PUB_Gateway").unwrap();
 
         assert_eq!(params["connection_string"], "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud%5FV45PUB%5FGateway?authSource=admin&authMechanism=SCRAM-SHA-1");
     }
@@ -5541,7 +6652,7 @@ mod tests {
         config.connection_string =
             Some("mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin".to_string());
 
-        let params = agent_connect_params(&config, "172.22.4.42", 27017, "");
+        let params = agent_connect_params(&config, "172.22.4.42", 27017, "").unwrap();
 
         assert_eq!(params["database"], "RestCloud_V45PUB_Gateway");
     }
@@ -5552,7 +6663,7 @@ mod tests {
 
         assert_eq!(
             mongo_legacy_error_with_auth_hint(err),
-            "Agent RPC error: Exception authenticating MongoCredential{mechanism=SCRAM-SHA-1, userName='rwuser', source='gray_lite_twin_fat'}\n\nCurrent authentication database: gray_lite_twin_fat. If this user was created in admin, set Authentication database to admin or add authSource=admin to URL params."
+            "Agent RPC error: Exception authenticating MongoCredential{mechanism=SCRAM-SHA-1, userName='rwuser', source='gray_lite_twin_fat'}\n\nCurrent authentication database: gray_lite_twin_fat. The server rejected these credentials. Verify the username and password, and confirm that the user was created in gray_lite_twin_fat. If the user was created in admin, set Authentication database to admin or add authSource=admin to URL params."
         );
     }
 
@@ -5571,7 +6682,7 @@ mod tests {
         config.driver_profile = Some("oceanbase".to_string());
 
         assert_eq!(
-            oceanbase_mysql_query_timeout_sql(&config, 300_000),
+            db::oceanbase_mysql::query_timeout_sql(&config, 300_000),
             Some("SET ob_query_timeout = 300000000000".to_string())
         );
     }
@@ -5639,7 +6750,7 @@ mod tests {
         config.sysdba = true;
         config.oracle_connection_type = Some("service_name".to_string());
 
-        let params = agent_connect_params(&config, "oracle.example.com", 1521, "ORCLPDB1");
+        let params = agent_connect_params(&config, "oracle.example.com", 1521, "ORCLPDB1").unwrap();
 
         assert_eq!(params["database"], "SYSDBA:ORCLPDB1");
         assert_eq!(params["sysdba"], true);
@@ -5682,7 +6793,7 @@ mod tests {
             config.url_params = Some("sslmode=disable".to_string());
             config.connection_string = Some(stale_connection_string.to_string());
 
-            let params = agent_connect_params(&config, host, port, "platform_face_freezer_jgj");
+            let params = agent_connect_params(&config, host, port, "platform_face_freezer_jgj").unwrap();
 
             assert_eq!(params["database"], "platform_face_freezer_jgj");
             assert_eq!(params["connection_string"], expected_connection_string);
@@ -5695,7 +6806,7 @@ mod tests {
         config.db_type = DatabaseType::Oracle;
         config.oracle_connection_type = Some("sid".to_string());
 
-        let params = agent_connect_params(&config, "127.0.0.1", 11521, "ORCL");
+        let params = agent_connect_params(&config, "127.0.0.1", 11521, "ORCL").unwrap();
 
         assert_eq!(params["connection_string"], "jdbc:oracle:thin:@127.0.0.1:11521:ORCL");
     }
@@ -5706,7 +6817,7 @@ mod tests {
         config.db_type = DatabaseType::Oracle;
         config.oracle_connection_type = None;
 
-        let params = agent_connect_params(&config, "127.0.0.1", 11521, "ORCL");
+        let params = agent_connect_params(&config, "127.0.0.1", 11521, "ORCL").unwrap();
 
         assert_eq!(params["connection_string"], "jdbc:oracle:thin:@//127.0.0.1:11521/ORCL");
     }
@@ -5767,7 +6878,7 @@ mod tests {
         config.password = "secret".to_string();
         config.url_params = Some("encrypt=true".to_string());
 
-        let params = agent_connect_params(&config, "hana.example.com", 30013, "TENANT1");
+        let params = agent_connect_params(&config, "hana.example.com", 30013, "TENANT1").unwrap();
 
         assert_eq!(params["database"], "TENANT1");
         assert_eq!(params["connection_string"], "jdbc:sap://hana.example.com:30013/?databaseName=TENANT1&encrypt=true");
@@ -5785,6 +6896,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_pool_handle_does_not_block_registry_writes() {
+        let (state, dir) = test_app_state().await;
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("slow-operation".to_string(), agent_pool_stub());
+            })
+            .await;
+
+        let handle = state.pool_handle("slow-operation").await.expect("pool handle");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            state.update_connection_pools(|connections| {
+                connections.insert("other-connection".to_string(), agent_pool_stub());
+            }),
+        )
+        .await
+        .expect("an owned handle must not retain the registry lock");
+
+        assert!(matches!(handle, PoolKind::Agent(_)));
+        assert!(state.pool_handle("other-connection").await.is_some());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn redis_pool_handle_survives_registry_removal() {
+        let (state, dir) = test_app_state().await;
+        let redis = Arc::new(crate::db::redis_driver::redis_connection_test_stub());
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("redis".to_string(), PoolKind::Redis(Arc::clone(&redis)));
+            })
+            .await;
+
+        let handle = state.pool_handle("redis").await.expect("Redis handle");
+        let removed = state.update_connection_pools(|connections| connections.remove("redis")).await;
+
+        assert!(matches!(handle, PoolKind::Redis(ref current) if Arc::ptr_eq(current, &redis)));
+        assert!(matches!(removed, Some(PoolKind::Redis(ref current)) if Arc::ptr_eq(current, &redis)));
+        assert!(state.pool_handle("redis").await.is_none());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn shutdown_releases_connection_pools_and_agent_daemons() {
         let (state, dir) = test_app_state().await;
         state.connections.write().await.insert("conn".to_string(), agent_pool_stub());
@@ -5799,6 +6955,23 @@ mod tests {
 
         assert!(state.connections.read().await.is_empty());
         assert!(state.agent_manager.active_daemon_keys().await.is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn webview_reload_session_cancellation_marks_running_tasks_cancelled() {
+        let (state, dir) = test_app_state().await;
+        let registered = state.running_queries.register_task(
+            "exec-1".to_string(),
+            crate::query_cancel::RunningTaskMetadata::query("conn-1", "main", Some("tab-1".to_string())),
+        );
+        assert!(!registered.token().is_cancelled());
+
+        // The narrow renderer-reload boundary signals all running-query tasks
+        // (SQL execution and exports register here) without touching pools.
+        assert_eq!(state.cancel_webview_reload_session_tasks(), 1);
+        assert!(registered.token().is_cancelled());
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5874,7 +7047,7 @@ mod tests {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(path, b"").unwrap();
+        std::fs::write(path, b"test executable").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -5901,6 +7074,59 @@ mod tests {
 
         assert_eq!(state.agent_manager.base_dir(), &agent_dir);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn ssh_tunnel_test_includes_prerequisites_through_final_ssh_hop() {
+        let before = TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "before".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        });
+        let ssh = TransportLayerConfig::Ssh(ssh_layer("ssh", ""));
+        let after = TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "after".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Http,
+            host: "downstream.internal".to_string(),
+            port: 8080,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        });
+        let layers = vec![before.clone(), ssh.clone(), after];
+
+        assert_eq!(transport_layers_through_last_ssh(&layers).unwrap(), &[before, ssh]);
+    }
+
+    #[test]
+    fn ssh_tunnel_test_rejects_chain_without_ssh() {
+        let layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
+            id: "proxy".to_string(),
+            name: String::new(),
+            enabled: true,
+            proxy_type: ProxyType::Socks5,
+            host: "proxy.internal".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            test_target: None,
+            profile_id: String::new(),
+        })];
+
+        assert_eq!(
+            transport_layers_through_last_ssh(&layers).unwrap_err(),
+            "Connection has no enabled SSH tunnel layer"
+        );
     }
 
     #[tokio::test]
@@ -6011,6 +7237,40 @@ mod tests {
         assert!(state.connections.read().await.contains_key("conn"));
         drop(held_connection);
         state.remove_connection_pools_detached("conn").await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn mysql_health_check_keeps_pool_when_connection_creation_exceeds_probe_budget() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let pool_options =
+            mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(1, 2).unwrap());
+        let options = mysql_async::OptsBuilder::default()
+            .ip_or_hostname(address.ip().to_string())
+            .tcp_port(address.port())
+            .user(Some("fault-injection"))
+            .pass(Some("fault-injection"))
+            .pool_opts(Some(pool_options));
+        let pool = db::mysql::MySqlPool::new(options, 2);
+        let (state, dir) = test_app_state().await;
+        state.connections.write().await.insert("conn".to_string(), PoolKind::Mysql(pool.clone(), MysqlMode::Normal));
+
+        let started = Instant::now();
+        assert!(!state.remove_stale_connection_pool("conn").await);
+
+        assert!(started.elapsed() >= super::HEALTH_CHECK_POOL_ACQUIRE_TIMEOUT);
+        assert!(matches!(
+            state.connections.read().await.get("conn"),
+            Some(PoolKind::Mysql(current, _)) if pool.is_same_pool(current)
+        ));
+        state.connections.write().await.remove("conn");
+        server.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), pool.disconnect()).await;
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6491,6 +7751,194 @@ mod tests {
         assert_eq!(super::mysql_pool_max_connections_for_session(None), 10);
         assert_eq!(super::mysql_pool_max_connections_for_session(Some("")), 10);
         assert_eq!(super::mysql_pool_max_connections_for_session(Some("tab-1")), 1);
+    }
+
+    #[test]
+    fn postgres_pool_size_keeps_session_pools_single_connection() {
+        assert_eq!(super::postgres_pool_max_connections_for_session(None), 10);
+        assert_eq!(super::postgres_pool_max_connections_for_session(Some("")), 10);
+        assert_eq!(super::postgres_pool_max_connections_for_session(Some("mcp:batch-1")), 1);
+    }
+
+    #[test]
+    fn stale_mysql_pool_observation_does_not_remove_replacement_generation() {
+        let checked = crate::db::mysql::MySqlPool::new("mysql://root@127.0.0.1:3306/app", 10);
+        let checked_clone = checked.clone();
+        let replacement = crate::db::mysql::MySqlPool::new("mysql://root@127.0.0.1:3306/app", 10);
+        assert!(checked.is_same_pool(&checked_clone));
+        assert!(!checked.is_same_pool(&replacement));
+    }
+
+    #[tokio::test]
+    async fn stale_postgres_cleanup_preserves_concurrent_replacement_publication() {
+        let (state, dir) = test_app_state().await;
+        let state = std::sync::Arc::new(state);
+        let pool_key = "conn:app";
+        let postgres_pool = || {
+            let manager = deadpool_postgres::Manager::new(tokio_postgres::Config::new(), tokio_postgres::NoTls);
+            deadpool_postgres::Pool::builder(manager)
+                .runtime(deadpool_postgres::Runtime::Tokio1)
+                .build()
+                .expect("build PostgreSQL test pool")
+        };
+        let checked = postgres_pool();
+        let replacement = postgres_pool();
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Postgres(checked));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+        let checked_publication = state.pool_publication_snapshot(pool_key).await.unwrap().publication;
+
+        let cleanup_ready = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let continue_cleanup = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let cleanup_state = state.clone();
+        let cleanup_publication = checked_publication.clone();
+        let cleanup_ready_for_task = cleanup_ready.clone();
+        let cleanup_continue = continue_cleanup.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .remove_stale_pool_if_current_inner(
+                    pool_key,
+                    &cleanup_publication,
+                    Some(super::StalePoolCleanupBarriers {
+                        before_removal: Some((cleanup_ready_for_task, cleanup_continue)),
+                        after_removal: None,
+                    }),
+                )
+                .await
+        });
+        cleanup_ready.wait().await;
+
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Postgres(replacement));
+        let replacement_publication = state.pool_publication_snapshot(pool_key).await.unwrap().publication;
+        assert!(!checked_publication.is_same(&replacement_publication));
+        continue_cleanup.wait().await;
+        assert!(!cleanup.await.unwrap());
+
+        let current = state.pool_publication_snapshot(pool_key).await.expect("replacement must remain routable");
+        assert!(matches!(current.pool, PoolKind::Postgres(_)));
+        assert!(current.publication.is_same(&replacement_publication));
+        assert!(state.pool_activity.read().await.contains_key(pool_key));
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn stale_mysql_cleanup_preserves_replacement_support_state() {
+        let (state, dir) = test_app_state().await;
+        let state = std::sync::Arc::new(state);
+        let pool_key = "conn:app";
+        let checked = crate::db::mysql::MySqlPool::new("mysql://root@127.0.0.1:3306/app", 10);
+        let replacement = crate::db::mysql::MySqlPool::new("mysql://root@127.0.0.1:3306/app", 10);
+        let mut config = mysql_config(Some("app"));
+        config.keepalive_interval_secs = 60;
+        state
+            .connections
+            .write()
+            .await
+            .insert(pool_key.to_string(), PoolKind::Mysql(checked.clone(), MysqlMode::Normal));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+        let checked_publication = state.pool_publication_snapshot(pool_key).await.unwrap().publication;
+        state.start_keepalive_task(
+            pool_key,
+            &PoolKind::Mysql(checked, MysqlMode::Normal),
+            &config,
+            #[cfg(feature = "mq-admin")]
+            None,
+        );
+        assert_eq!(state.supervised_task_count(), 1);
+
+        let route_removed = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let continue_cleanup = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let cleanup_state = state.clone();
+        let cleanup_publication = checked_publication.clone();
+        let cleanup_route_removed = route_removed.clone();
+        let cleanup_continue = continue_cleanup.clone();
+        let cleanup = tokio::spawn(async move {
+            cleanup_state
+                .remove_stale_pool_if_current_inner(
+                    pool_key,
+                    &cleanup_publication,
+                    Some(super::StalePoolCleanupBarriers {
+                        before_removal: None,
+                        after_removal: Some((cleanup_route_removed, cleanup_continue)),
+                    }),
+                )
+                .await
+        });
+        route_removed.wait().await;
+
+        let publish_state = state.clone();
+        let publish_config = config.clone();
+        let publish_replacement = replacement.clone();
+        let mut publish = tokio::spawn(async move {
+            publish_state
+                .insert_connection_pool(
+                    pool_key.to_string(),
+                    PoolKind::Mysql(publish_replacement, MysqlMode::Normal),
+                    &publish_config,
+                )
+                .await
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut publish).await.is_err(),
+            "replacement publication must wait while stale support state is cleaned"
+        );
+        continue_cleanup.wait().await;
+        assert!(cleanup.await.unwrap());
+        publish.await.unwrap().unwrap();
+
+        let current = state.pool_publication_snapshot(pool_key).await.expect("replacement must remain routable");
+        assert!(matches!(current.pool, PoolKind::Mysql(ref pool, _) if replacement.is_same_pool(pool)));
+        assert!(!current.publication.is_same(&checked_publication));
+        assert!(state.pool_activity.read().await.contains_key(pool_key));
+        assert_eq!(state.supervised_task_count(), 1);
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn metadata_concurrency_reserves_query_capacity() {
+        assert_eq!(super::metadata_concurrency_limit(DatabaseType::Mysql, 10), 6);
+        assert_eq!(super::metadata_concurrency_limit(DatabaseType::Postgres, 10), 6);
+        assert_eq!(super::metadata_concurrency_limit(DatabaseType::Mysql, 3), 1);
+        assert_eq!(super::metadata_concurrency_limit(DatabaseType::Postgres, 1), 1);
+        assert_eq!(super::metadata_concurrency_limit(DatabaseType::SqlServer, 10), 1);
+    }
+
+    #[test]
+    fn session_metadata_gate_allowance_matches_session_pool_capacity() {
+        // PostgreSQL session pools are full-size (10 connections, see
+        // db/postgres.rs Pool::builder().max_size(10)), so the gate must not
+        // serialize the database-export prefetch down to one permit.
+        assert_eq!(super::metadata_gate_session_allowance(DatabaseType::Postgres), 10);
+        // MySQL and other session-scoped pools are single-connection.
+        assert_eq!(super::metadata_gate_session_allowance(DatabaseType::Mysql), 1);
+        // SQL Server gate is intentionally shared/serialized regardless.
+        assert_eq!(super::metadata_gate_session_allowance(DatabaseType::SqlServer), 1);
+    }
+
+    #[test]
+    fn metadata_gate_is_limited_to_supported_pool_drivers() {
+        assert!(super::uses_metadata_gate(DatabaseType::Mysql));
+        assert!(super::uses_metadata_gate(DatabaseType::Postgres));
+        assert!(super::uses_metadata_gate(DatabaseType::SqlServer));
+        assert!(!super::uses_metadata_gate(DatabaseType::Oracle));
+        assert!(!super::uses_metadata_gate(DatabaseType::Sqlite));
+        assert!(!super::uses_metadata_gate(DatabaseType::MongoDb));
+    }
+
+    #[test]
+    fn sqlserver_metadata_gate_is_shared_across_client_sessions() {
+        assert_eq!(
+            super::metadata_gate_key("conn", Some("app"), DatabaseType::SqlServer, Some("metadata-1")),
+            super::metadata_gate_key("conn", Some("app"), DatabaseType::SqlServer, Some("metadata-2"))
+        );
+        assert_ne!(
+            super::metadata_gate_key("conn", Some("app"), DatabaseType::Mysql, Some("tab-1")),
+            super::metadata_gate_key("conn", Some("app"), DatabaseType::Mysql, Some("tab-2"))
+        );
     }
 
     #[test]
@@ -7060,6 +8508,39 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn metadata_close_replace_runtime_preserves_manual_transaction_sibling() {
+        let (state, dir) = test_app_state().await;
+        let (runtime, metadata_client, manual_txn_client) =
+            replace_runtime_on_error_clients(&dir, "close_session").await;
+        let mut config = mysql_config(Some("analytics"));
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Dameng;
+        state.configs.write().await.insert(config.id.clone(), config);
+        let metadata_pool_key = "conn:analytics:session:metadata-session:role:metadata";
+        let manual_txn_pool_key = "conn:analytics:session:manual-txn-test";
+        {
+            let mut connections = state.connections.write().await;
+            connections.insert(metadata_pool_key.to_string(), PoolKind::Agent(metadata_client));
+            connections.insert(manual_txn_pool_key.to_string(), PoolKind::Agent(manual_txn_client));
+        }
+        {
+            let mut activity = state.pool_activity.write().await;
+            activity.insert(metadata_pool_key.to_string(), super::PoolActivity::now());
+            activity.insert(manual_txn_pool_key.to_string(), super::PoolActivity::now());
+        }
+
+        assert!(state.close_metadata_session_pool("conn", Some("analytics"), "metadata-session").await.unwrap());
+
+        assert!(!state.connections.read().await.contains_key(metadata_pool_key));
+        assert!(state.connections.read().await.contains_key(manual_txn_pool_key));
+        assert!(state.pool_activity.read().await.contains_key(manual_txn_pool_key));
+        assert!(!runtime.is_failed());
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn reclaim_close_replace_runtime_never_restores_failed_pool() {
         let (state, dir) = test_app_state().await;
         let (runtime, reclaimed_client, sibling_client) = replace_runtime_on_error_clients(&dir, "close_session").await;
@@ -7549,6 +9030,43 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn manual_transaction_connection_drop_detaches_session_pool() {
+        let (state, dir) = test_app_state().await;
+        let (runtime, manual_txn_client, _sibling_client) = replace_runtime_on_error_clients(&dir, "unused").await;
+        let mut config = mysql_config(Some("analytics"));
+        config.id = "conn".to_string();
+        config.db_type = DatabaseType::Dameng;
+        state.configs.write().await.insert(config.id.clone(), config);
+
+        let client_session_id = "manual-txn-test";
+        let pool_key = "conn:analytics:session:manual-txn-test";
+        state.connections.write().await.insert(pool_key.to_string(), PoolKind::Agent(manual_txn_client.clone()));
+        state.pool_activity.write().await.insert(pool_key.to_string(), super::PoolActivity::now());
+        let cleanup_guard =
+            state.workload_session_pool_cleanup_guard("conn", Some("analytics"), client_session_id).await.unwrap();
+
+        drop(TxnConnection::Agent {
+            client: manual_txn_client,
+            client_session_id: client_session_id.to_string(),
+            database: Some("analytics".to_string()),
+            cleanup_guard,
+        });
+
+        for _ in 0..100 {
+            if !state.connections.read().await.contains_key(pool_key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(!state.pool_activity.read().await.contains_key(pool_key));
+        assert!(!runtime.is_failed());
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn closing_oracle_table_tab_keeps_connection_scoped_pool() {
         let (state, dir) = test_app_state().await;
         let mut config = mysql_config(Some("ORCLPDB1"));
@@ -7716,6 +9234,23 @@ for line in sys.stdin:
 
         let error = state.connection_host_port("oracle-tns", &config).await.unwrap_err();
         assert!(error.contains("cannot be combined with SSH, proxy, or HTTP tunnel"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn hive_zookeeper_discovery_rejects_static_transport_layers() {
+        let (state, dir) = test_app_state().await;
+        let mut config = mysql_config(Some("default"));
+        config.db_type = DatabaseType::Hive;
+        config.connection_string = Some(
+            "jdbc:hive2://zk1.example.com:2181,zk2.example.com:2181/default;serviceDiscoveryMode=zooKeeper".to_string(),
+        );
+        config.url_params = Some("serviceDiscoveryMode=zooKeeper".to_string());
+        config.transport_layers = vec![TransportLayerConfig::Ssh(ssh_layer("hive-zk-tunnel", ""))];
+
+        let error = state.connection_host_port("hive-zookeeper", &config).await.unwrap_err();
+        assert!(error.contains("discovered HiveServer2 nodes would bypass the configured transport"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

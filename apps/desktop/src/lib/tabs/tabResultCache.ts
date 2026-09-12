@@ -34,6 +34,9 @@ export interface TabResultSnapshot {
   activeResultRunId?: string;
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
+  queryWriteTargets?: QueryTab["queryWriteTargets"];
+  resultColumnComments?: QueryTab["resultColumnComments"];
+  queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
@@ -53,6 +56,7 @@ interface ColumnarQueryResult {
   execution_error?: true;
   statement_index?: number;
   column_types?: string[];
+  local_column_filters?: QueryResult["local_column_filters"];
   columnValues: CellValue[][];
   rowCount: number;
   mongo_documents?: unknown[];
@@ -318,7 +322,15 @@ async function deleteIndexedDbCacheOwner(ownerId: string): Promise<void> {
 function clonePlain<T>(value: T): T {
   const raw = toRaw(value);
   if (typeof structuredClone === "function") return structuredClone(raw);
-  return JSON.parse(JSON.stringify(raw)) as T;
+  try {
+    return JSON.parse(JSON.stringify(raw)) as T;
+  } catch {
+    return raw;
+  }
+}
+
+function cloneLocalColumnFilters(filters: QueryResult["local_column_filters"]): QueryResult["local_column_filters"] {
+  return filters ? Object.fromEntries(Object.entries(filters).map(([columnIndex, values]) => [columnIndex, [...values]])) : undefined;
 }
 
 function stripSessionIds(result: QueryResult | undefined): QueryResult | undefined {
@@ -328,6 +340,7 @@ function stripSessionIds(result: QueryResult | undefined): QueryResult | undefin
     execution_error: result.execution_error,
     statement_index: result.statement_index,
     column_types: result.column_types ? [...result.column_types] : undefined,
+    local_column_filters: cloneLocalColumnFilters(result.local_column_filters),
     spatial_columns: result.spatial_columns?.map((entry) => ({ column_index: entry.column_index, srid: entry.srid })),
     spatial_values: result.spatial_values?.map((row) => [...row]),
     large_value_cells: result.large_value_cells?.map((cell) => ({ ...cell })),
@@ -371,6 +384,7 @@ function toColumnarResult(result: QueryResult | undefined): ColumnarQueryResult 
     execution_error: result.execution_error,
     statement_index: result.statement_index,
     column_types: result.column_types ? [...result.column_types] : undefined,
+    local_column_filters: cloneLocalColumnFilters(result.local_column_filters),
     spatial_columns: result.spatial_columns?.map((entry) => ({ column_index: entry.column_index, srid: entry.srid })),
     spatial_values: result.spatial_values?.map((row) => [...row]),
     large_value_cells: result.large_value_cells?.map((cell) => ({ ...cell })),
@@ -397,6 +411,7 @@ function fromColumnarResult(result: ColumnarQueryResult | undefined): QueryResul
     execution_error: result.execution_error,
     statement_index: result.statement_index,
     column_types: result.column_types ? [...result.column_types] : undefined,
+    local_column_filters: cloneLocalColumnFilters(result.local_column_filters),
     spatial_columns: result.spatial_columns?.map((entry) => ({ column_index: entry.column_index, srid: entry.srid })),
     spatial_values: result.spatial_values?.map((row) => [...row]),
     large_value_cells: result.large_value_cells?.map((cell) => ({ ...cell })),
@@ -543,12 +558,16 @@ async function pruneRemoteRuntimeCache(options: ResultCachePruneOptions): Promis
 }
 
 async function deleteRemoteRuntimeCacheOwner(ownerId: string): Promise<void> {
-  if (isTauriRuntime()) {
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("delete_tab_runtime_cache_owner", { ownerId });
-    return;
+  try {
+    if (isTauriRuntime()) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("delete_tab_runtime_cache_owner", { ownerId });
+      return;
+    }
+    await fetch(apiUrl(`/api/tab-runtime-cache/owner?owner_id=${encodeURIComponent(ownerId)}`), { method: "DELETE" });
+  } catch {
+    // Cache deletion is best-effort; the entry expires server-side anyway.
   }
-  await fetch(apiUrl(`/api/tab-runtime-cache/owner?owner_id=${encodeURIComponent(ownerId)}`), { method: "DELETE" });
 }
 
 async function readRemoteRuntimeCache(key: string): Promise<Uint8Array | undefined> {
@@ -578,8 +597,10 @@ async function deleteRemoteRuntimeCache(key: string): Promise<void> {
       return;
     }
     await fetch(apiUrl(`/api/tab-runtime-cache?key=${encodeURIComponent(key)}`), { method: "DELETE" });
-  } catch (error) {
-    console.warn("[DBX][tab-result-cache:remote-delete:error]", { key, error });
+  } catch {
+    // Best-effort delete (the entry expires server-side). Deliberately silent: logging
+    // here after a vitest run finishes races worker teardown and has failed CI runs
+    // ("Closing rpc while onUserConsoleLog was pending").
   }
 }
 
@@ -706,6 +727,7 @@ export function decodeTabResultSnapshot(bytes: Uint8Array | ArrayBuffer): TabRes
     return undefined;
   }
   if (!isRecord(decoded.payload)) return undefined;
+  // SAFETY: The validated envelope is produced by encodeTabResultSnapshot, so its record payload has the snapshot shape expected here.
   return payloadToSnapshot(decoded.payload as unknown as TabResultSnapshotPayload);
 }
 
@@ -727,6 +749,9 @@ export function buildTabResultSnapshot(tab: QueryTab): TabResultSnapshot | undef
     activeResultRunId: tab.activeResultRunId,
     queryAnalysis: tab.queryAnalysis ? clonePlain(tab.queryAnalysis) : undefined,
     querySourceColumns: tab.querySourceColumns ? [...tab.querySourceColumns] : undefined,
+    queryWriteTargets: tab.queryWriteTargets?.map((target) => ({ ...target, sourceColumns: [...target.sourceColumns] })),
+    resultColumnComments: tab.resultColumnComments ? clonePlain(tab.resultColumnComments) : undefined,
+    queryDisplaySourceColumns: tab.queryDisplaySourceColumns ? [...tab.queryDisplaySourceColumns] : undefined,
     queryEditabilityReason: tab.queryEditabilityReason,
     mongoEditTarget: tab.mongoEditTarget ? clonePlain(tab.mongoEditTarget) : undefined,
     tableMeta: tab.tableMeta ? clonePlain(tab.tableMeta) : undefined,

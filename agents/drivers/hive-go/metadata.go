@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,6 +39,13 @@ type objectInfo struct {
 	Schema     string  `json:"schema"`
 	Comment    *string `json:"comment"`
 	Valid      *bool   `json:"valid,omitempty"`
+}
+
+type objectSource struct {
+	Name       string  `json:"name"`
+	ObjectType string  `json:"object_type"`
+	Schema     *string `json:"schema"`
+	Source     string  `json:"source"`
 }
 
 type columnInfo struct {
@@ -197,6 +205,18 @@ func (server *server) connectionInfo() (map[string]any, error) {
 			username = current
 		}
 	}
+	productName := "Apache Hive"
+	compatibilityMode := "hive"
+	driverName := "DBX Hive Go Agent"
+	if strings.EqualFold(server.params.DatabaseType, "kyuubi") {
+		productName = "Apache Kyuubi"
+		compatibilityMode = "kyuubi"
+		driverName = "DBX Kyuubi Go Agent"
+	} else if strings.EqualFold(server.params.DatabaseType, "impala") || strings.Contains(strings.ToLower(version), "impalad version") {
+		productName = "Apache Impala"
+		compatibilityMode = "impala"
+		driverName = "DBX Impala Go Agent"
+	}
 	return map[string]any{
 		"database":          server.config.Database,
 		"schema":            server.config.Database,
@@ -204,13 +224,13 @@ func (server *server) connectionInfo() (map[string]any, error) {
 		"version":           version,
 		"sqlDialect":        "HIVE",
 		"identifierQuote":   "`",
-		"compatibilityMode": "hive",
+		"compatibilityMode": compatibilityMode,
 		"databaseInfo": map[string]string{
-			"productName":            "Apache Hive",
+			"productName":            productName,
 			"productVersion":         version,
 			"unquotedIdentifierCase": "mixed",
 			"quotedIdentifierCase":   "mixed",
-			"driverName":             "DBX Hive Go Agent",
+			"driverName":             driverName,
 			"driverVersion":          "gohive-v2.1.0",
 		},
 	}, nil
@@ -305,43 +325,282 @@ func (server *server) listTables(schema string, constraints metadataListConstrai
 		sort.Slice(values, func(first, second int) bool { return values[first].Name < values[second].Name })
 		return applyMetadataWindow(values, constraints.Offset, constraints.Limit), nil
 	}
-	fallbackStatement := "SHOW TABLES IN " + quoteHiveIdentifier(schema)
-	if len(requestedTypes) > 0 && !containsString(requestedTypes, "TABLE") {
-		fallbackStatement = "SHOW VIEWS IN " + quoteHiveIdentifier(schema)
+	type fallbackQuery struct {
+		operation  string
+		statement  string
+		objectType string
 	}
-	result, err := server.executeQuery(queryOptions{
-		SQL:     fallbackStatement,
-		MaxRows: metadataQueryLimit,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("HiveServer2 metadata failed (%v); SHOW TABLES fallback failed: %w", metadataErr, err)
+	fallbackQueries := make([]fallbackQuery, 0, 2)
+	if containsString(requestedTypes, "TABLE") {
+		fallbackQueries = append(fallbackQueries, fallbackQuery{
+			operation:  "SHOW TABLES",
+			statement:  "SHOW TABLES IN " + quoteHiveIdentifier(schema),
+			objectType: "TABLE",
+		})
 	}
-	values := make([]tableInfo, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		name := showTablesRowName(result.Columns, row)
-		if name == "" || !metadataNameMatches(name, constraints.Filter) {
-			continue
+	if containsString(requestedTypes, "VIEW") || containsString(requestedTypes, "MATERIALIZED VIEW") {
+		fallbackQueries = append(fallbackQueries, fallbackQuery{
+			operation:  "SHOW VIEWS",
+			statement:  "SHOW VIEWS IN " + quoteHiveIdentifier(schema),
+			objectType: "VIEW",
+		})
+	}
+	objectsByName := make(map[string]tableInfo)
+	tableFallbackSucceeded := false
+	for _, fallback := range fallbackQueries {
+		result, err := server.executeQuery(queryOptions{SQL: fallback.statement, MaxRows: metadataQueryLimit})
+		if err != nil {
+			// Older Hive and Impala versions can list tables but do not support SHOW VIEWS.
+			// Keep the usable table result for mixed requests; explicit view requests still fail.
+			if fallback.objectType == "VIEW" && tableFallbackSucceeded && showViewsUnsupported(err) {
+				continue
+			}
+			return nil, fmt.Errorf("HiveServer2 metadata failed (%v); %s fallback failed: %w", metadataErr, fallback.operation, err)
 		}
-		values = append(values, tableInfo{Name: name, TableType: "TABLE", Comment: nil})
+		if fallback.objectType == "TABLE" {
+			tableFallbackSucceeded = true
+		}
+		for _, row := range result.Rows {
+			name := showTablesRowName(result.Columns, row)
+			if name == "" || !metadataNameMatches(name, constraints.Filter) {
+				continue
+			}
+			candidate := tableInfo{Name: name, TableType: fallback.objectType, Comment: nil}
+			if existing, ok := objectsByName[name]; ok && existing.TableType == "VIEW" && candidate.TableType != "VIEW" {
+				continue
+			}
+			objectsByName[name] = candidate
+		}
+	}
+	values := make([]tableInfo, 0, len(objectsByName))
+	for _, value := range objectsByName {
+		values = append(values, value)
 	}
 	sort.Slice(values, func(first, second int) bool { return values[first].Name < values[second].Name })
 	return applyMetadataWindow(values, constraints.Offset, constraints.Limit), nil
 }
 
-func (server *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
-	if !acceptsHiveTable(constraints.ObjectTypes) {
+func showViewsUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	operationalMarkers := []string{
+		"permission",
+		"access denied",
+		"not authorized",
+		"unauthorized",
+		"authentication",
+		"authorization",
+		"timeout",
+		"timed out",
+		"deadline exceeded",
+		"cancelled",
+		"canceled",
+		"transport",
+		"connection",
+		"broken pipe",
+		"network",
+	}
+	for _, marker := range operationalMarkers {
+		if strings.Contains(message, marker) {
+			return false
+		}
+	}
+	explicitMarkers := []string{
+		"unsupported",
+		"not supported",
+		"not implemented",
+		"unknown statement",
+		"unrecognized statement",
+	}
+	for _, marker := range explicitMarkers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	parseMarkers := []string{
+		"parseexception",
+		"parse error",
+		"syntax error",
+		"mismatched input",
+		"cannot recognize input",
+		"no viable alternative",
+	}
+	for _, marker := range parseMarkers {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (server *server) listObjects(database, schema string, constraints metadataListConstraints) ([]objectInfo, error) {
+	if !acceptsHiveTable(constraints.ObjectTypes) && !(server.supportsRoutines() && acceptsHiveRoutine(constraints.ObjectTypes)) {
 		return []objectInfo{}, nil
 	}
-	tables, err := server.listTables(schema, constraints)
-	if err != nil {
-		return nil, err
-	}
 	schema = firstNonEmpty(schema, server.config.Database)
-	values := make([]objectInfo, 0, len(tables))
-	for _, table := range tables {
-		values = append(values, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: schema, Comment: table.Comment})
+	values := make([]objectInfo, 0)
+	if acceptsHiveTable(constraints.ObjectTypes) {
+		tables, err := server.listTables(schema, constraints)
+		if err != nil {
+			return nil, err
+		}
+		for _, table := range tables {
+			values = append(values, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: schema, Comment: table.Comment})
+		}
 	}
-	return values, nil
+	if server.supportsRoutines() && acceptsRoutineType(constraints.ObjectTypes, "PROCEDURE") {
+		procedures, err := server.listRoutines(database, schema, constraints, "PROCEDURE")
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, procedures...)
+	}
+	if server.supportsRoutines() && acceptsRoutineType(constraints.ObjectTypes, "FUNCTION") {
+		functions, err := server.listRoutines(database, schema, constraints, "FUNCTION")
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, functions...)
+	}
+	sort.Slice(values, func(first, second int) bool { return values[first].Name < values[second].Name })
+	return applyMetadataWindow(values, constraints.Offset, constraints.Limit), nil
+}
+
+// supportsRoutines reports whether the connected server is known to expose the
+// Hive procedure / function catalog views (system.procedures_v /
+// system.functions_v). ArgoDB / Inceptor / Transwarp forks ship these views;
+// vanilla Apache Hive does not, so routine listing is gated on the connection's
+// database_type to avoid firing unsupported queries against plain Hive.
+func (server *server) supportsRoutines() bool {
+	switch strings.ToLower(strings.TrimSpace(server.params.DatabaseType)) {
+	case "argo", "inceptor", "inceptor2", "transwarp":
+		return true
+	default:
+		return false
+	}
+}
+
+// routineDatabaseCandidates returns the database_name filters to try against
+// system.procedures_v / system.functions_v. The sidebar may pass the active
+// database through either the schema or database RPC parameter, so mirror the
+// JDBC plugin and try both. The connection default is only a candidate when
+// the caller supplied neither parameter: appending it unconditionally would
+// return the default database's routines under an explicit database node that
+// has none of its own.
+func routineDatabaseCandidates(schema, database, connectionDatabase string) []string {
+	seen := map[string]bool{}
+	values := make([]string, 0, 3)
+	add := func(candidate string) {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			return
+		}
+		key := strings.ToLower(candidate)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		values = append(values, candidate)
+	}
+	add(database)
+	add(schema)
+	if strings.TrimSpace(database) == "" && strings.TrimSpace(schema) == "" {
+		add(connectionDatabase)
+	}
+	return values
+}
+
+// listRoutines queries the server's procedure / function catalog views when the
+// driver supports them. Hive and most forks (ArgoDB, Inceptor, Transwarp) expose
+// stored procedures / functions through the system.procedures_v / system.functions_v
+// views, with columns (procedure_name | function_name, database_name, full_text, ...).
+// The full_text column carries the routine source used by getObjectSource.
+//
+// The query is best-effort: when the view is missing or the server rejects it
+// (older Hive without procedure support), the call returns an empty slice and
+// nil error so the caller can fall back to listing tables.
+func (server *server) listRoutines(database, schema string, constraints metadataListConstraints, routineType string) ([]objectInfo, error) {
+	nameColumn := "procedure_name"
+	viewName := "system.procedures_v"
+	if strings.EqualFold(routineType, "FUNCTION") {
+		nameColumn = "function_name"
+		viewName = "system.functions_v"
+	}
+	candidates := routineDatabaseCandidates(schema, database, server.config.Database)
+	if len(candidates) == 0 {
+		return []objectInfo{}, nil
+	}
+	likePattern := buildRoutineLikePattern(constraints.Filter)
+	resolvedSchema := firstNonEmpty(schema, database, server.config.Database)
+	for _, targetSchema := range candidates {
+		// database_name is a string column, so the schema filter must be a single-quoted
+		// literal — not a backtick-quoted identifier. ArgoDB/Inceptor reject lower(`ods`)
+		// against system.procedures_v with an ERROR_STATUS, while lower('ods') works.
+		schemaLiteral := "'" + strings.ReplaceAll(targetSchema, "'", "''") + "'"
+		sql := "SELECT " + nameColumn + " FROM " + viewName +
+			" WHERE lower(database_name) = lower(" + schemaLiteral + ")" +
+			" AND lower(" + nameColumn + ") LIKE " + likePattern +
+			" ORDER BY " + nameColumn
+		result, err := server.executeQuery(queryOptions{SQL: sql, MaxRows: metadataQueryLimit})
+		if err != nil {
+			log.Printf(
+				"[hive-go][listRoutines] query failed: database=%q schema=%q routineType=%s sql=%q err=%v",
+				targetSchema,
+				resolvedSchema,
+				routineType,
+				sql,
+				err,
+			)
+			continue
+		}
+		values := make([]objectInfo, 0, len(result.Rows))
+		for _, row := range result.Rows {
+			name := rowString(row, 0)
+			if name == "" {
+				continue
+			}
+			values = append(values, objectInfo{Name: name, ObjectType: strings.ToUpper(routineType), Schema: resolvedSchema, Comment: nil})
+		}
+		if len(values) > 0 {
+			return values, nil
+		}
+	}
+	return []objectInfo{}, nil
+}
+
+// buildRoutineLikePattern turns a user-supplied filter into a Hive-safe LIKE
+// literal: wraps with %, escapes \, %, _ (the LIKE metacharacters), and quotes
+// the whole literal so it can be concatenated directly into SQL.
+func buildRoutineLikePattern(filter string) string {
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(filter)
+	return "'%" + escaped + "%'"
+}
+
+// acceptsHiveRoutine reports whether the requested object types include any
+// routine (PROCEDURE / FUNCTION) that hive-go needs to surface through listObjects.
+func acceptsHiveRoutine(objectTypes []string) bool {
+	for _, objectType := range objectTypes {
+		if strings.EqualFold(objectType, "PROCEDURE") || strings.EqualFold(objectType, "FUNCTION") {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptsRoutineType reports whether the requested object types include the
+// given routine kind (case-insensitive).
+func acceptsRoutineType(objectTypes []string, routineType string) bool {
+	for _, objectType := range objectTypes {
+		if strings.EqualFold(objectType, routineType) {
+			return true
+		}
+	}
+	return false
 }
 
 func (server *server) getColumns(schema, table string) ([]columnInfo, error) {
@@ -473,6 +732,78 @@ func (server *server) getTableDDL(schema, table string) (string, error) {
 		return "", nil
 	}
 	return strings.Join(lines, "\n") + "\n", nil
+}
+
+func (server *server) getObjectSource(database, schema, name, objectType string) (objectSource, error) {
+	schema = firstNonEmpty(schema, database, server.config.Database)
+	var source string
+	var err error
+	switch strings.ToUpper(objectType) {
+	case "PROCEDURE", "FUNCTION":
+		if !server.supportsRoutines() {
+			return objectSource{}, fmt.Errorf("routine source is not supported for %s connections", server.params.DatabaseType)
+		}
+		source, err = server.getRoutineSource(database, schema, name, strings.ToUpper(objectType))
+	default:
+		source, err = server.getTableDDL(schema, name)
+	}
+	if err != nil {
+		return objectSource{}, err
+	}
+	return objectSource{
+		Name:       name,
+		ObjectType: strings.ToUpper(objectType),
+		Schema:     optionalString(schema),
+		Source:     source,
+	}, nil
+}
+
+// getRoutineSource fetches a procedure or function's full source from the
+// server's system.procedures_v / system.functions_v view. Returns an empty
+// string when the view is missing or the routine is not found, so callers can
+// fall back to other sources. full_text may span multiple rows (the underlying
+// query driver splits long strings), so we join them like getTableDDL does.
+func (server *server) getRoutineSource(database, schema, name, routineType string) (string, error) {
+	nameColumn := "procedure_name"
+	viewName := "system.procedures_v"
+	if strings.EqualFold(routineType, "FUNCTION") {
+		nameColumn = "function_name"
+		viewName = "system.functions_v"
+	}
+	candidates := routineDatabaseCandidates(schema, database, server.config.Database)
+	if len(candidates) == 0 {
+		return "", nil
+	}
+	escapedName := strings.ReplaceAll(name, "'", "''")
+	for _, targetSchema := range candidates {
+		sql := "SELECT full_text FROM " + viewName +
+			" WHERE lower(database_name) = lower('" + strings.ReplaceAll(targetSchema, "'", "''") + "')" +
+			" AND " + nameColumn + " = '" + escapedName + "'"
+		result, err := server.executeQuery(queryOptions{SQL: sql, MaxRows: metadataQueryLimit})
+		if err != nil {
+			log.Printf(
+				"[hive-go][getRoutineSource] query failed: database=%q schema=%q name=%q routineType=%s sql=%q err=%v",
+				targetSchema,
+				schema,
+				name,
+				routineType,
+				sql,
+				err,
+			)
+			continue
+		}
+		lines := make([]string, 0, len(result.Rows))
+		for _, row := range result.Rows {
+			if line := firstRowValue(row); line != "" {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) == 0 {
+			continue
+		}
+		return strings.Join(lines, "\n") + "\n", nil
+	}
+	return "", nil
 }
 
 func (server *server) getExplainInfo(sqlText string) (string, error) {

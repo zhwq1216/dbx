@@ -6,20 +6,46 @@ const globalsCss = readCascadeCss();
 const dialogContentSource = readFileSync(new URL("../../components/ui/dialog/DialogContent.vue", import.meta.url), "utf8");
 const dialogScrollContentSource = readFileSync(new URL("../../components/ui/dialog/DialogScrollContent.vue", import.meta.url), "utf8");
 const dialogOverlaySource = readFileSync(new URL("../../components/ui/dialog/DialogOverlay.vue", import.meta.url), "utf8");
+const codeSnapshotDialogSource = readFileSync(new URL("../../components/codeSnapshot/CodeSnapshotDialog.vue", import.meta.url), "utf8");
+const dataTransferDialogSource = readFileSync(new URL("../../components/transfer/DataTransferDialog.vue", import.meta.url), "utf8");
+const updateDialogSource = readFileSync(new URL("../../components/layout/UpdateDialog.vue", import.meta.url), "utf8");
+const dataGridColumnHeaderSource = readFileSync(new URL("../../components/grid/DataGridColumnHeader.vue", import.meta.url), "utf8");
+const ddlViewDialogSource = readFileSync(new URL("../../components/objects/DdlViewDialog.vue", import.meta.url), "utf8");
+const schemaDiagramDialogSource = readFileSync(new URL("../../components/diagram/SchemaDiagramDialog.vue", import.meta.url), "utf8");
 const connectionDialogSource = readFileSync(new URL("../../components/connection/ConnectionDialog.vue", import.meta.url), "utf8");
 const connectionTreeSource = readFileSync(new URL("../../components/sidebar/ConnectionTree.vue", import.meta.url), "utf8");
+const activeConnectionFilterSource = readFileSync(new URL("../../components/sidebar/ActiveConnectionFilterButton.vue", import.meta.url), "utf8");
 const scheduledDatabaseBackupSource = readFileSync(new URL("../../components/backup/ScheduledDatabaseBackupSettings.vue", import.meta.url), "utf8");
 const driverStoreDialogSource = readFileSync(new URL("../../components/config/DriverStoreDialog.vue", import.meta.url), "utf8");
 const tunnelProfileManagerSource = readFileSync(new URL("../../components/connection/TunnelProfileManager.vue", import.meta.url), "utf8");
 const changelogPanelSource = readFileSync(new URL("../../components/settings/ChangelogPanel.vue", import.meta.url), "utf8");
 const editorSettingsDialogSource = readFileSync(new URL("../../components/editor/EditorSettingsDialog.vue", import.meta.url), "utf8");
 const switchSource = readFileSync(new URL("../../components/ui/switch/Switch.vue", import.meta.url), "utf8");
+const aiAssistantSource = readFileSync(new URL("../../components/editor/AiAssistant.vue", import.meta.url), "utf8");
 const desktopIndexSource = readFileSync(new URL("../../../index.html", import.meta.url), "utf8");
 const connectionDialogLegacyCss = readFileSync(new URL("../../../public/connection-dialog-legacy.css", import.meta.url), "utf8");
 const legacyWebViewSource = readFileSync(new URL("../../lib/ui/legacyWebView.ts", import.meta.url), "utf8");
 const mainSource = readFileSync(new URL("../../main.ts", import.meta.url), "utf8");
 
 describe("legacy WebView CSS fallbacks", () => {
+  it("keeps globals.css balanced and free of min-width media wrappers", () => {
+    // Production CSS minification rewrites `@media (min-width: ...)` into range
+    // syntax that legacy WebViews cannot parse, which silently disables any rule
+    // placed inside one. The html.dbx-legacy-webview class is the only gate, so
+    // no fallback rule may live inside a min-width media query. The brace check
+    // guards the unwrap refactors against dropping rule closers.
+    expect(globalsCss).not.toMatch(/@media \(min-width[^)]*\)\s*\{/);
+    // The Tailwind @source glob (../**/*.{vue,...}) contains a literal "*/",
+    // so it must be excluded before stripping comments.
+    const withoutComments = globalsCss.replace(/^@source .*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    const opens = (withoutComments.match(/\{/g) ?? []).length;
+    const closes = (withoutComments.match(/\}/g) ?? []).length;
+    expect(opens).toBe(closes);
+    expect(globalsCss).toContain("html.dbx-legacy-webview .sm\\:flex-row");
+    expect(globalsCss).toContain("html.dbx-legacy-webview .md\\:w-full");
+    expect(globalsCss).toContain("html.dbx-legacy-webview .lg\\:grid-cols-6");
+  });
+
   it("scopes component overrides to the runtime legacy WebView class", () => {
     const fallbackStart = globalsCss.indexOf("html.dbx-legacy-webview .sm\\:block");
     const tabsOverride = globalsCss.indexOf('html.dbx-legacy-webview [data-slot="tabs-trigger"]');
@@ -78,6 +104,99 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(globalsCss).not.toContain("filter: blur(4px);");
   });
 
+  it("keeps the data transfer dialog width fallback scoped to legacy WebViews", () => {
+    expect(dataTransferDialogSource).toContain('class="dbx-transfer-dialog sm:max-w-[1120px] max-h-[80vh] flex flex-col overflow-hidden resize"');
+    expect(dataTransferDialogSource).toContain('width: "min(1120px, calc(100vw - 2rem))"');
+    expect(dataTransferDialogSource).toContain('html.dbx-legacy-webview [data-slot="dialog-content"].dbx-transfer-dialog[class~="max-w-sm"]');
+    expect(dataTransferDialogSource).toContain("max-width: calc(100vw - 2rem) !important;");
+    expect(dataTransferDialogSource).not.toContain("@media (min-width: 640px)");
+    expect(dataTransferDialogSource).not.toMatch(/^\s+width: calc\(100vw - 2rem\) !important;$/m);
+    expect(globalsCss).not.toContain(".dbx-transfer-dialog");
+  });
+
+  it("covers the transfer dialog footer through the global legacy rule", () => {
+    expect(dataTransferDialogSource).not.toContain('[data-slot="dialog-footer"]');
+  });
+
+  it("keeps the code snapshot dialog layout on the global legacy dialog fallbacks", () => {
+    expect(codeSnapshotDialogSource).toContain('class="flex max-h-[calc(var(--dbx-viewport-height)-2rem)] flex-col overflow-hidden border border-border !bg-background text-foreground shadow-2xl !backdrop-blur-none sm:max-w-[860px]"');
+    expect(codeSnapshotDialogSource).not.toContain("dbx-legacy-webview");
+    expect(codeSnapshotDialogSource).not.toContain("@media");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="sm:max-w-[860px]"]');
+  });
+
+  it("keeps the update dialog layout on the global legacy dialog fallbacks", () => {
+    expect(updateDialogSource).toContain('class="sm:max-w-[700px]"');
+    expect(updateDialogSource).not.toContain("dbx-legacy-webview");
+    expect(updateDialogSource).not.toContain("@media");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="sm:max-w-[700px]"]');
+  });
+
+  it("keeps the DDL dialog layout on the global legacy dialog fallbacks", () => {
+    expect(ddlViewDialogSource).toContain('class="dbx-ddl-view-dialog sm:max-w-190"');
+    // The dialog content element is rendered through reka-ui's portal Teleport and
+    // never carries this component's scoped data-v attribute, so per-dialog rules
+    // (scoped or unscoped) are avoided; the global width table covers the dialog.
+    expect(ddlViewDialogSource).not.toContain("dbx-legacy-webview");
+    expect(ddlViewDialogSource).not.toContain("@media");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class~="sm:max-w-190"]');
+  });
+
+  it("keeps the global dialog fallback block outside media queries", () => {
+    // Production minification rewrites `@media (min-width: ...)` into range syntax
+    // that legacy WebViews cannot parse, so this block must stay unwrapped.
+    const footerStart = globalsCss.indexOf('html.dbx-legacy-webview [data-slot="dialog-footer"]');
+    const splitpanesStart = globalsCss.indexOf("/* Splitpanes */", footerStart);
+
+    expect(footerStart).toBeGreaterThan(-1);
+    expect(splitpanesStart).toBeGreaterThan(footerStart);
+    const dialogFallbackBlock = globalsCss.slice(footerStart, splitpanesStart);
+    expect(dialogFallbackBlock).toContain("flex-direction: row !important;");
+    expect(dialogFallbackBlock).toContain("justify-content: flex-end !important;");
+    expect(dialogFallbackBlock).toContain("max-width: 47.5rem !important;");
+    expect(dialogFallbackBlock).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="sm:max-w-[1120px]"]');
+    expect(dialogFallbackBlock).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="sm:max-w-[min(1180px,calc(100vw-32px))]"]');
+    expect(dialogFallbackBlock).not.toContain("@media");
+  });
+
+  it("covers unprefixed arbitrary dialog max-widths that lose to the generic cap", () => {
+    // Arbitrary max-w-* utilities live in @layer utilities and lose to the
+    // un-layered 24rem generic cap in every engine (multi-db execute dialog).
+    const multiDbDialogSource = readFileSync(new URL("../../components/editor/MultiDbExecuteDialog.vue", import.meta.url), "utf8");
+    expect(multiDbDialogSource).toContain("max-w-[min(1080px,calc(100vw-32px))]");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="max-w-[min(1080px"]');
+    expect(globalsCss).toContain("max-width: min(1080px, calc(100vw - 2rem)) !important;");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="max-w-[1800px]"]');
+  });
+
+  it("keeps the schema diagram dialog width covered by the legacy width fallbacks", () => {
+    // The toolbar is overflow-x-auto: when the legacy WebView clamps the dialog
+    // to the generic 24rem cap, the toolbar controls get cut off entirely.
+    expect(schemaDiagramDialogSource).toContain("sm:max-w-[94vw]");
+    expect(globalsCss).toContain('html.dbx-legacy-webview [data-slot="dialog-content"][class*="sm:max-w-[94vw]"]');
+  });
+
+  it("keeps the schema diagram fullscreen mode above the generic legacy width cap", () => {
+    // Fullscreen drops the sm:max-w-* classes and relies on inline width, which
+    // the generic 24rem !important cap outranks in legacy WebViews — the dialog
+    // then renders 24rem wide and the canvas collapses to a sliver.
+    expect(schemaDiagramDialogSource).toContain("dbx-diagram-fullscreen");
+    const ruleStart = globalsCss.indexOf('html.dbx-legacy-webview [data-slot="dialog-content"].dbx-diagram-fullscreen');
+    expect(ruleStart).toBeGreaterThan(globalsCss.indexOf('html.dbx-legacy-webview [data-slot="dialog-content"][class~="max-w-sm"]'));
+    const rule = globalsCss.slice(ruleStart, globalsCss.indexOf("}", ruleStart));
+    expect(rule).toContain("max-width: none !important;");
+    expect(rule).toContain("width: calc(100vw - 2rem) !important;");
+    expect(rule).toContain("var(--dbx-viewport-height)");
+  });
+
+  it("uses an explicit tooltip copy-button hover color in legacy WebViews", () => {
+    expect(dataGridColumnHeaderSource).toContain("data-column-header-copy-name");
+    expect(dataGridColumnHeaderSource).toContain("html.dbx-legacy-webview [data-column-header-copy-name]:hover");
+    expect(dataGridColumnHeaderSource).toContain("background-color: rgba(255, 255, 255, 0.1);");
+    expect(dataGridColumnHeaderSource).toContain("html.dbx-legacy-webview.dark [data-column-header-copy-name]:hover");
+    expect(dataGridColumnHeaderSource).toContain("background-color: rgba(0, 0, 0, 0.1);");
+  });
+
   it("keeps primary alpha utilities readable in legacy WebViews", () => {
     expect(globalsCss).toContain("--dbx-primary-rgb: 23, 23, 23;");
     expect(globalsCss).toContain("--dbx-primary-rgb: 46, 95, 166;");
@@ -86,8 +205,10 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(globalsCss).toContain(".border-primary\\/30");
     expect(globalsCss).toContain("border-color: rgba(var(--dbx-primary-rgb), 0.3) !important;");
     expect(globalsCss).toContain(".hover\\:bg-primary\\/15:hover");
-    expect(connectionTreeSource).toContain("showActiveConnectionsOnly");
-    expect(connectionTreeSource.match(/bg-primary\/10 border-primary\/30/g)?.length).toBe(3);
+    const activeConnectionSources = `${connectionTreeSource}\n${activeConnectionFilterSource}`;
+    expect(activeConnectionSources).toContain("showActiveConnectionsOnly");
+    expect(connectionTreeSource).toContain("text-primary bg-primary/10 border-primary/30");
+    expect(activeConnectionFilterSource).toContain("text-primary bg-primary/10 border-primary/30");
   });
 
   it("keeps legacy tab triggers connected to the configured corner style", () => {
@@ -110,6 +231,12 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(connectionDialogLegacyCss).toContain("height: 720px !important;");
     expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-form-body');
     expect(connectionDialogLegacyCss).toContain("align-content: start !important;");
+    expect(connectionDialogSource).toContain("connection-dialog-footer");
+    expect(connectionDialogSource).toContain("connection-dialog-test-status");
+    expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-dialog-footer');
+    expect(connectionDialogLegacyCss).toContain("flex-wrap: nowrap !important;");
+    expect(connectionDialogLegacyCss).toContain('[data-slot="dialog-content"].connection-dialog-content--config .connection-dialog-test-status');
+    expect(connectionDialogLegacyCss).toContain("min-width: 12rem !important;");
     expect(connectionDialogSource).toContain("connection-url-params-row--compact");
     expect(connectionDialogSource).toContain("connection-url-params-row--with-hint");
     expect(connectionDialogSource).toContain("connection-url-params-label");
@@ -121,6 +248,35 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(connectionDialogLegacyCss).toContain(".connection-db-picker-option");
     expect(connectionDialogLegacyCss).not.toContain("width >=");
     expect(connectionDialogSource).not.toContain("@media (min-width: 640px)");
+  });
+
+  it("keeps the sidebar table tree scrollbar unchanged outside legacy WebViews", () => {
+    expect(connectionTreeSource).toContain('class="sidebar-tree-scrollbar"');
+    expect(connectionTreeSource).toMatch(/\.sidebar-tree-scrollbar \{[\s\S]*?opacity: 0;/);
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview .sidebar-tree-scrollbar");
+    expect(connectionTreeSource).toMatch(/html\.dbx-legacy-webview \.sidebar-tree-scrollbar \{[\s\S]*?opacity: 0\.9;/);
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview .sidebar-tree-scrollbar__thumb");
+    expect(connectionTreeSource).toContain("background: rgba(82, 82, 82, 0.42);");
+    expect(connectionTreeSource).toContain("html.dbx-legacy-webview.dark .sidebar-tree-scrollbar__thumb");
+    expect(connectionTreeSource).toContain("background: rgba(212, 212, 216, 0.42);");
+  });
+
+  it("keeps AI table scrollbars visible without OKLCH color mixing", () => {
+    const thumbStart = aiAssistantSource.indexOf(".ai-markdown :deep(.ai-markdown-table-wrap::-webkit-scrollbar-thumb) {");
+    const hoverStart = aiAssistantSource.indexOf(".ai-markdown :deep(.ai-markdown-table-wrap:hover::-webkit-scrollbar-thumb) {");
+    const legacyStart = aiAssistantSource.indexOf("html.dbx-legacy-webview.dark .ai-markdown", hoverStart);
+    const thumb = aiAssistantSource.slice(thumbStart, hoverStart);
+    const hover = aiAssistantSource.slice(hoverStart, legacyStart);
+
+    expect(thumbStart).toBeGreaterThan(-1);
+    expect(hoverStart).toBeGreaterThan(thumbStart);
+    expect(legacyStart).toBeGreaterThan(hoverStart);
+    expect(thumb.indexOf("background: rgba(82, 82, 82, 0.28);")).toBeGreaterThan(-1);
+    expect(thumb.indexOf("background: rgba(82, 82, 82, 0.28);")).toBeLessThan(thumb.indexOf("background: color-mix(in oklch, var(--foreground) 28%, transparent);"));
+    expect(hover.indexOf("background: rgba(82, 82, 82, 0.45);")).toBeGreaterThan(-1);
+    expect(hover.indexOf("background: rgba(82, 82, 82, 0.45);")).toBeLessThan(hover.indexOf("background: color-mix(in oklch, var(--foreground) 45%, transparent);"));
+    expect(aiAssistantSource).toContain("background: rgba(212, 212, 216, 0.28);");
+    expect(aiAssistantSource).toContain("background: rgba(212, 212, 216, 0.45);");
   });
 
   it("keeps selected tiles readable in WebViews without color-mix support", () => {
@@ -262,6 +418,13 @@ describe("legacy WebView CSS fallbacks", () => {
     expect(fallback).toContain("line-height: 1.25rem !important;");
     expect(fallback).toContain("-webkit-appearance: inner-spin-button !important;");
     expect(fallback).toContain("::-webkit-inner-spin-button");
+    expect(editorSettingsDialogSource).toContain("settings-mcp-config-tabs");
+    expect(editorSettingsDialogSource).toContain("settings-mcp-config-tab");
+    expect(fallback).toContain(".settings-layout .settings-mcp-config-tabs");
+    expect(fallback).toContain("gap: 0.25rem !important;");
+    expect(fallback).toContain(".settings-layout .settings-mcp-config-tab");
+    expect(fallback).toContain("flex: 0 0 auto !important;");
+    expect(fallback).toContain("min-width: max-content !important;");
     expect(editorSettingsDialogSource).toContain('class="settings-ai-back-button"');
     expect(fallback).toContain(".settings-ai-back-button");
     expect(fallback).toContain("margin-left: -0.625rem !important;");

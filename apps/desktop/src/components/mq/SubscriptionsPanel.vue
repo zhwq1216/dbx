@@ -37,7 +37,6 @@ const { confirmMqWrite } = useMqMutationGuard(() => props.connectionId);
 const subscriptions = ref<SubscriptionInfo[]>([]);
 const loading = ref(false);
 const enriching = ref(false);
-const truncatedHint = ref<string>();
 const enrichFailedHint = ref<string>();
 const error = ref<string>();
 let loadSeq = 0;
@@ -65,8 +64,10 @@ const formData = ref({
 });
 
 const resetFormData = ref({
-  position: "latest" as "earliest" | "latest" | "timestamp",
+  position: "latest" as "earliest" | "latest" | "timestamp" | "partitionOffset",
   timestampMs: Date.now(),
+  partition: 0,
+  offset: 0,
 });
 
 const skipFormData = ref({
@@ -168,7 +169,6 @@ async function loadSubscriptions() {
   const topicRef = getListTopicRef();
   if (!topicRef) {
     subscriptions.value = [];
-    truncatedHint.value = undefined;
     enrichFailedHint.value = undefined;
     return;
   }
@@ -176,7 +176,6 @@ async function loadSubscriptions() {
   loading.value = true;
   enriching.value = false;
   error.value = undefined;
-  truncatedHint.value = undefined;
   enrichFailedHint.value = undefined;
   try {
     // Fast list first (no enrich / online members) so large clusters paint quickly.
@@ -184,20 +183,16 @@ async function loadSubscriptions() {
     if (seq !== loadSeq) return;
     subscriptions.value = page;
     syncSelectedSubscription(page);
-    if (isClusterWideMode.value && page.length >= 500) {
-      truncatedHint.value = t("mqSubscriptions.truncatedHint", { count: page.length });
-    }
     if (isClusterWideMode.value) {
       enriching.value = true;
       try {
         const enriched = await mqEnrichSubscriptions(props.connectionId, topicRef);
         if (seq !== loadSeq) return;
-        subscriptions.value = enriched;
+        // Keep the complete fast list even if an older/slow agent returns only a partial enrichment page.
+        const merged = mergeSubscriptionEnrichment(page, enriched);
+        subscriptions.value = merged;
         // Detail dialog holds a snapshot; refresh so topics/members arrive after enrich.
-        syncSelectedSubscription(enriched);
-        if (enriched.length >= 500) {
-          truncatedHint.value = t("mqSubscriptions.truncatedHint", { count: enriched.length });
-        }
+        syncSelectedSubscription(merged);
       } catch (e: unknown) {
         // Keep the fast list if enrichment times out; surface why online columns stayed empty.
         if (seq === loadSeq) {
@@ -212,6 +207,14 @@ async function loadSubscriptions() {
   } finally {
     if (seq === loadSeq) loading.value = false;
   }
+}
+
+function mergeSubscriptionEnrichment(fastList: SubscriptionInfo[], enrichedList: SubscriptionInfo[]): SubscriptionInfo[] {
+  const enrichedByName = new Map(enrichedList.map((subscription) => [subscription.name, subscription]));
+  return fastList.map((subscription) => {
+    const enriched = enrichedByName.get(subscription.name);
+    return enriched ? { ...subscription, ...enriched } : subscription;
+  });
 }
 
 function openCreateDialog() {
@@ -261,6 +264,8 @@ function openResetDialog(sub: SubscriptionInfo) {
   resetFormData.value = {
     position: "latest",
     timestampMs: Date.now(),
+    partition: 0,
+    offset: 0,
   };
   showResetDialog.value = true;
 }
@@ -365,6 +370,13 @@ async function handleResetCursor() {
     let pos: ResetPosition;
     if (resetFormData.value.position === "timestamp") {
       pos = { kind: "timestamp", timestampMs: resetFormData.value.timestampMs };
+    } else if (resetFormData.value.position === "partitionOffset") {
+      const { partition, offset } = resetFormData.value;
+      if (!Number.isSafeInteger(partition) || partition < 0 || !Number.isSafeInteger(offset) || offset < 0) {
+        error.value = t("mqSubscriptions.nonNegativeIntegerRequired");
+        return;
+      }
+      pos = { kind: "partitionOffset", partition, offset };
     } else {
       pos = { kind: resetFormData.value.position };
     }
@@ -515,7 +527,6 @@ watch(
 
     <template v-else>
       <div v-if="error" class="panel-error">{{ error }}</div>
-      <div v-if="truncatedHint && !error" class="panel-hint">{{ truncatedHint }}</div>
       <div v-if="enrichFailedHint && !error" class="panel-hint">{{ enrichFailedHint }}</div>
 
       <div v-if="!error && loading && !subscriptions.length" class="panel-loading">{{ t("mqSubscriptions.loading") }}</div>
@@ -650,12 +661,22 @@ watch(
                 <input type="radio" v-model="resetFormData.position" value="timestamp" :disabled="readOnly" />
                 {{ t("mqSubscriptions.timestamp") }}
               </label>
+              <label v-if="mqSystemKind === 'kafka'" class="radio-label">
+                <input type="radio" v-model="resetFormData.position" value="partitionOffset" :disabled="readOnly" />
+                {{ t("mqSubscriptions.partitionOffset") }}
+              </label>
             </div>
           </div>
           <div v-if="resetFormData.position === 'timestamp'" class="form-group">
             <label>{{ t("mqSubscriptions.timestampMs") }}</label>
             <input v-model.number="resetFormData.timestampMs" type="number" :disabled="readOnly" />
             <div class="form-hint">{{ t("mqSubscriptions.currentTime", { time: new Date(resetFormData.timestampMs).toLocaleString() }) }}</div>
+          </div>
+          <div v-if="mqSystemKind === 'kafka' && resetFormData.position === 'partitionOffset'" class="form-group">
+            <label>{{ t("mqSubscriptions.partition") }}</label>
+            <input v-model.number="resetFormData.partition" data-testid="reset-partition" type="number" min="0" step="1" :disabled="readOnly" />
+            <label>{{ t("mqSubscriptions.offset") }}</label>
+            <input v-model.number="resetFormData.offset" data-testid="reset-offset" type="number" min="0" step="1" :disabled="readOnly" />
           </div>
           <div v-if="error" class="form-error">{{ error }}</div>
         </div>

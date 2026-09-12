@@ -1,81 +1,16 @@
 import type { BackendError } from "@/lib/backend/errorUtils";
-import type { MultiDbResultRunExecution } from "@/types/sqlExecution";
+import type { TransferContent, TransferMode, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/tauri";
+import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/sqlExecution";
+import type { DatabaseType } from "@/types/generated/databaseTypes";
 
-export type DatabaseType =
-  | "mysql"
-  | "postgres"
-  | "sqlite"
-  | "rqlite"
-  | "turso"
-  | "cloudflare-d1"
-  | "redis"
-  | "duckdb"
-  | "clickhouse"
-  | "sqlserver"
-  | "mongodb"
-  | "oracle"
-  | "elasticsearch"
-  | "easysearch"
-  | "hbase"
-  | "qdrant"
-  | "milvus"
-  | "weaviate"
-  | "chromadb"
-  | "doris"
-  | "starrocks"
-  | "manticoresearch"
-  | "databend"
-  | "redshift"
-  | "dameng"
-  | "gaussdb"
-  | "kingbase"
-  | "highgo"
-  | "uxdb"
-  | "vastbase"
-  | "goldendb"
-  | "kwdb"
-  | "yashandb"
-  | "databricks"
-  | "saphana"
-  | "teradata"
-  | "vertica"
-  | "firebird"
-  | "exasol"
-  | "opengauss"
-  | "oceanbase-oracle"
-  | "questdb"
-  | "gbase"
-  | "access"
-  | "h2"
-  | "snowflake"
-  | "trino"
-  | "prestosql"
-  | "hive"
-  | "spark"
-  | "db2"
-  | "informix"
-  | "neo4j"
-  | "cassandra"
-  | "bigquery"
-  | "kylin"
-  | "sundb"
-  | "oscar"
-  | "tdengine"
-  | "xugu"
-  | "iotdb"
-  | "etcd"
-  | "zookeeper"
-  | "iris"
-  | "influxdb"
-  | "victoriametrics"
-  | "jdbc"
-  | "mq"
-  | "mqtt"
-  | "nacos"
-  | "consul";
+export type { DatabaseType } from "@/types/generated/databaseTypes";
 
 export function isElasticsearchCompatibleDatabaseType(dbType?: DatabaseType): boolean {
   return dbType === "elasticsearch" || dbType === "easysearch";
+}
+
+export function isMeilisearchDatabaseType(dbType?: DatabaseType): boolean {
+  return dbType === "meilisearch";
 }
 
 export interface SqlSnippet {
@@ -86,9 +21,17 @@ export interface SqlSnippet {
   enabled?: boolean;
 }
 
-export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column";
+export interface SqlShortcutAction {
+  id: string;
+  label: string;
+  shortcut: string;
+  sql: string;
+  enabled?: boolean;
+}
 
-export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "object";
+export type CompletionAssistantObjectKind = "database" | "schema" | "table" | "view" | "routine" | "procedure" | "function" | "column" | "sequence";
+
+export type CompletionAssistantCandidateKind = "database" | "schema" | "table" | "view" | "procedure" | "function" | "column" | "sequence" | "object";
 
 export type CompletionAssistantMatchMode = "prefix" | "contains";
 
@@ -143,6 +86,7 @@ export interface ConnectionConfig {
   database?: string;
   default_schema?: string;
   visible_databases?: string[];
+  visible_database_patterns?: string[];
   visible_schemas?: Record<string, string[]>;
   show_system_schemas?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
@@ -180,11 +124,19 @@ export interface ConnectionConfig {
   redis_key_separator?: string;
   redis_scan_page_size?: number;
   redis_database_aliases?: Record<string, string>;
+  /** Key-search templates for the Redis browser. Non-empty overrides global settings. */
+  redis_key_templates?: string[];
   etcd_endpoints?: string;
   gbase_server?: string;
   informix_server?: string;
   external_config?: unknown;
   one_time?: boolean;
+  /**
+   * Whether the database password may be persisted locally. When false, the
+   * password is never written to local storage and the user is prompted on
+   * every connect. Absent/true keeps current behavior (password saved).
+   */
+  save_password?: boolean;
   read_only?: boolean;
   /** Explicit production marker for every database reachable through this connection. */
   is_production?: boolean;
@@ -248,9 +200,7 @@ export interface SshTunnelConfig {
    * `"key+password"` tries private key auth first and falls back to
    * password auth if the key is rejected.
    *
-   * `"agent"` is a legacy value: it's no longer offered as a dropdown
-   * choice for new connections, but is preserved and displayed read-only
-   * for connections that already have `use_ssh_agent` configured.
+   * `"agent"` uses identities from the configured SSH agent socket.
    */
   auth_method?: "password" | "key" | "key+password" | "agent" | "none";
   /** Allow `nc` through an SSH exec channel when direct-tcpip is prohibited. */
@@ -394,6 +344,29 @@ export interface DatabaseStorageInfo {
   size_bytes: number | null;
 }
 
+export interface XuguDatafileInfo {
+  node_id: string;
+  space_id: number;
+  path: string;
+  file_no: number;
+  max_size?: number | null;
+  step_size?: number | null;
+  curr_size?: number | null;
+  reserved1?: string | null;
+}
+
+export interface XuguTablespaceInfo {
+  node_id: string;
+  space_id: number;
+  space_name: string;
+  datafile_num: number;
+  space_type: string;
+  media_error?: string | null;
+  total_chunk_num?: number | null;
+  free_chunk_num?: number | null;
+  datafiles: XuguDatafileInfo[];
+}
+
 export interface SqlServerCompletionContext {
   default_schema: string;
   supports_session_database_switch: boolean;
@@ -427,7 +400,7 @@ export interface TableInfo {
   parent_name?: string | null;
 }
 
-export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type DatabaseObjectType = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "JOB" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectInfo {
   name: string;
@@ -456,7 +429,7 @@ export interface ObjectStatistics {
   total_bytes?: number | null;
 }
 
-export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "SYNONYM" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
+export type ObjectSourceKind = "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "EVENT" | "SEQUENCE" | "SYNONYM" | "JOB" | "PACKAGE" | "PACKAGE_BODY" | "TYPE" | "TYPE_BODY";
 
 export interface ObjectSource {
   name: string;
@@ -464,6 +437,28 @@ export interface ObjectSource {
   schema?: string | null;
   source: string;
   editable?: boolean;
+}
+
+export interface MysqlEventInfo {
+  name: string;
+  schema: string;
+  definer?: string | null;
+  time_zone?: string | null;
+  event_type?: string | null;
+  execute_at?: string | null;
+  interval_value?: string | null;
+  interval_field?: string | null;
+  starts?: string | null;
+  ends?: string | null;
+  status?: string | null;
+  on_completion?: string | null;
+  comment?: string | null;
+  event_body?: string | null;
+  event_definition?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  last_executed?: string | null;
+  source?: string | null;
 }
 
 export type CustomTypeKind = "base" | "composite" | "domain" | "enum" | "range" | "multirange";
@@ -524,6 +519,7 @@ export interface CustomTypeDetails {
 export interface ColumnInfo {
   name: string;
   data_type: string;
+  resolved_schema?: string;
   is_nullable: boolean;
   column_default: string | null;
   is_primary_key: boolean;
@@ -554,6 +550,20 @@ export interface IndexInfo {
   index_type?: string | null;
   included_columns?: string[] | null;
   comment?: string | null;
+  /** Parallel to `columns`: true at index i means columns[i] is a raw expression, not a plain column name. */
+  key_is_expression?: boolean[] | null;
+  /** Parallel to `columns`: operator class name for each key column (PostgreSQL), if non-default. */
+  column_opclasses?: (string | null)[] | null;
+  /**
+   * True when the index is the object behind a PRIMARY KEY / UNIQUE constraint rather than a
+   * standalone index. Carried back to the backend inside the index draft's `original` snapshot:
+   * Dameng only accepts `ALTER TABLE ... ADD/DROP CONSTRAINT` for those indexes.
+   */
+  constraint_backed?: boolean | null;
+}
+
+export interface ReferenceKeyInfo {
+  columns: string[];
 }
 
 export interface ForeignKeyInfo {
@@ -679,6 +689,13 @@ export interface QueryResult {
   execution_error?: true;
   /** Set only for SQL Server informational messages emitted by the backend. */
   server_message?: true;
+  /** Oracle-only manual-transaction UX marker: set on a manual-transaction result
+   *  whose statement DBX proved to be an ordinary top-level read. Absent for
+   *  every non-Oracle execution and every unproven Oracle statement. */
+  manual_transaction_proven_read_only?: true;
+  /** Oracle-only manual-transaction UX marker: set on the synthetic successful
+   *  result of an empty/whitespace/comments-only manual script. */
+  manual_transaction_no_statement?: true;
   /** Structured backend error; authoritative when execution_error is true. */
   error?: BackendError;
   /** Zero-based index of the submitted statement that produced this result. */
@@ -752,7 +769,9 @@ export interface BatchSqlExecution {
   completed: number;
   total: number;
   startedAt: number;
+  executionTarget?: MultiDbExecutionTarget;
   finishedAt?: number;
+  recoveryDismissed?: boolean;
   items: BatchStatementExecutionItem[];
 }
 
@@ -761,12 +780,23 @@ export interface SpatialColumn {
   srid: number | null;
 }
 
+export interface QueryResultSourceColumnRef {
+  sourceKey: string;
+  sourceColumn: string;
+  /** Physical source identity for display-only features such as column formatters. */
+  database?: string;
+  schema?: string;
+  tableName?: string;
+}
+
 export interface QueryResultRun {
   id: string;
   title: string;
   sequence: number;
   sql: string;
   createdAt: number;
+  /** Keeps this result from being replaced by an ordinary query execution. */
+  pinned?: boolean;
   /** Distinguishes successive result payloads that reuse the same run slot. */
   resultGridRevision?: string;
   result?: QueryResult;
@@ -801,6 +831,9 @@ export interface QueryResultRun {
   resultEvicted?: boolean;
   queryAnalysis?: QueryTab["queryAnalysis"];
   querySourceColumns?: QueryTab["querySourceColumns"];
+  queryWriteTargets?: QueryTab["queryWriteTargets"];
+  resultColumnComments?: QueryTab["resultColumnComments"];
+  queryDisplaySourceColumns?: QueryTab["queryDisplaySourceColumns"];
   queryEditabilityReason?: QueryTab["queryEditabilityReason"];
   mongoEditTarget?: QueryTab["mongoEditTarget"];
   tableMeta?: QueryTab["tableMeta"];
@@ -865,6 +898,8 @@ export type TreeNodeType =
   | "connection"
   | "connection-group"
   | "database"
+  | "tablespace"
+  | "datafile"
   | "doris-catalog"
   | "linked-server-root"
   | "linked-server"
@@ -881,16 +916,19 @@ export type TreeNodeType =
   | "type-member"
   | "sequence"
   | "synonym"
+  | "job"
   | "package"
   | "package-body"
   | "group-columns"
   | "group-indexes"
   | "group-fkeys"
   | "group-triggers"
+  | "group-events"
   | "group-constraints"
   | "group-table-partitions"
   | "group-table-subpartitions"
   | "group-tables"
+  | "group-dolt-system-tables"
   | "group-views"
   | "group-materialized-views"
   | "group-procedures"
@@ -898,9 +936,12 @@ export type TreeNodeType =
   | "group-types"
   | "group-sequences"
   | "group-synonyms"
+  | "group-jobs"
   | "group-packages"
   | "group-partitions"
   | "group-extensions"
+  | "group-tablespaces"
+  | "group-datafiles"
   | "extension"
   | "object-browser"
   | "user-admin"
@@ -920,12 +961,14 @@ export type TreeNodeType =
   | "index"
   | "fkey"
   | "trigger"
+  | "event"
   | "constraint"
   | "partition"
   | "subpartition"
   | "redis-db"
   | "mq-tenant"
   | "nacos-namespace"
+  | "nacos-access-control"
   | "etcd-root"
   | "etcd-dashboard"
   | "etcd-access-control"
@@ -937,9 +980,11 @@ export type TreeNodeType =
   | "mongo-buckets"
   | "mongo-bucket"
   | "mongo-collection"
+  | "dynamodb-table"
   | "vector-database"
   | "vector-collection"
   | "elasticsearch-index"
+  | "meilisearch-system"
   | "mqtt-topic";
 
 export interface ConnectionGroup {
@@ -959,6 +1004,8 @@ export interface TreeNode {
   id: string;
   label: string;
   type: TreeNodeType;
+  /** Additional values matched by sidebar search without rendering them. */
+  searchAliases?: string[];
   children?: TreeNode[];
   isLoading?: boolean;
   isExpanded?: boolean;
@@ -994,6 +1041,9 @@ export interface TreeNode {
   comment?: string | null;
   valid?: boolean | null;
   sizeBytes?: number | null;
+  xuguTablespace?: XuguTablespaceInfo;
+  xuguDatafile?: XuguDatafileInfo;
+  xuguDatafilePath?: string;
   objectCount?: number;
   loadedKeyCount?: number;
   totalKeyCount?: number;
@@ -1022,7 +1072,7 @@ export interface TableNameFilter {
   excludePatterns: string[];
 }
 
-export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "triggers" | "ddl";
+export type TableInfoTab = "columns" | "indexes" | "foreignKeys" | "constraints" | "triggers" | "ddl";
 
 export interface TableStructureEditorTarget {
   kind: "column" | "index";
@@ -1032,12 +1082,24 @@ export interface TableStructureEditorTarget {
 export interface TableStructureEditorDraft {
   dirty?: boolean;
   activeTab: TableInfoTab;
+  /** DDL as loaded from the database — the baseline `ddlDraft` is compared against. */
+  ddlContent?: string;
+  /** Edited DDL script, or null/undefined when the DDL tab was left untouched. */
+  ddlDraft?: string | null;
   newTableName: string;
   tableComment: string;
   originalTableComment: string;
+  mysqlAutoIncrementValue?: string;
+  originalMysqlAutoIncrementValue?: string;
+  mysqlTableEngine?: string;
+  originalMysqlTableEngine?: string;
+  tableOwner?: string;
+  originalTableOwner?: string;
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
   indexes: import("@/lib/table/tableStructureEditorSql").EditableStructureIndex[];
   foreignKeys: import("@/lib/table/tableStructureEditorSql").EditableStructureForeignKey[];
+  constraints?: ConstraintInfo[];
+  constraintsLoaded?: boolean;
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   triggersLoaded?: boolean;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
@@ -1057,18 +1119,39 @@ export interface ObjectBrowserViewport {
   viewMode: ObjectBrowserViewMode;
 }
 
+/** Runtime-only viewport state for the selected configuration in a Nacos tab. */
+export interface NacosConfigEditorViewport {
+  namespace: string;
+  dataId: string;
+  group: string;
+  scrollTop: number;
+  scrollLeft: number;
+}
+
 export interface ExternalSqlFileVersion {
   sizeBytes: number;
   modifiedNs: string;
   contentHash: string;
 }
 
+export interface QueryPageJumpProgress {
+  completedRequests: number;
+  totalRequests: number;
+  targetPage: number;
+}
+
 export interface QueryTab {
   id: string;
+  /** Stable creation time used when tabs are displayed in creation order. */
+  createdAt?: number;
   title: string;
   customTitle?: boolean;
+  /** Force the editor to word-wrap regardless of the global setting, e.g. for auto-generated single-line templates. */
+  forceWordWrap?: boolean;
   connectionId: string;
   database: string;
+  /** Optional branch context for a driver-profile database workspace. */
+  workspaceBranch?: string;
   schema?: string;
   /** Doris / StarRocks multi-catalog: the external catalog this tab's
    * database belongs to (undefined for internal/default catalog). */
@@ -1102,6 +1185,8 @@ export interface QueryTab {
   resultTotalRowCountLoading?: boolean;
   resultSessionId?: string;
   resultClientSessionId?: string;
+  /** Ephemeral UI progress for sequential Elasticsearch cursor requests. */
+  resultPageJumpProgress?: QueryPageJumpProgress;
   resultAccessedAt?: number;
   resultEstimatedBytes?: number;
   resultCacheKey?: string;
@@ -1137,6 +1222,8 @@ export interface QueryTab {
     head: number;
   };
   executionId?: string;
+  /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
+  executingResultRunId?: string | null;
   isExplaining?: boolean;
   explainExecutionId?: string;
   /** Per-run connection session for explain flows that require session state. */
@@ -1149,6 +1236,8 @@ export interface QueryTab {
     | "redis"
     | "redis-dashboard"
     | "mongo"
+    | "meilisearch"
+    | "meilisearch-system"
     | "mongo-gridfs"
     | "mongo-bucket"
     | "vector"
@@ -1163,6 +1252,7 @@ export interface QueryTab {
     | "mqtt"
     | "nacos"
     | "nacos-dashboard"
+    | "nacos-access-control"
     | "databases"
     | "objects"
     | "structure"
@@ -1171,8 +1261,11 @@ export interface QueryTab {
     | "dameng-roles"
     | "dameng-jobs"
     | "processlist"
+    | "sqlserver-trace"
     | "mysql-dashboard"
-    | "postgres-dashboard";
+    | "postgres-dashboard"
+    | "xugu-dashboard"
+    | "dolt-version-control";
   /** Ephemeral navigation intent; it is consumed by HBaseBrowser and is not persisted. */
   hbaseCreateTableOnOpen?: boolean;
   mqTenant?: string;
@@ -1184,6 +1277,7 @@ export interface QueryTab {
   nacosTargetGroup?: string;
   nacosTargetKeyword?: string;
   nacosTargetRequestId?: number;
+  nacosConfigEditorViewport?: NacosConfigEditorViewport;
   structureTableName?: string;
   structureInitialTab?: TableInfoTab;
   structureInitialTabRequestId?: number;
@@ -1193,14 +1287,24 @@ export interface QueryTab {
     catalog?: string;
     schema?: string;
     objectType?: "tables";
+    eventName?: string;
+    eventReadOnly?: boolean;
+    eventOpenRequestId?: number;
+    /** 显式的"新建事件"请求：单调递增，用于让已复用 tab 也能重复进入 CREATE 编辑器 */
+    eventCreateRequestId?: number;
+    initialObjectFilter?: "tables" | "events";
+    searchQuery?: string;
     viewport?: ObjectBrowserViewport;
   };
+  /** Opened to view object source, including objects without editable source metadata. */
+  sourceView?: boolean;
   objectSource?: {
     schema?: string;
     name: string;
     objectType: ObjectSourceKind;
     signature?: string;
   };
+  tableComment?: string | null;
   tableMeta?: {
     schema?: string;
     tableName: string;
@@ -1211,6 +1315,9 @@ export interface QueryTab {
     primaryKeys: string[];
   };
   tableMetaUpdatedAt?: number;
+  /** 该 tab 的 tableMeta 是哪个连接元数据代次下写入的：disconnect / 关闭数据库 /
+   * 死池重连等生命周期边界会让该代次递增，代次失配视同冷缓存（issue #6623 / PR #6640）。 */
+  tableMetaGeneration?: number;
   pendingDataChangeCount?: number;
   /** Ephemeral editor draft that has not yet been applied to the data grid. */
   hasPendingDataEditorDraft?: boolean;
@@ -1232,7 +1339,9 @@ export interface QueryTab {
     editableSourceKey?: string;
     multiSource?: boolean;
     allowInsert?: boolean;
+    allowDelete?: boolean;
     allowInsertDelete?: boolean;
+    distinct?: boolean;
     sources?: {
       key: string;
       catalog?: string;
@@ -1252,8 +1361,37 @@ export interface QueryTab {
       resultName: string;
       expression: string;
     }[];
+    groupByColumns?: {
+      sourceName?: string;
+      sourceNameQuoted?: boolean;
+      sourceQualifier?: string;
+      sourceKey?: string;
+      star?: boolean;
+      resultName: string;
+      expression: string;
+    }[];
   };
   querySourceColumns?: Array<string | undefined>;
+  queryWriteTargets?: Array<{ tableMeta: NonNullable<QueryTab["tableMeta"]>; sourceColumns: Array<string | undefined> }>;
+  /**
+   * Column comments for a multi-source query result (e.g. JOIN), indexed by
+   * result-column ordinal (projection order). Each entry is the comment of the
+   * single base column that result column resolves to; `undefined` when the
+   * column is ambiguous (e.g. an unqualified name present in several sources)
+   * or cannot be resolved back to a base column, so the grid shows no comment
+   * instead of a wrong one. Populated even when the result is not editable
+   * (e.g. multi-table JOIN), so joined results still show column comments.
+   */
+  resultColumnComments?: Array<string | undefined>;
+  /**
+   * Display-only result-column to source mapping for multi-source results,
+   * indexed by result-column ordinal. Each entry carries the source identity
+   * (sourceKey + canonical source column name), so comments resolve per source
+   * instead of first-source-wins on name clashes. Unlike querySourceColumns it
+   * is also populated for multi-source results that are not editable, and must
+   * never be used for row identity or editing.
+   */
+  queryDisplaySourceColumns?: Array<QueryResultSourceColumnRef | undefined>;
   queryEditabilityReason?: "not-select" | "cte" | "set-operation" | "aggregation" | "external-source" | "complex-source" | "computed-columns" | "no-table" | "no-primary-key" | "primary-key-not-returned" | "aliased-columns" | "metadata-unavailable";
   mongoEditTarget?: {
     collection: string;
@@ -1272,6 +1410,10 @@ export interface QueryTab {
   txnSessionId?: string;
   /** Set to true when a manual transaction was auto-rolled back due to inactivity */
   txnAutoRolledBack?: boolean;
+  /** Oracle-only, non-persisted: whether the current manual Oracle session has
+   *  executed at least one statement DBX cannot prove read-only. Commit/Rollback
+   *  actions are hidden while a session is clean. Never cleared by a later read. */
+  oracleTxnPossiblyDirty?: boolean;
 }
 
 export interface SavedSqlFolder {
@@ -1290,6 +1432,8 @@ export interface SavedSqlFile {
   folderId?: string;
   name: string;
   database: string;
+  /** Undefined means the connection's built-in/default catalog. */
+  catalog?: string;
   schema?: string;
   sql: string;
   sqlLoaded?: boolean;
@@ -1303,6 +1447,51 @@ export interface SavedSqlFile {
 export interface SavedSqlLibrary {
   folders: SavedSqlFolder[];
   files: SavedSqlFile[];
+}
+
+/** Serializable configuration of a saved data-transfer task. */
+export interface TransferTaskConfig {
+  sourceConnectionId: string;
+  /** Undefined means the connection's built-in/default catalog. */
+  sourceCatalog?: string;
+  sourceDatabase: string;
+  sourceSchema?: string;
+  targetConnectionId: string;
+  targetCatalog?: string;
+  targetDatabase: string;
+  targetSchema?: string;
+  /** Selected object names grouped by object kind (TABLE, VIEW, ...). */
+  objects: Partial<Record<TransferObjectKind, string[]>>;
+  content: TransferContent;
+  mode: TransferMode;
+  targetTableNameCase: TransferTableNameCase;
+  quoteTargetColumnNames: boolean;
+  batchSize: number;
+}
+
+export interface TransferTask {
+  id: string;
+  folderId?: string;
+  name: string;
+  orderIndex?: number;
+  config: TransferTaskConfig;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskFolder {
+  id: string;
+  parentFolderId?: string;
+  name: string;
+  orderIndex?: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TransferTaskLibrary {
+  version: 1;
+  folders: TransferTaskFolder[];
+  tasks: TransferTask[];
 }
 
 export interface VectorCollectionMeta {

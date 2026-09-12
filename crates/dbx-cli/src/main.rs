@@ -27,6 +27,7 @@ const BRIDGE_REQUIRED_TYPES: &[&str] = &[
     "oracle",
     "elasticsearch",
     "easysearch",
+    "meilisearch",
     "qdrant",
     "milvus",
     "weaviate",
@@ -64,7 +65,10 @@ const BRIDGE_REQUIRED_TYPES: &[&str] = &[
     "neo4j",
     "cassandra",
     "bigquery",
+    "spanner",
     "kylin",
+    "ignite",
+    "ignite3",
     "sundb",
     "oscar",
     "xugu",
@@ -174,6 +178,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(argv: Vec<String>) -> Result<String, (CliError, bool)> {
+    // Set aws_lc_rs as the process-level default CryptoProvider to prevent a rustls panic
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     let wants_json = argv.iter().any(|arg| arg == "--json");
     let flags = parse_flags(&argv).map_err(|error| (error, wants_json))?;
     let json_output = flags.format == OutputFormat::Json;
@@ -1079,6 +1086,15 @@ mod tests {
 
         async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
             Ok(config)
+        }
+
+        async fn duplicate_connection_for_mcp(
+            &self,
+            _source_id: &str,
+            _copy_id: &str,
+            _copy_name: &str,
+        ) -> Result<ConnectionConfig, String> {
+            Err("not exercised".to_string())
         }
 
         async fn remove_connection_for_mcp(&self, _connection_id: &str) -> Result<bool, String> {

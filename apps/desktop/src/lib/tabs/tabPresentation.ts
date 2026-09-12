@@ -1,5 +1,7 @@
-﻿import { useConnectionStore } from "@/stores/connectionStore";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { hexToRgba } from "@/lib/common/color";
+import type { CSSProperties } from "vue";
 import { findConnectionGroupPath } from "@/lib/sidebar/sidebarLayout";
 import { splitMongoCommandRanges } from "@/lib/mongo/mongoShellCommand";
 import { executableStatementRanges, splitSqlStatementRanges, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
@@ -9,6 +11,14 @@ import type { BatchSqlExecution, ConnectionConfig, DatabaseType, QueryResult, Qu
 
 type Translate = (key: string, params?: Record<string, unknown>) => string;
 export type OutputView = "result" | "summary" | "explain" | "chart";
+const TABLE_COMMENT_TOOLTIP_MAX_LENGTH = 50;
+
+function tableCommentTooltipValue(comment: string | null | undefined): string | undefined {
+  const normalized = comment?.trim().replace(/\s+/g, " ");
+  if (!normalized) return undefined;
+  const characters = Array.from(normalized);
+  return characters.length <= TABLE_COMMENT_TOOLTIP_MAX_LENGTH ? normalized : `${characters.slice(0, TABLE_COMMENT_TOOLTIP_MAX_LENGTH - 1).join("")}…`;
+}
 
 export function connectionDisplayName(connectionId: string): string {
   const connectionStore = useConnectionStore();
@@ -115,6 +125,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@${t("tabs.etcdAccessControl")}`;
   }
+  if (tab.mode === "nacos-access-control") {
+    if (compact) return connectionDisplayName(tab.connectionId);
+    return `${connectionDisplayName(tab.connectionId)}@${t("tabs.nacosAccessControl")}`;
+  }
   if (tab.mode === "zookeeper") {
     if (compact) return connectionDisplayName(tab.connectionId);
     return `${connectionDisplayName(tab.connectionId)}@keys`;
@@ -129,6 +143,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
   }
   if (tab.mode === "mqtt") {
     return `${connectionDisplayName(tab.connectionId)} - ${t("connection.mqttConsoleTitle")}`;
+  }
+  if (tab.mode === "dolt-version-control") {
+    const branch = tab.workspaceBranch?.trim();
+    return `${connectionDisplayName(tab.connectionId)} VCS@${database}${branch ? `.${branch}` : ""}`;
   }
   if (tab.mode === "databases") {
     if (compact) return t("tabs.databases");
@@ -160,6 +178,10 @@ export function tabTooltipLines(tab: QueryTab, t: Translate): { label: string; v
   }
   if (tab.mode === "data" && tab.tableMeta?.tableName) {
     lines.push({ label: t("tabs.tooltipTable"), value: tab.tableMeta.tableName });
+    const comment = tableCommentTooltipValue(tab.tableComment);
+    if (comment) {
+      lines.push({ label: t("tabs.tooltipTableComment"), value: comment });
+    }
   }
   if (tab.mode === "mongo" && tab.sql) {
     lines.push({ label: t("tabs.tooltipCollection"), value: tab.sql });
@@ -336,17 +358,22 @@ export function activeResultRun(tab: Pick<QueryTab, "resultRuns" | "activeResult
   return tab.resultRuns?.find((run) => run.id === tab.activeResultRunId);
 }
 
-export function resultRunItems(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">): { id: string; title: string; sequence: number; active: boolean }[] {
+export function resultRunItems(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">): { id: string; title: string; sequence: number; active: boolean; pinned: boolean }[] {
   return (tab.resultRuns ?? []).map((run) => ({
     id: run.id,
     title: run.title,
     sequence: run.sequence,
     active: run.id === tab.activeResultRunId,
+    pinned: run.pinned === true,
   }));
 }
 
 export function resultGridCacheKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex">): string {
   return `${tab.id}-${tab.activeResultRunId ?? "current"}-${tab.activeResultIndex ?? 0}`;
+}
+
+export function resultGridColumnWidthCacheKey(tab: Pick<QueryTab, "id"> & Partial<Pick<QueryTab, "activeResultIndex">>): string {
+  return `result-column-width-${tab.id}-${tab.activeResultIndex ?? 0}`;
 }
 
 export function resultGridInstanceKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex" | "resultGridRevision">): string {
@@ -440,6 +467,7 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "etcd") return t("tabs.etcd");
   if (tab.mode === "etcd-dashboard") return t("tabs.etcdDashboard");
   if (tab.mode === "etcd-access-control") return t("tabs.etcdAccessControl");
+  if (tab.mode === "nacos-access-control") return t("tabs.nacosAccessControl");
   if (tab.mode === "zookeeper") return t("tabs.zookeeper");
   if (tab.mode === "consul") return t("tabs.consul");
   if (tab.mode === "consul-overview") return t("consul.ui.overview");
@@ -447,5 +475,63 @@ export function tabModeLabel(tab: QueryTab, t: Translate): string {
   if (tab.mode === "databases") return t("tabs.databases");
   if (tab.mode === "objects") return t("tabs.objects");
   if (tab.mode === "users") return t("tabs.users");
+  if (tab.mode === "dolt-version-control") return t("doltVersionControl.title");
   return tab.mode;
+}
+
+export function tabDatabaseIconType(tab: QueryTab): string {
+  const connectionStore = useConnectionStore();
+  const connection = connectionStore.getConfig(tab.connectionId);
+  if (!connection) return "mq";
+  if (connection.db_type === "mq") {
+    const externalConfig = connection.external_config as { systemKind?: unknown } | undefined;
+    const systemKind = typeof externalConfig?.systemKind === "string" ? externalConfig.systemKind : "";
+    if (connection.driver_profile === "kafka" || systemKind === "kafka") return "kafka";
+    if (connection.driver_profile === "rocketmq" || systemKind === "rocketmq") return "rocketmq";
+    if (connection.driver_profile === "rabbitmq" || systemKind === "rabbitmq") return "rabbitmq";
+    if (connection.driver_profile === "pulsar" || systemKind === "pulsar") return "pulsar";
+  }
+  return connection.driver_profile || connection.db_type;
+}
+
+export function tabIconClass(tab: QueryTab): string {
+  if (tab.externalSqlFileMissing) return "text-amber-600 dark:text-amber-400";
+  if (tab.mode === "mq") return "";
+  if (tab.mode === "databases" || tab.mode === "objects") return "text-amber-500 dark:text-amber-400";
+  if (tab.mode === "data" || tab.mode === "mongo" || tab.mode === "vector" || tab.mode === "redis" || tab.mode === "hbase" || tab.mode === "structure") return "text-emerald-600 dark:text-emerald-400";
+  return "text-blue-600 dark:text-blue-400";
+}
+
+export function tabColorStyle(tab: QueryTab, active: boolean, isClassic: boolean): CSSProperties | undefined {
+  const color = connectionColor(tab.connectionId);
+  if (!color) {
+    if (isClassic) {
+      return active ? { boxShadow: "inset 0 -2px 0 var(--ring)" } : undefined;
+    }
+    return active ? { borderColor: "var(--ring)" } : undefined;
+  }
+  if (isClassic) {
+    return {
+      "--app-tab-background": hexToRgba(color, active ? 0.16 : 0.07),
+      "--app-tab-hover-background": hexToRgba(color, 0.14),
+      boxShadow: active ? `inset 0 -2px 0 ${color}` : undefined,
+    };
+  }
+  return {
+    "--app-tab-background": hexToRgba(color, active ? 0.16 : 0.09),
+    "--app-tab-hover-background": hexToRgba(color, 0.16),
+    borderColor: active ? hexToRgba(color, 0.72) : hexToRgba(color, 0.18),
+  };
+}
+
+export function dirtyTabTitleStyle(isDirty: boolean): CSSProperties | undefined {
+  if (!isDirty) {
+    return undefined;
+  }
+  return {
+    fontStyle: "italic",
+    fontWeight: 700,
+    transform: "skewX(-8deg)",
+    transformOrigin: "left center",
+  };
 }

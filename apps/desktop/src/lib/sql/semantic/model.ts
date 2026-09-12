@@ -1,5 +1,6 @@
 import { sqlSemanticDialectFor, type SqlSemanticDialectAdapter } from "@/lib/sql/semantic/dialect";
 import { findActiveSqlStatementSpan, isSuppressedSqlSemanticContext, tokenIsIdentifier, tokenizeSqlSemantic, unquoteSqlSemanticIdentifier } from "@/lib/sql/semantic/tokens";
+import { resolveSqlStatementWindow } from "@/lib/sql/sqlSyntaxTreeWindow";
 import type {
   SqlSemanticBuildOptions,
   SqlSemanticClauseSpans,
@@ -130,18 +131,6 @@ function updateIntroducesMutationTarget(tokens: readonly SqlSemanticToken[], upd
   return true;
 }
 
-function commaContinuesTableList(tokens: readonly SqlSemanticToken[], commaIndex: number): boolean {
-  const comma = tokens[commaIndex];
-  if (comma?.text !== ",") return false;
-  for (let index = commaIndex - 1; index >= 0; index -= 1) {
-    const item = tokens[index];
-    if (!item || item.depth !== comma.depth || item.kind !== "word") continue;
-    if (item.normalized === "from") return true;
-    if (item.normalized === "select" || item.normalized === "join" || TABLE_INTRODUCERS.has(item.normalized) || CLAUSE_BOUNDARIES.has(item.normalized)) return false;
-  }
-  return false;
-}
-
 /**
  * Finds concrete table-name tokens for visual highlighting without consulting
  * metadata. Only the final identifier in a qualified name is returned, so
@@ -152,11 +141,18 @@ export function sqlSemanticTableNameSpans(sql: string, options: SqlSemanticBuild
   const tokens = significantTokens(tokenizeSqlSemantic(sql, dialect.id));
   const spans: SqlSemanticSpan[] = [];
   const seen = new Set<string>();
+  const commaContinuesTableListByDepth = new Map<number, boolean>();
 
   for (let index = 0; index < tokens.length; index += 1) {
     const item = tokens[index];
+    if (!item) continue;
+    const commaContinuesTableList = item.text === "," && commaContinuesTableListByDepth.get(item.depth) === true;
+    if (item.kind === "word") {
+      if (item.normalized === "from") commaContinuesTableListByDepth.set(item.depth, true);
+      else if (item.normalized === "select" || item.normalized === "join" || TABLE_INTRODUCERS.has(item.normalized) || CLAUSE_BOUNDARIES.has(item.normalized)) commaContinuesTableListByDepth.set(item.depth, false);
+    }
     const introduced = item?.kind === "word" && TABLE_INTRODUCERS.has(item.normalized) && (item.normalized !== "update" || updateIntroducesMutationTarget(tokens, index));
-    if (!introduced && !commaContinuesTableList(tokens, index)) continue;
+    if (!introduced && !commaContinuesTableList) continue;
 
     let target = index + 1;
     while (TABLE_TARGET_MODIFIERS.has(tokens[target]?.normalized ?? "")) target += 1;
@@ -785,8 +781,16 @@ function buildScope(statement: SqlSemanticStatement, rowSources: SqlSemanticRowS
 export function buildSqlSemanticModel(sql: string, cursor: number, options: SqlSemanticBuildOptions = {}): SqlSemanticModel {
   const safeCursor = Math.max(0, Math.min(cursor, sql.length));
   const dialect = sqlSemanticDialectFor(options);
-  const allTokens = tokenizeSqlSemantic(sql, dialect.id);
-  const statementSpan = findActiveSqlStatementSpan(sql, allTokens, safeCursor);
+  const window = resolveSqlStatementWindow(sql, safeCursor, options.editorState, dialect.id);
+  const windowSql = sql.slice(window.from, window.to);
+  const windowCursor = safeCursor - window.from;
+  const localTokens = tokenizeSqlSemantic(windowSql, dialect.id);
+  const localStatementSpan = findActiveSqlStatementSpan(windowSql, localTokens, windowCursor);
+  const allTokens = localTokens.map((token) => ({
+    ...token,
+    span: { start: token.span.start + window.from, end: token.span.end + window.from },
+  }));
+  const statementSpan = { start: localStatementSpan.start + window.from, end: localStatementSpan.end + window.from };
   const tokens = significantTokens(allTokens.filter((item) => item.span.end > statementSpan.start && item.span.start < statementSpan.end));
   const kind = statementKind(tokens);
   const statement: SqlSemanticStatement = {

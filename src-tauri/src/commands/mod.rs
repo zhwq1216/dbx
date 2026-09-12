@@ -25,6 +25,7 @@ pub mod keychain;
 pub mod list_sql_files;
 pub mod mcp;
 pub mod mcp_bridge;
+pub mod mcp_http_server;
 pub mod mongo_cmd;
 #[cfg(feature = "mq-admin")]
 pub mod mq_cmd;
@@ -56,6 +57,7 @@ pub mod transfer;
 pub mod tunnel_profiles;
 pub mod update;
 mod update_portable;
+pub mod vector_cmd;
 pub mod window_controls;
 pub mod xlsx_export;
 pub mod zookeeper_cmd;

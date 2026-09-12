@@ -176,6 +176,210 @@ func TestURLParamsOverrideConnectionString(t *testing.T) {
 	if config.TransportMode != "http" || config.HTTPPath != "proxy" {
 		t.Fatalf("URL params did not override connection string: %#v", config)
 	}
+	if len(config.Endpoints) != 1 || config.Endpoints[0] != (endpoint{Host: "hive.example.com", Port: 10000}) {
+		t.Fatalf("resolved form endpoint did not override connection string: %#v", config.Endpoints)
+	}
+}
+
+func TestResolvedDirectEndpointAndDatabasePreserveJDBCParameterSections(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		Host:             "127.0.0.1",
+		Port:             18080,
+		Database:         "analytics",
+		ConnectionString: "jdbc:hive2://old.example.com:10000/default;transportMode=http;httpPath=gateway?hive.exec.dynamic.partition=true#SourceTable=events",
+		URLParams:        "transportMode=http;httpPath=gateway?hive.exec.dynamic.partition=true#SourceTable=events",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 1 || config.Endpoints[0] != (endpoint{Host: "127.0.0.1", Port: 18080}) {
+		t.Fatalf("unexpected resolved endpoint: %#v", config.Endpoints)
+	}
+	if config.Database != "analytics" {
+		t.Fatalf("resolved database = %q, want analytics", config.Database)
+	}
+	if config.TransportMode != "http" || config.HTTPPath != "gateway" {
+		t.Fatalf("JDBC session parameters were not preserved: %#v", config)
+	}
+	if config.HiveConfiguration["set:hiveconf:hive.exec.dynamic.partition"] != "true" {
+		t.Fatalf("JDBC hiveConfs were not preserved: %#v", config.HiveConfiguration)
+	}
+	if config.HiveConfiguration["set:hivevar:SourceTable"] != "events" {
+		t.Fatalf("JDBC hiveVars were not preserved: %#v", config.HiveConfiguration)
+	}
+}
+
+func TestStructuredFieldsOverridePersistedJDBCValues(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		Host:             "127.0.0.1",
+		Port:             18080,
+		Username:         "edited-user",
+		Password:         "edited-password",
+		ConnectionString: "jdbc:hive2://old-user:old-password@old.example.com:10000/old_database;transportMode=http;auth=LDAP;ssl=true;serviceDiscoveryMode=zooKeeper?hive.exec.dynamic.partition=true#SourceTable=events",
+		URLParams:        "user=url-user;password=url-password;ssl=true?hive.exec.dynamic.partition=true#SourceTable=events",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 1 || config.Endpoints[0] != (endpoint{Host: "127.0.0.1", Port: 18080}) {
+		t.Fatalf("unexpected resolved endpoint: %#v", config.Endpoints)
+	}
+	if config.Database != defaultHiveDatabase {
+		t.Fatalf("database = %q, want %q", config.Database, defaultHiveDatabase)
+	}
+	if config.Username != "edited-user" || config.Password != "edited-password" {
+		t.Fatalf("structured credentials were overwritten: username=%q password=%q", config.Username, config.Password)
+	}
+	if config.TransportMode != "binary" || config.Auth != "NONE" || config.ServiceDiscoveryMode != "" {
+		t.Fatalf("removed JDBC parameters remained active: %#v", config)
+	}
+	if config.TLSConfig != nil {
+		t.Fatal("disabled structured SSL was re-enabled by persisted JDBC parameters")
+	}
+	if config.HiveConfiguration["set:hiveconf:hive.exec.dynamic.partition"] != "true" {
+		t.Fatalf("current hiveConfs were not preserved: %#v", config.HiveConfiguration)
+	}
+	if config.HiveConfiguration["set:hivevar:SourceTable"] != "events" {
+		t.Fatalf("current hiveVars were not preserved: %#v", config.HiveConfiguration)
+	}
+}
+
+func TestConnectionStringOnlyKeepsJDBCValues(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		ConnectionString: "jdbc:hive2://raw-user:raw-password@hive.example.com:10001/analytics;transportMode=http;ssl=true",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Database != "analytics" || config.Username != "raw-user" || config.Password != "raw-password" {
+		t.Fatalf("connection-string-only fields were not preserved: %#v", config)
+	}
+	if config.TransportMode != "http" || config.TLSConfig == nil {
+		t.Fatalf("connection-string-only parameters were not preserved: %#v", config)
+	}
+}
+
+func TestZooKeeperDiscoveryKeepsAllJDBCEndpoints(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		Host:             "127.0.0.1",
+		Port:             12181,
+		Database:         "analytics",
+		ConnectionString: "jdbc:hive2://zk1.example.com:2181,zk2.example.com:2181/default;serviceDiscoveryMode=zooKeeper;zooKeeperNamespace=hiveserver2",
+		URLParams:        "serviceDiscoveryMode=zooKeeper;zooKeeperNamespace=hiveserver2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(config.Endpoints) != 2 || config.Endpoints[0].Host != "zk1.example.com" || config.Endpoints[1].Host != "zk2.example.com" {
+		t.Fatalf("ZooKeeper discovery endpoints were not preserved: %#v", config.Endpoints)
+	}
+	if config.Database != "analytics" {
+		t.Fatalf("resolved database = %q, want analytics", config.Database)
+	}
+}
+
+func TestImpalaDefaultsToNoSASL(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "impala",
+		Host:         "impala.example.com",
+		Port:         21050,
+		Database:     "analytics",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "NOSASL" {
+		t.Fatalf("unexpected Impala auth mode: %q", config.Auth)
+	}
+	if config.Kerberos.Service != "impala" {
+		t.Fatalf("unexpected Impala Kerberos service: %q", config.Kerberos.Service)
+	}
+}
+
+func TestArgoDefaultsToNoSASL(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "argo",
+		Host:         "argo.example.com",
+		Port:         10000,
+		Database:     "analytics",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "NOSASL" {
+		t.Fatalf("unexpected ArgoDB auth mode: %q", config.Auth)
+	}
+}
+
+func TestArgoExplicitAuthenticationOverridesDefault(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "argo",
+		Host:         "argo.example.com",
+		Port:         10000,
+		URLParams:    "auth=NONE",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "NONE" || !config.AuthExplicit {
+		t.Fatalf("explicit ArgoDB authentication was not preserved: %#v", config)
+	}
+}
+
+func TestHiveDefaultAuthenticationRemainsSASL(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "hive",
+		Host:         "hive.example.com",
+		Port:         10000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "NONE" {
+		t.Fatalf("unexpected Hive auth mode: %q", config.Auth)
+	}
+}
+
+func TestImpalaExplicitAuthenticationOverridesDefaults(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "impala",
+		Host:         "impala.example.com",
+		Port:         21050,
+		URLParams:    "auth=NONE;service=custom",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "NONE" || config.Kerberos.Service != "custom" {
+		t.Fatalf("explicit Impala authentication was not preserved: %#v", config.Kerberos)
+	}
+}
+
+func TestImpalaLDAPHTTPSSLConfiguration(t *testing.T) {
+	config, err := parseConnectionConfig(connectParams{
+		DatabaseType: "impala",
+		Host:         "impala.example.com",
+		Port:         21050,
+		Username:     "alice",
+		Password:     "secret",
+		URLParams:    "auth=LDAP;transportMode=http;httpPath=cliservice",
+		SSL:          true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Auth != "LDAP" || config.TransportMode != "http" || config.HTTPPath != "cliservice" {
+		t.Fatalf("unexpected Impala LDAP transport config: %#v", config)
+	}
+	if config.Username != "alice" || config.Password != "secret" {
+		t.Fatalf("Impala LDAP credentials were not preserved: %q / %q", config.Username, config.Password)
+	}
+	if config.TLSConfig == nil || config.TLSConfig.ServerName != "impala.example.com" {
+		t.Fatalf("unexpected Impala LDAP TLS config: %#v", config.TLSConfig)
+	}
+	if config.Kerberos.Service != defaultImpalaService {
+		t.Fatalf("unexpected Impala service default: %q", config.Kerberos.Service)
+	}
 }
 
 func TestParseStandardJDBCURLSectionsAndCredentials(t *testing.T) {
@@ -193,8 +397,9 @@ func TestParseStandardJDBCURLSectionsAndCredentials(t *testing.T) {
 		t.Fatalf("deprecated Hive conf transport settings were not applied: %#v", config)
 	}
 	want := map[string]string{
-		"set:hiveconf:hive.exec.dynamic.partition": "false",
-		"set:hivevar:SourceTable":                  "override",
+		"set:hiveconf:hive.resultset.use.unique.column.names": "false",
+		"set:hiveconf:hive.exec.dynamic.partition":            "false",
+		"set:hivevar:SourceTable":                             "override",
 	}
 	if !reflect.DeepEqual(config.HiveConfiguration, want) {
 		t.Fatalf("unexpected OpenSession configuration: %#v", config.HiveConfiguration)
@@ -210,14 +415,92 @@ func TestOpenSessionCompatibilityVariablesFromSessionParams(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"hive.server2.proxy.user":                     "alice",
-		"set:hiveconf:hive.create.as.external.legacy": "true",
-		"set:hiveconf:hive.exec.compress.output":      "true",
-		"set:hivevar:source":                          "events",
-		"set:hivevar:wmpool":                          "etl",
+		"hive.server2.proxy.user":                             "alice",
+		"set:hiveconf:hive.create.as.external.legacy":         "true",
+		"set:hiveconf:hive.exec.compress.output":              "true",
+		"set:hiveconf:hive.resultset.use.unique.column.names": "false",
+		"set:hivevar:source":                                  "events",
+		"set:hivevar:wmpool":                                  "etl",
 	}
 	if !reflect.DeepEqual(config.HiveConfiguration, want) {
 		t.Fatalf("unexpected OpenSession compatibility variables: %#v", config.HiveConfiguration)
+	}
+}
+
+func TestOpenSessionUsesLeafResultLabelsUnlessExplicitlyOverridden(t *testing.T) {
+	tests := []struct {
+		name       string
+		connection string
+		urlParams  string
+		want       string
+	}{
+		{name: "default", want: "false"},
+		{
+			name:       "JDBC hiveconf override",
+			connection: "jdbc:hive2://hs2.example.com:10000/default?hive.resultset.use.unique.column.names=true",
+			want:       "true",
+		},
+		{
+			name:      "URL hiveconf override",
+			urlParams: "?HIVE.RESULTSET.USE.UNIQUE.COLUMN.NAMES=true",
+			want:      "true",
+		},
+		{
+			name:       "URL hiveconf wins over JDBC hiveconf",
+			connection: "jdbc:hive2://hs2.example.com:10000/default?hive.resultset.use.unique.column.names=true",
+			urlParams:  "?hive.resultset.use.unique.column.names=false",
+			want:       "false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			params := connectParams{Host: "hs2.example.com", ConnectionString: test.connection, URLParams: test.urlParams}
+			if test.connection != "" {
+				params.Host = ""
+			}
+			config, err := parseConnectionConfig(params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const key = "set:hiveconf:hive.resultset.use.unique.column.names"
+			if got := config.HiveConfiguration[key]; got != test.want {
+				t.Fatalf("%s = %q, want %q; config=%#v", key, got, test.want, config.HiveConfiguration)
+			}
+			matches := 0
+			for candidate := range config.HiveConfiguration {
+				if strings.EqualFold(candidate, key) {
+					matches++
+				}
+			}
+			if matches != 1 {
+				t.Fatalf("result label hiveconf must appear exactly once: %#v", config.HiveConfiguration)
+			}
+		})
+	}
+}
+
+func TestHiveAssignmentMergeCanonicalizesOnlyResultLabelSetting(t *testing.T) {
+	first := map[string]string{
+		"CaseSensitive":                          "first",
+		"HIVE.RESULTSET.USE.UNIQUE.COLUMN.NAMES": "true",
+	}
+	second := map[string]string{
+		"casesensitive":                          "second",
+		"hive.resultset.use.unique.column.names": "false",
+	}
+
+	hiveConfs := mergeHiveConfAssignments(first, second)
+	if got := hiveConfs[resultSetUniqueColumnNames]; got != "false" {
+		t.Fatalf("result-label setting override = %q, want false; values=%#v", got, hiveConfs)
+	}
+	if got := len(hiveConfs); got != 3 {
+		t.Fatalf("unrelated case-distinct Hive confs were collapsed: %#v", hiveConfs)
+	}
+
+	hiveVars := mergeHiveAssignments(first, second)
+	if got := len(hiveVars); got != 4 {
+		t.Fatalf("case-distinct Hive variables were collapsed: %#v", hiveVars)
 	}
 }
 

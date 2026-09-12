@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,7 @@ type fakeDriverState struct {
 	rowCount       int
 	execStatements []string
 	execConnIDs    []int
+	execErrors     map[string]error
 }
 
 type fakeDriver struct{}
@@ -144,6 +146,9 @@ func (connection fakeConn) ExecContext(_ context.Context, query string, _ []driv
 	defer state.mu.Unlock()
 	state.execStatements = append(state.execStatements, query)
 	state.execConnIDs = append(state.execConnIDs, connection.id)
+	if err := state.execErrors[query]; err != nil {
+		return nil, err
+	}
 	return driver.RowsAffected(1), nil
 }
 
@@ -223,8 +228,8 @@ func (connection *fallbackConn) QueryContext(_ context.Context, query string, _ 
 			identity = nil
 		}
 		return &valueRows{
-			columns: []string{"column_name", "data_type", "is_nullable", "column_default", "column_comment", "numeric_precision", "numeric_scale", "character_maximum_length", "attidentity"},
-			rows:    [][]driver.Value{{"id", "integer", false, nil, nil, int64(32), int64(0), nil, identity}},
+			columns: []string{"resolved_schema", "column_name", "data_type", "is_nullable", "column_default", "column_comment", "numeric_precision", "numeric_scale", "character_maximum_length", "attidentity"},
+			rows:    [][]driver.Value{{"public", "id", "integer", false, nil, nil, int64(32), int64(0), nil, identity}},
 		}, nil
 	}
 	return nil, errors.New("unexpected query: " + query)
@@ -342,6 +347,75 @@ func (state *connectionAttemptState) snapshot() ([]string, []time.Time) {
 }
 
 func (state *connectionAttemptState) connectionStrings() []string {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return append([]string(nil), state.dsns...)
+}
+
+// failoverState records every opener attempt (per endpoint host + sslmode)
+// and simulates ping failures keyed as "<sslMode>@<host>".
+type failoverState struct {
+	mu         sync.Mutex
+	opened     []string
+	dsns       []string
+	pingErrors map[string]error
+}
+
+type failoverOpener struct {
+	state *failoverState
+}
+
+type failoverConnector struct {
+	state   *failoverState
+	host    string
+	sslMode string
+}
+
+type failoverDriver struct{}
+
+type failoverConn struct {
+	state   *failoverState
+	host    string
+	sslMode string
+}
+
+func (o failoverOpener) open(cp connectParams, sslMode string) (*sql.DB, error) {
+	dsn := buildDSNWithSSLMode(cp, sslMode)
+	o.state.mu.Lock()
+	o.state.opened = append(o.state.opened, sslMode+"@"+cp.Host)
+	o.state.dsns = append(o.state.dsns, dsn)
+	o.state.mu.Unlock()
+	return sql.OpenDB(failoverConnector{state: o.state, host: cp.Host, sslMode: sslMode}), nil
+}
+
+func (connector failoverConnector) Connect(context.Context) (driver.Conn, error) {
+	conn := failoverConn{state: connector.state, host: connector.host, sslMode: connector.sslMode}
+	return &conn, nil
+}
+
+func (failoverConnector) Driver() driver.Driver { return failoverDriver{} }
+
+func (failoverDriver) Open(string) (driver.Conn, error) { return nil, driver.ErrSkip }
+
+func (*failoverConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+
+func (*failoverConn) Close() error { return nil }
+
+func (*failoverConn) Begin() (driver.Tx, error) { return nil, driver.ErrSkip }
+
+func (connection failoverConn) Ping(context.Context) error {
+	connection.state.mu.Lock()
+	defer connection.state.mu.Unlock()
+	return connection.state.pingErrors[connection.sslMode+"@"+connection.host]
+}
+
+func (state *failoverState) attempts() []string {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return append([]string(nil), state.opened...)
+}
+
+func (state *failoverState) connectionStrings() []string {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	return append([]string(nil), state.dsns...)
@@ -846,6 +920,21 @@ func TestOpenAndPingDBPreferFallbackUsesOneTimeoutBudget(t *testing.T) {
 	}
 }
 
+func TestOpenAndPingDBPreferFallbackHandlesKingbaseV7TLSFailure(t *testing.T) {
+	state := &connectionAttemptState{pingErrors: map[string]error{
+		"require": errors.New("remote error: tls: handshake failure"),
+	}}
+	db, err := openAndPingDB(connectParams{}, time.Second, state.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	attempts, _ := state.snapshot()
+	if strings.Join(attempts, ",") != "require,disable" {
+		t.Fatalf("unexpected KingBase V7 attempts: %v", attempts)
+	}
+}
+
 func TestOpenAndPingDBDoesNotDowngradeUnrelatedErrors(t *testing.T) {
 	authErr := errors.New("authentication failed")
 	state := &connectionAttemptState{pingErrors: map[string]error{"require": authErr}}
@@ -859,6 +948,33 @@ func TestOpenAndPingDBDoesNotDowngradeUnrelatedErrors(t *testing.T) {
 	attempts, _ := state.snapshot()
 	if strings.Join(attempts, ",") != "require" {
 		t.Fatalf("unrelated errors must not downgrade: %v", attempts)
+	}
+}
+
+func TestOpenAndPingDBDoesNotDowngradeNetworkErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "timeout", err: context.DeadlineExceeded},
+		{name: "connection refused", err: errors.New("dial tcp 127.0.0.1:54321: connect: connection refused")},
+		{name: "generic handshake", err: errors.New("handshake failure")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &connectionAttemptState{pingErrors: map[string]error{"require": test.err}}
+			db, err := openAndPingDB(connectParams{}, time.Second, state.open)
+			if db != nil {
+				db.Close()
+			}
+			if !errors.Is(err, test.err) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			attempts, _ := state.snapshot()
+			if strings.Join(attempts, ",") != "require" {
+				t.Fatalf("network errors must not downgrade: %v", attempts)
+			}
+		})
 	}
 }
 
@@ -881,6 +997,26 @@ func TestOpenAndPingDBExplicitModesNeverDowngrade(t *testing.T) {
 	}
 }
 
+func TestOpenAndPingDBExplicitModesNeverDowngradeKingbaseV7TLSFailure(t *testing.T) {
+	tlsErr := errors.New("remote error: tls: handshake failure")
+	for _, sslMode := range []string{"disable", "require", "verify-ca", "verify-full"} {
+		t.Run(sslMode, func(t *testing.T) {
+			state := &connectionAttemptState{pingErrors: map[string]error{sslMode: tlsErr}}
+			db, err := openAndPingDB(connectParams{URLParams: "sslmode=" + sslMode}, time.Second, state.open)
+			if db != nil {
+				db.Close()
+			}
+			if !errors.Is(err, tlsErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			attempts, _ := state.snapshot()
+			if len(attempts) != 1 || attempts[0] != sslMode {
+				t.Fatalf("explicit mode must use one attempt: %v", attempts)
+			}
+		})
+	}
+}
+
 func TestOpenAndPingDBSSLDefaultsToVerifyFull(t *testing.T) {
 	state := &connectionAttemptState{pingErrors: map[string]error{}}
 	db, err := openAndPingDB(connectParams{SSL: true}, time.Second, state.open)
@@ -891,6 +1027,300 @@ func TestOpenAndPingDBSSLDefaultsToVerifyFull(t *testing.T) {
 	attempts, _ := state.snapshot()
 	if len(attempts) != 1 || attempts[0] != "verify-full" {
 		t.Fatalf("SSL=true must stay verify-full: %v", attempts)
+	}
+}
+
+func TestSplitHostEndpoints(t *testing.T) {
+	tests := []struct {
+		name         string
+		host         string
+		fallbackPort int
+		expected     []kingbaseEndpoint
+	}{
+		{
+			name:         "single host stays whole",
+			host:         "172.22.232.10",
+			fallbackPort: 54321,
+			expected:     []kingbaseEndpoint{{host: "172.22.232.10", port: 54321}},
+		},
+		{
+			name:         "single host with custom fallback port",
+			host:         "db.example.com",
+			fallbackPort: 6000,
+			expected:     []kingbaseEndpoint{{host: "db.example.com", port: 6000}},
+		},
+		{
+			name:         "comma separated cluster",
+			host:         "172.22.232.10,172.22.232.11",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "172.22.232.10", port: 54321},
+				{host: "172.22.232.11", port: 54321},
+			},
+		},
+		{
+			name:         "semicolon separated cluster",
+			host:         "172.22.232.10; 172.22.232.11",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "172.22.232.10", port: 54321},
+				{host: "172.22.232.11", port: 54321},
+			},
+		},
+		{
+			name:         "per entry ports",
+			host:         "10.0.0.1:1000,10.0.0.2:2000",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "10.0.0.1", port: 1000},
+				{host: "10.0.0.2", port: 2000},
+			},
+		},
+		{
+			name:         "mixed embedded and fallback ports",
+			host:         "10.0.0.1:1000,10.0.0.2",
+			fallbackPort: 54322,
+			expected: []kingbaseEndpoint{
+				{host: "10.0.0.1", port: 1000},
+				{host: "10.0.0.2", port: 54322},
+			},
+		},
+		{
+			name:         "bracketed ipv6 without port",
+			host:         "[2001:db8::1],[2001:db8::2]",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "2001:db8::1", port: 54321},
+				{host: "2001:db8::2", port: 54321},
+			},
+		},
+		{
+			name:         "bracketed ipv6 with port",
+			host:         "[2001:db8::1]:6000,[2001:db8::2]:6001",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "2001:db8::1", port: 6000},
+				{host: "2001:db8::2", port: 6001},
+			},
+		},
+		{
+			name:         "bare ipv6 literal",
+			host:         "::1",
+			fallbackPort: 54321,
+			expected:     []kingbaseEndpoint{{host: "::1", port: 54321}},
+		},
+		{
+			name:         "invalid port suffix stays part of the host",
+			host:         "db.example.com:notaport",
+			fallbackPort: 54321,
+			expected:     []kingbaseEndpoint{{host: "db.example.com:notaport", port: 54321}},
+		},
+		{
+			name:         "out of range port falls back",
+			host:         "10.0.0.1:70000",
+			fallbackPort: 54321,
+			expected:     []kingbaseEndpoint{{host: "10.0.0.1:70000", port: 54321}},
+		},
+		{
+			name:         "empty entries are dropped",
+			host:         "10.0.0.1,, ;10.0.0.2",
+			fallbackPort: 54321,
+			expected: []kingbaseEndpoint{
+				{host: "10.0.0.1", port: 54321},
+				{host: "10.0.0.2", port: 54321},
+			},
+		},
+		{
+			name:         "empty host yields no endpoints",
+			host:         "  ",
+			fallbackPort: 54321,
+			expected:     []kingbaseEndpoint{},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			endpoints := splitHostEndpoints(test.host, test.fallbackPort)
+			if len(endpoints) != len(test.expected) {
+				t.Fatalf("unexpected endpoint count: got %#v want %#v", endpoints, test.expected)
+			}
+			for index, endpoint := range endpoints {
+				if endpoint != test.expected[index] {
+					t.Fatalf("endpoint %d mismatch: got %#v want %#v", index, endpoint, test.expected[index])
+				}
+			}
+		})
+	}
+}
+
+func TestClusterConnectEndpointsIgnoresNativeConnectionString(t *testing.T) {
+	if endpoints := clusterConnectEndpoints(connectParams{
+		Host:             "10.0.0.1,10.0.0.2",
+		Port:             54321,
+		ConnectionString: "host=cluster.example.com port=54321",
+	}); endpoints != nil {
+		t.Fatalf("native connection string must not be split: %#v", endpoints)
+	}
+	// The JDBC URL the host app always passes is ignored by the DSN builder,
+	// so the host field must still be split for it.
+	endpoints := clusterConnectEndpoints(connectParams{
+		Host:             "10.0.0.1,10.0.0.2",
+		Port:             54321,
+		ConnectionString: "jdbc:kingbase8://10.0.0.1:54321/test",
+	})
+	if len(endpoints) != 2 {
+		t.Fatalf("jdbc url must not block cluster splitting: %#v", endpoints)
+	}
+}
+
+func TestOpenAndPingDBSingleHostDSNUnchanged(t *testing.T) {
+	state := &failoverState{pingErrors: map[string]error{
+		"require@172.22.232.10": gokb.ErrSSLNotSupported,
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "172.22.232.10", Port: 54321, Username: "system", Database: "test"}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	dsns := state.connectionStrings()
+	if len(dsns) != 2 {
+		t.Fatalf("single host must keep the prefer fallback sequence: %v", dsns)
+	}
+	for _, dsn := range dsns {
+		if !strings.Contains(dsn, "host='172.22.232.10' port=54321 ") {
+			t.Fatalf("single host DSN changed: %s", dsn)
+		}
+	}
+}
+
+func TestOpenAndPingDBMultiHostFailsOverToReachableEndpoint(t *testing.T) {
+	state := &failoverState{pingErrors: map[string]error{
+		"require@203.0.113.10": errors.New("dial tcp 203.0.113.10:54321: connect: connection refused"),
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "203.0.113.10,198.51.100.20", Port: 54321}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	attempts := state.attempts()
+	if strings.Join(attempts, " -> ") != "require@203.0.113.10 -> require@198.51.100.20" {
+		t.Fatalf("unexpected failover order: %v", attempts)
+	}
+	dsns := state.connectionStrings()
+	if len(dsns) != 2 {
+		t.Fatalf("unexpected DSN count: %v", dsns)
+	}
+	if !strings.Contains(dsns[0], "host='203.0.113.10' port=54321") {
+		t.Fatalf("first DSN must target the first endpoint: %s", dsns[0])
+	}
+	if !strings.Contains(dsns[1], "host='198.51.100.20' port=54321") {
+		t.Fatalf("second DSN must target the second endpoint: %s", dsns[1])
+	}
+}
+
+func TestOpenAndPingDBMultiHostAppliesConfiguredPortToEveryEndpoint(t *testing.T) {
+	// Regression for #7885: the whole comma-joined host string used to reach
+	// gokb as one hostname (`lookup ip1,ip2: no such host`) while the
+	// configured port was never applied per endpoint.
+	state := &failoverState{pingErrors: map[string]error{
+		"require@10.10.0.1": errors.New("dial tcp: connection refused"),
+		"disable@10.10.0.1": errors.New("dial tcp: connection refused"),
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "10.10.0.1,10.10.0.2", Port: 54321}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, dsn := range state.connectionStrings() {
+		if strings.Contains(dsn, "10.10.0.1,") || strings.Contains(dsn, ",10.10.0.2") {
+			t.Fatalf("comma-joined host leaked into DSN: %s", dsn)
+		}
+		if !strings.Contains(dsn, "port=54321") {
+			t.Fatalf("configured port missing from DSN: %s", dsn)
+		}
+	}
+}
+
+func TestOpenAndPingDBMultiHostPerEntryPorts(t *testing.T) {
+	state := &failoverState{pingErrors: map[string]error{
+		"require@10.0.0.1": errors.New("dial tcp: connection refused"),
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "10.0.0.1:1000,10.0.0.2:2000", Port: 54321}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	dsns := state.connectionStrings()
+	if !strings.Contains(dsns[0], "host='10.0.0.1' port=1000") {
+		t.Fatalf("first endpoint must use its embedded port: %s", dsns[0])
+	}
+	if !strings.Contains(dsns[1], "host='10.0.0.2' port=2000") {
+		t.Fatalf("second endpoint must use its embedded port: %s", dsns[1])
+	}
+}
+
+func TestOpenAndPingDBMultiHostSemicolonSeparatorFailsOver(t *testing.T) {
+	state := &failoverState{pingErrors: map[string]error{
+		"require@10.0.0.9": errors.New("dial tcp: connection refused"),
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "10.0.0.9;10.0.0.10", Port: 54321}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	attempts := state.attempts()
+	if len(attempts) != 2 || attempts[1] != "require@10.0.0.10" {
+		t.Fatalf("semicolon separated hosts must fail over in order: %v", attempts)
+	}
+}
+
+func TestOpenAndPingDBMultiHostAllEndpointsFail(t *testing.T) {
+	refused := errors.New("dial tcp: connection refused")
+	state := &failoverState{pingErrors: map[string]error{
+		"require@10.0.0.1": refused,
+		"require@10.0.0.2": refused,
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "10.0.0.1,10.0.0.2", Port: 54321}, time.Second, opener.open)
+	if db != nil {
+		db.Close()
+	}
+	if err == nil {
+		t.Fatal("expected failure when every endpoint is down")
+	}
+	if !errors.Is(err, refused) {
+		t.Fatalf("aggregated error must wrap endpoint failures: %v", err)
+	}
+	for _, endpoint := range []string{"10.0.0.1:54321", "10.0.0.2:54321"} {
+		if !strings.Contains(err.Error(), endpoint) {
+			t.Fatalf("error must mention %s: %v", endpoint, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "trying 2 endpoints") {
+		t.Fatalf("error must report the endpoint count: %v", err)
+	}
+}
+
+func TestOpenAndPingDBMultiHostKeepsSSLFallbackPerEndpoint(t *testing.T) {
+	state := &failoverState{pingErrors: map[string]error{
+		"require@10.0.0.1": gokb.ErrSSLNotSupported,
+		"disable@10.0.0.1": errors.New("dial tcp: connection refused"),
+		"require@10.0.0.2": gokb.ErrSSLNotSupported,
+	}}
+	opener := failoverOpener{state: state}
+	db, err := openAndPingDB(connectParams{Host: "10.0.0.1,10.0.0.2", Port: 54321}, time.Second, opener.open)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	attempts := state.attempts()
+	expected := "require@10.0.0.1 -> disable@10.0.0.1 -> require@10.0.0.2 -> disable@10.0.0.2"
+	if strings.Join(attempts, " -> ") != expected {
+		t.Fatalf("unexpected attempt sequence: %v", attempts)
 	}
 }
 
@@ -926,6 +1356,525 @@ func TestKingbaseListIndexesQuerySupportsSQLServerMode(t *testing.T) {
 	}
 	if strings.Contains(query, "[pos.n]") {
 		t.Fatalf("index query should not use dynamic array subscripts in SQL Server mode: %s", query)
+	}
+}
+
+func TestParseCatalogAttributeNumbers(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      any
+		expected string
+		wantErr  bool
+	}{
+		{name: "int2vector string", raw: "1 2 4", expected: "1,2,4"},
+		{name: "array string", raw: "{3,5}", expected: "3,5"},
+		{name: "bytes", raw: []byte("6 7"), expected: "6,7"},
+		{name: "bracketed array string", raw: "[8 9]", expected: "8,9"},
+		{name: "int16 slice", raw: []int16{10, 11}, expected: "10,11"},
+		{name: "empty", raw: nil, expected: ""},
+		{name: "invalid", raw: "1 bad", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			numbers, err := parseCatalogAttributeNumbers(test.raw)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("expected parse error, got %v", numbers)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			parts := make([]string, len(numbers))
+			for index, number := range numbers {
+				parts[index] = strconv.Itoa(number)
+			}
+			if actual := strings.Join(parts, ","); actual != test.expected {
+				t.Fatalf("unexpected numbers: %q", actual)
+			}
+		})
+	}
+}
+
+func TestParseConstraintEnabled(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  any
+		want bool
+	}{
+		{name: "boolean true", raw: true, want: true},
+		{name: "boolean false", raw: false, want: false},
+		{name: "enabled string", raw: "E", want: true},
+		{name: "disabled string", raw: "D", want: false},
+		{name: "enabled bytes", raw: []byte("enabled"), want: true},
+		{name: "disabled bytes", raw: []byte("disabled"), want: false},
+		{name: "one", raw: int64(1), want: true},
+		{name: "zero", raw: int64(0), want: false},
+		{name: "null", raw: nil, want: true},
+		{name: "unknown", raw: "future-state", want: true},
+		{name: "not validated label defaults enabled", raw: "N", want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if actual := parseConstraintEnabled(test.raw); actual != test.want {
+				t.Fatalf("parseConstraintEnabled(%#v) = %v, want %v", test.raw, actual, test.want)
+			}
+		})
+	}
+}
+
+func TestListIndexesFallsBackWhenWithOrdinalityIsUnsupported(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "WITH ORDINALITY"):
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42601"), Message: `syntax error at or near "WITH ORDINALITY"`}
+		case strings.Contains(query, "SELECT i.relname, am.amname") && strings.Contains(query, "ix.indkey"):
+			return &valueRows{
+				columns: []string{"relname", "amname", "indisunique", "indisprimary", "indkey"},
+				rows: [][]driver.Value{
+					{"orders_customer_idx", "btree", false, false, "2 3"},
+					{"orders_pkey", "btree", true, true, []byte("1")},
+				},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname"):
+			return &valueRows{
+				columns: []string{"attnum", "attname"},
+				rows:    [][]driver.Value{{int64(1), "id"}, {int64(2), "customer_id"}, {int64(3), "created_at"}},
+			}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	for range 2 {
+		indexes, err := server.listIndexes("PUBLIC", "orders")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(indexes) != 2 || strings.Join(indexes[0].Columns, ",") != "customer_id,created_at" || strings.Join(indexes[1].Columns, ",") != "id" {
+			t.Fatalf("unexpected indexes: %#v", indexes)
+		}
+	}
+
+	var ordinalityQueries int
+	for _, query := range state.snapshotQueries() {
+		if strings.Contains(query, "WITH ORDINALITY") {
+			ordinalityQueries++
+		}
+	}
+	if ordinalityQueries != 1 || !server.indexOrdinalityUnsupported {
+		t.Fatalf("unsupported capability was not cached: queries=%v", state.snapshotQueries())
+	}
+}
+
+func TestGetColumnsUsesResolvedSchemaAcrossCatalogMetadata(t *testing.T) {
+	tests := []struct {
+		name               string
+		postgresCatalog    bool
+		requestedSchema    string
+		resolvedSchema     string
+		visibilityFunction string
+		sqlServerIdentity  bool
+	}{
+		{name: "sys catalog search path", resolvedSchema: "tenant_visible", visibilityFunction: "sys_catalog.sys_table_is_visible(c.oid)", sqlServerIdentity: true},
+		{name: "postgres catalog search path", postgresCatalog: true, resolvedSchema: "tenant_pg", visibilityFunction: "pg_catalog.pg_table_is_visible(c.oid)"},
+		{name: "explicit schema", requestedSchema: "tenant_explicit", resolvedSchema: "tenant_explicit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			catalog := "sys_catalog"
+			prefix := "sys"
+			if test.postgresCatalog {
+				catalog = "pg_catalog"
+				prefix = "pg"
+			}
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				switch {
+				case strings.Contains(query, "FROM "+catalog+"."+prefix+"_attribute a"):
+					if test.visibilityFunction != "" {
+						if !strings.Contains(query, test.visibilityFunction) {
+							return nil, fmt.Errorf("unqualified columns query did not use the catalog visibility function: %s", query)
+						}
+					} else if strings.Contains(query, "table_is_visible") || !strings.Contains(query, "n.nspname = '"+test.requestedSchema+"'") {
+						return nil, fmt.Errorf("explicit-schema columns query changed resolution behavior: %s", query)
+					}
+					return &valueRows{
+						columns: []string{"nspname", "attname", "format_type", "nullable", "default", "comment", "precision", "scale", "length", "identity"},
+						rows:    [][]driver.Value{{test.resolvedSchema, "feearea", "character varying", false, nil, nil, nil, nil, nil, nil}},
+					}, nil
+				case strings.Contains(query, "FROM information_schema.table_constraints"):
+					if !strings.Contains(query, "tc.table_schema='"+test.resolvedSchema+"'") {
+						return nil, fmt.Errorf("primary-key lookup did not use resolved schema: %s", query)
+					}
+					return &valueRows{columns: []string{"column_name"}, rows: [][]driver.Value{{"feearea"}}}, nil
+				case strings.Contains(query, "FROM sys.identity_columns"):
+					if !strings.Contains(query, "n.nspname='"+test.resolvedSchema+"'") {
+						return nil, fmt.Errorf("identity lookup did not use resolved schema: %s", query)
+					}
+					return &valueRows{columns: []string{"attname", "seed_value", "increment_value"}, rows: [][]driver.Value{{"feearea", "1", "1"}}}, nil
+				default:
+					return nil, fmt.Errorf("unexpected query: %s", query)
+				}
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+			server.mode.postgresCatalog = test.postgresCatalog
+			server.mode.sqlServerIdentity = test.sqlServerIdentity
+
+			columns, err := server.getColumns(test.requestedSchema, "m_workflow")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(columns) != 1 || columns[0].ResolvedSchema == nil || *columns[0].ResolvedSchema != test.resolvedSchema || !columns[0].IsPrimaryKey {
+				t.Fatalf("resolved relation metadata was lost: %#v", columns)
+			}
+			if test.sqlServerIdentity && (columns[0].Extra == nil || *columns[0].Extra != "IDENTITY(1,1)") {
+				t.Fatalf("identity metadata did not use the resolved relation: %#v", columns)
+			}
+		})
+	}
+}
+
+func TestListIndexesDoesNotFallbackForUnrelatedErrors(t *testing.T) {
+	expectedErr := errors.New("metadata connection reset")
+	state := &metadataDriverState{query: func(string) (driver.Rows, error) { return nil, expectedErr }}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	if _, err := server.listIndexes("PUBLIC", "orders"); !errors.Is(err, expectedErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if queries := state.snapshotQueries(); len(queries) != 1 || server.indexOrdinalityUnsupported {
+		t.Fatalf("unrelated error triggered fallback: %v", queries)
+	}
+}
+
+func TestListForeignKeysUsesCatalogForV7(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM information_schema.table_constraints tc"):
+			return nil, errors.New("V7 must not query information_schema foreign keys")
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			return &valueRows{
+				columns: []string{"conname", "conkey", "confkey", "nspname", "relname"},
+				rows:    [][]driver.Value{{"orders_customer_fkey", "2 3", "1 2", "PUBLIC", "customers"}},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'orders'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(2), "customer_id"}, {int64(3), "customer_region"}}}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'customers'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}, {int64(2), "region"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+	server.mode.legacyV7 = true
+
+	keys, err := server.listForeignKeys("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 2 || keys[0].Column != "customer_id" || keys[0].RefColumn != "id" || keys[1].Column != "customer_region" || keys[1].RefColumn != "region" {
+		t.Fatalf("unexpected foreign keys: %#v", keys)
+	}
+}
+
+func TestListForeignKeysKeepsEmptyInformationSchemaResultOnV8(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "FROM information_schema.table_constraints tc") {
+			return &valueRows{columns: []string{"constraint_name", "column_name", "table_name", "column_name"}}, nil
+		}
+		return nil, errors.New("V8 empty result must not trigger a catalog query: " + query)
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	keys, err := server.listForeignKeys("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 || len(state.snapshotQueries()) != 1 {
+		t.Fatalf("unexpected foreign keys or query count: keys=%#v queries=%v", keys, state.snapshotQueries())
+	}
+}
+
+func TestListConstraintsResolvesColumnsAndForeignKeyDetails(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "convalidated", "constatus"},
+				rows: [][]driver.Value{
+					{"orders_amount_check", "c", "CHECK (amount > 0)", "{4}", nil, nil, nil, " ", " ", " ", false, false, []byte("f"), []byte("D")},
+					{"orders_customer_fkey", "f", "FOREIGN KEY (customer_id, customer_region) REFERENCES customers(id, region) ON DELETE CASCADE", "{2,3}", "PUBLIC", "customers", "{1,2}", "s", "a", "c", true, true, "t", "E"},
+				},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'orders'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(2), "customer_id"}, {int64(3), "customer_region"}, {int64(4), "amount"}}}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'customers'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}, {int64(2), "region"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 2 {
+		t.Fatalf("unexpected constraints: %#v", constraints)
+	}
+	check, foreignKey := constraints[0], constraints[1]
+	if check.ConstraintType != "CHECK" || !equalStringSlices(check.Columns, []string{"amount"}) || check.Valid || check.Enabled {
+		t.Fatalf("unexpected check constraint: %#v", check)
+	}
+	if foreignKey.ConstraintType != "FOREIGN KEY" || !foreignKey.Valid || !foreignKey.Enabled || !equalStringSlices(foreignKey.Columns, []string{"customer_id", "customer_region"}) || !equalStringSlices(foreignKey.RefColumns, []string{"id", "region"}) {
+		t.Fatalf("unexpected foreign key columns: %#v", foreignKey)
+	}
+	if foreignKey.RefSchema == nil || *foreignKey.RefSchema != "PUBLIC" || foreignKey.RefTable == nil || *foreignKey.RefTable != "customers" || foreignKey.MatchType == nil || *foreignKey.MatchType != "SIMPLE" || foreignKey.OnUpdate == nil || *foreignKey.OnUpdate != "NO ACTION" || foreignKey.OnDelete == nil || *foreignKey.OnDelete != "CASCADE" || !foreignKey.Deferrable || !foreignKey.InitiallyDeferred {
+		t.Fatalf("unexpected foreign key details: %#v", foreignKey)
+	}
+	queries := strings.Join(state.snapshotQueries(), "\n")
+	if !strings.Contains(queries, "sys_catalog.sys_get_constraintdef") {
+		t.Fatalf("constraints must use the active catalog deparser: %s", queries)
+	}
+}
+
+func TestKingbaseConstraintQueryHasLegacyV7Fallback(t *testing.T) {
+	modern := kingbaseConstraintsQuery("sys_catalog", "sys", "public", "orders", false, false, false)
+	if !strings.Contains(modern, "sys_catalog.sys_get_constraintdef") || !strings.Contains(modern, "c.convalidated") || !strings.Contains(modern, "COALESCE(c.conname, '')") {
+		t.Fatalf("modern constraint query missing metadata fields: %s", modern)
+	}
+	if !strings.Contains(modern, "COALESCE(CAST(c.convalidated AS text), 'T')") {
+		t.Fatalf("modern constraint query must normalize convalidated to text: %s", modern)
+	}
+	if !strings.Contains(modern, "COALESCE(CAST(c.constatus AS text), 'E')") {
+		t.Fatalf("modern constraint query must normalize constatus to text: %s", modern)
+	}
+	legacy := kingbaseConstraintsQuery("sys_catalog", "sys", "public", "orders", true, true, true)
+	if strings.Contains(legacy, "sys_get_constraintdef") || strings.Contains(legacy, "c.convalidated") || !strings.Contains(legacy, "''") || !strings.Contains(legacy, "COALESCE(c.conname, '')") {
+		t.Fatalf("legacy V7 constraint query is not safe: %s", legacy)
+	}
+}
+
+func TestListConstraintsFallsBackWhenValidatedColumnIsUnsupported(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "c.convalidated") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "column c.convalidated does not exist"}
+		}
+		if strings.Contains(query, "FROM sys_catalog.sys_constraint c") {
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "valid", "enabled"},
+				rows:    [][]driver.Value{{"orders_pkey", "p", "PRIMARY KEY (id)", "{1}", nil, nil, nil, nil, nil, nil, false, false, true, true}},
+			}, nil
+		}
+		if strings.Contains(query, "SELECT a.attnum, a.attname") {
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}}}, nil
+		}
+		return nil, errors.New("unexpected query: " + query)
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 1 || constraints[0].Definition != "PRIMARY KEY (id)" || !constraints[0].Valid {
+		t.Fatalf("unexpected fallback constraints: %#v", constraints)
+	}
+	if !server.constraintValidatedUnsupported {
+		t.Fatal("validated-column fallback was not cached")
+	}
+	if len(state.snapshotQueries()) != 3 {
+		t.Fatalf("expected failed modern query, fallback query and attribute query: %v", state.snapshotQueries())
+	}
+
+	if _, err := server.listConstraints("PUBLIC", "orders"); err != nil {
+		t.Fatal(err)
+	}
+	queries := state.snapshotQueries()
+	for _, query := range queries[3:] {
+		if strings.Contains(query, "c.convalidated") {
+			t.Fatalf("cached fallback queried unsupported convalidated column: %s", query)
+		}
+	}
+}
+
+func TestListConstraintsLegacyV7KeepsStructuralMetadata(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			if strings.Contains(query, "c.convalidated") {
+				return nil, errors.New("V7 query used unsupported constraint metadata: " + query)
+			}
+			if strings.Contains(query, "sys_get_constraintdef") {
+				return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function sys_get_constraintdef does not exist"}
+			}
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "valid", "enabled"},
+				rows:    [][]driver.Value{{"orders_pkey", "p", "", "[1]", nil, nil, nil, nil, nil, nil, false, false, true, true}},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+	server.mode.legacyV7 = true
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 1 || constraints[0].Name != "orders_pkey" || constraints[0].Definition != "" || !constraints[0].Valid || !equalStringSlices(constraints[0].Columns, []string{"id"}) || !server.constraintDefinitionUnsupported {
+		t.Fatalf("unexpected V7 constraints: %#v", constraints)
+	}
+}
+
+func TestListConstraintsLegacyV7UsesSupportedDeparser(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			if !strings.Contains(query, "sys_catalog.sys_get_constraintdef") || strings.Contains(query, "COALESCE(CAST(c.convalidated AS text)") || strings.Contains(query, "c.constatus") {
+				return nil, errors.New("unexpected V7 constraint query: " + query)
+			}
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "valid", "enabled"},
+				rows:    [][]driver.Value{{"orders_pkey", "p", "PRIMARY KEY (id)", "[1]", nil, nil, nil, nil, nil, nil, false, false, true, "E"}},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+	server.mode.legacyV7 = true
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 1 || constraints[0].Definition != "PRIMARY KEY (id)" || !constraints[0].Enabled || server.constraintDefinitionUnsupported {
+		t.Fatalf("unexpected V7 constraints: %#v", constraints)
+	}
+}
+
+func TestKingbaseConstraintQueryUsesPostgresCatalog(t *testing.T) {
+	query := kingbaseConstraintsQuery("pg_catalog", "pg", "public", "orders", false, false, false)
+	if !strings.Contains(query, "pg_catalog.pg_get_constraintdef") || strings.Contains(query, "sys_get_constraintdef") {
+		t.Fatalf("PostgreSQL catalog query used the wrong deparser: %s", query)
+	}
+	if !strings.Contains(query, "FROM pg_catalog.pg_constraint") || !strings.Contains(query, "pg_catalog.pg_namespace") {
+		t.Fatalf("PostgreSQL catalog query used the wrong catalog tables: %s", query)
+	}
+}
+
+func TestListConstraintsHandlesNullAttributeVectors(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "valid", "enabled"},
+				rows:    [][]driver.Value{{"table_check", "c", "CHECK (true)", nil, nil, nil, nil, nil, nil, nil, false, false, true, true}},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname"):
+			return &valueRows{columns: []string{"attnum", "attname"}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(constraints) != 1 || len(constraints[0].Columns) != 0 || len(constraints[0].RefColumns) != 0 {
+		t.Fatalf("NULL attribute vectors should decode as empty lists: %#v", constraints)
+	}
+}
+
+func TestListConstraintsCachesReferencedAttributes(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "FROM sys_catalog.sys_constraint c"):
+			return &valueRows{
+				columns: []string{"conname", "contype", "definition", "conkey", "ref_schema", "ref_table", "confkey", "match_type", "on_update", "on_delete", "condeferrable", "condeferred", "valid", "enabled"},
+				rows: [][]driver.Value{
+					{"orders_customer_fkey", "f", "FOREIGN KEY (customer_id) REFERENCES customers(id)", "{2}", "PUBLIC", "customers", "{1}", "s", "a", "a", false, false, true, true},
+					{"orders_region_fkey", "f", "FOREIGN KEY (customer_region) REFERENCES customers(region)", "{3}", "PUBLIC", "customers", "{2}", "s", "a", "a", false, false, true, true},
+				},
+			}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'orders'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(2), "customer_id"}, {int64(3), "customer_region"}}}, nil
+		case strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'customers'"):
+			return &valueRows{columns: []string{"attnum", "attname"}, rows: [][]driver.Value{{int64(1), "id"}, {int64(2), "region"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	constraints, err := server.listConstraints("PUBLIC", "orders")
+	if err != nil || len(constraints) != 2 {
+		t.Fatalf("unexpected constraints: %v %#v", err, constraints)
+	}
+	var referencedAttributeQueries int
+	for _, query := range state.snapshotQueries() {
+		if strings.Contains(query, "SELECT a.attnum, a.attname") && strings.Contains(query, "c.relname = 'customers'") {
+			referencedAttributeQueries++
+		}
+	}
+	if referencedAttributeQueries != 1 {
+		t.Fatalf("referenced relation attributes were not cached: %v", state.snapshotQueries())
+	}
+}
+
+func TestKingbaseConstraintLabels(t *testing.T) {
+	for input, expected := range map[string]string{"p": "PRIMARY KEY", "f": "FOREIGN KEY", "u": "UNIQUE", "c": "CHECK", "t": "CONSTRAINT TRIGGER", "x": "EXCLUDE", "n": "NOT NULL", "custom": "custom"} {
+		if actual := kingbaseConstraintTypeName(input); actual != expected {
+			t.Fatalf("type %q: expected %q, got %q", input, expected, actual)
+		}
+	}
+	for input, expected := range map[string]string{"a": "NO ACTION", "r": "RESTRICT", "c": "CASCADE", "n": "SET NULL", "d": "SET DEFAULT"} {
+		actual := kingbaseConstraintAction(sql.NullString{String: input, Valid: true})
+		if actual == nil || *actual != expected {
+			t.Fatalf("action %q: expected %q, got %v", input, expected, actual)
+		}
+	}
+}
+
+func TestKingbaseV7VersionPattern(t *testing.T) {
+	for _, test := range []struct {
+		version string
+		v7      bool
+	}{
+		{version: "Kingbase V007R001C002B0014", v7: true},
+		{version: "KingbaseES V008R006C008B0014"},
+		{version: "PostgreSQL 12.1"},
+	} {
+		match := kingbaseReleasePattern.FindStringSubmatch(test.version)
+		actual := false
+		if len(match) == 2 {
+			major, err := strconv.Atoi(match[1])
+			actual = err == nil && major == 7
+		}
+		if actual != test.v7 {
+			t.Fatalf("version=%q: expected v7=%v, got %v", test.version, test.v7, actual)
+		}
 	}
 }
 
@@ -968,6 +1917,87 @@ func TestKingbaseCatalogFunctionsFollowMetadataMode(t *testing.T) {
 				t.Fatalf("catalog functions do not match metadata mode: %v", queries)
 			}
 		})
+	}
+}
+
+func TestListTriggerDefinitionsFallsBackToSingleArgument(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "sys_get_triggerdef(tg.oid, true)") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function SYS_CATALOG.SYS_GET_TRIGGERDEF(OID, BOOLEAN) does not exist"}
+		}
+		if strings.Contains(query, "tg.tgisinternal") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "column TG.TGISINTERNAL does not exist"}
+		}
+		if strings.Contains(query, "sys_get_triggerdef(tg.oid)") {
+			if !strings.Contains(query, "tg.tgkind <> 'c'") {
+				return nil, errors.New("V7 trigger query did not exclude constraint triggers: " + query)
+			}
+			return &valueRows{columns: []string{"definition"}, rows: [][]driver.Value{{"CREATE TRIGGER orders_audit ..."}}}, nil
+		}
+		return nil, errors.New("unexpected query: " + query)
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	for range 2 {
+		definitions, err := server.listTriggerDefinitions("PUBLIC", "orders")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(definitions) != 1 || definitions[0] != "CREATE TRIGGER orders_audit ..." {
+			t.Fatalf("unexpected definitions: %#v", definitions)
+		}
+	}
+
+	var prettyQueries int
+	for _, query := range state.snapshotQueries() {
+		if strings.Contains(query, "tg.oid, true") {
+			prettyQueries++
+		}
+	}
+	if prettyQueries != 1 || !server.triggerPrettyUnsupported || !server.triggerInternalUnsupported {
+		t.Fatalf("unsupported signature was not cached: %v", state.snapshotQueries())
+	}
+}
+
+func TestListTriggersFallsBackToV7InternalPredicate(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "tg.tgisinternal") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "column TG.TGISINTERNAL does not exist"}
+		}
+		if strings.Contains(query, "tg.tgkind <> 'c'") {
+			return &valueRows{columns: []string{"tgname", "events", "tgtype"}, rows: [][]driver.Value{{"orders_audit", "INSERT", int64(7)}}}, nil
+		}
+		return nil, errors.New("unexpected query: " + query)
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	for range 2 {
+		triggers, err := server.listTriggers("PUBLIC", "orders")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(triggers) != 1 || triggers[0].Name != "orders_audit" {
+			t.Fatalf("unexpected triggers: %#v", triggers)
+		}
+	}
+	if queries := state.snapshotQueries(); len(queries) != 3 || !server.triggerInternalUnsupported {
+		t.Fatalf("unsupported column was not cached: %v", queries)
+	}
+}
+
+func TestListTriggerDefinitionsDoesNotFallbackForUnrelatedErrors(t *testing.T) {
+	expectedErr := errors.New("permission denied for sys_trigger")
+	state := &metadataDriverState{query: func(string) (driver.Rows, error) { return nil, expectedErr }}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	if _, err := server.listTriggerDefinitions("PUBLIC", "orders"); !errors.Is(err, expectedErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if queries := state.snapshotQueries(); len(queries) != 1 || server.triggerPrettyUnsupported || server.triggerInternalUnsupported {
+		t.Fatalf("unrelated error triggered fallback: %v", queries)
 	}
 }
 
@@ -1084,31 +2114,151 @@ func TestListDatabasesFallsBackToPostgresCatalog(t *testing.T) {
 }
 
 func TestListTablesPreservesKingbaseObjectTypesAndComments(t *testing.T) {
+	tests := []struct {
+		name            string
+		postgresCatalog bool
+		mysqlCompat     bool
+		wantCatalog     string
+	}{
+		{name: "modern system catalog", wantCatalog: "sys_catalog.sys_class c"},
+		{name: "PostgreSQL catalog", postgresCatalog: true, wantCatalog: "pg_catalog.pg_class c"},
+		{name: "MySQL compatibility mode", mysqlCompat: true, wantCatalog: "sys_catalog.sys_class c"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				if !strings.Contains(query, "FROM "+test.wantCatalog) || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") || !strings.Contains(query, "obj_description(c.oid)") {
+					return nil, errors.New("unexpected query: " + query)
+				}
+				return &valueRows{
+					columns: []string{"relname", "relkind", "comment"},
+					rows: [][]driver.Value{
+						{"orders", "TABLE", "orders table"},
+						{"sales_view", "VIEW", nil},
+						{"sales_cache", "MATERIALIZED_VIEW", "cached sales"},
+					},
+				}, nil
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+			server.mode.postgresCatalog = test.postgresCatalog
+			server.mode.mysqlCompat = test.mysqlCompat
+
+			tables, err := server.listTables("public", metadataListConstraints{Filter: "sales", ObjectTypes: []string{"VIEW", "MATERIALIZED_VIEW"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tables) != 2 || tables[0].TableType != "VIEW" || tables[1].TableType != "MATERIALIZED_VIEW" {
+				t.Fatalf("unexpected tables: %#v", tables)
+			}
+			if tables[1].Comment == nil || *tables[1].Comment != "cached sales" {
+				t.Fatalf("materialized view comment was lost: %#v", tables[1])
+			}
+			if queries := state.snapshotQueries(); len(queries) != 1 {
+				t.Fatalf("supported catalog must use one request, got %d: %v", len(queries), queries)
+			}
+		})
+	}
+}
+
+func TestListTablesCachesMissingCatalogOIDCapability(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		postgresCatalog bool
+		wantCatalog     string
+	}{
+		{name: "system catalog", wantCatalog: "sys_catalog.sys_class c"},
+		{name: "PostgreSQL catalog", postgresCatalog: true, wantCatalog: "pg_catalog.pg_class c"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				if !strings.Contains(query, "FROM "+test.wantCatalog) {
+					return nil, errors.New("fallback changed catalog: " + query)
+				}
+				if strings.Contains(query, "c.oid") {
+					return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "kb: column c.oid does not exist"}
+				}
+				if !strings.Contains(query, "NULL AS table_comment") {
+					return nil, errors.New("fallback must return a NULL comment: " + query)
+				}
+				return &valueRows{
+					columns: []string{"relname", "relkind", "table_comment"},
+					rows:    [][]driver.Value{{"orders", "TABLE", nil}},
+				}, nil
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+			server.mode.postgresCatalog = test.postgresCatalog
+
+			for call := 0; call < 2; call++ {
+				tables, err := server.listTables("public", metadataListConstraints{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(tables) != 1 || tables[0].Name != "orders" || tables[0].Comment != nil {
+					t.Fatalf("unexpected fallback result: %#v", tables)
+				}
+			}
+
+			queries := state.snapshotQueries()
+			if len(queries) != 3 {
+				t.Fatalf("missing OID must be probed only once, got %d queries: %v", len(queries), queries)
+			}
+			if !strings.Contains(queries[0], "c.oid") || strings.Contains(queries[1], "c.oid") || strings.Contains(queries[2], "c.oid") {
+				t.Fatalf("unexpected capability fallback sequence: %v", queries)
+			}
+		})
+	}
+}
+
+func TestTableCommentCachesMissingCatalogOIDCapability(t *testing.T) {
 	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
-		if !strings.Contains(query, "FROM sys_catalog.sys_class c") || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") {
-			return nil, errors.New("unexpected query: " + query)
-		}
-		return &valueRows{
-			columns: []string{"relname", "relkind", "comment"},
-			rows: [][]driver.Value{
-				{"orders", "TABLE", "orders table"},
-				{"sales_view", "VIEW", nil},
-				{"sales_cache", "MATERIALIZED_VIEW", "cached sales"},
-			},
-		}, nil
+		return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "kb: column c.oid does not exist"}
 	}}
 	server := newServer()
 	server.db = openMetadataDB(t, state)
 
-	tables, err := server.listTables("public", metadataListConstraints{Filter: "sales", ObjectTypes: []string{"VIEW", "MATERIALIZED_VIEW"}})
-	if err != nil {
-		t.Fatal(err)
+	comment, err := server.getTableComment("public", "orders")
+	if err != nil || comment != nil {
+		t.Fatalf("missing OID comment must degrade to nil: comment=%v err=%v", comment, err)
 	}
-	if len(tables) != 2 || tables[0].TableType != "VIEW" || tables[1].TableType != "MATERIALIZED_VIEW" {
-		t.Fatalf("unexpected tables: %#v", tables)
+	comment, err = server.getTableComment("", "events")
+	if err != nil || comment != nil {
+		t.Fatalf("cached missing OID comment must return nil: comment=%v err=%v", comment, err)
 	}
-	if tables[1].Comment == nil || *tables[1].Comment != "cached sales" {
-		t.Fatalf("materialized view comment was lost: %#v", tables[1])
+	if queries := state.snapshotQueries(); len(queries) != 1 {
+		t.Fatalf("cached capability must avoid all later comment requests, got %d: %v", len(queries), queries)
+	}
+}
+
+func TestTableOIDFallbackRejectsUnrelatedErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "different missing column", err: &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "kb: column c.other_column does not exist"}},
+		{name: "connection error", err: errors.New("metadata connection reset")},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				return nil, test.err
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+
+			if _, err := server.listTables("public", metadataListConstraints{}); !errors.Is(err, test.err) {
+				t.Fatalf("listTables swallowed unrelated error: %v", err)
+			}
+			if _, err := server.getTableComment("public", "orders"); !errors.Is(err, test.err) {
+				t.Fatalf("getTableComment swallowed unrelated error: %v", err)
+			}
+			if queries := state.snapshotQueries(); len(queries) != 2 {
+				t.Fatalf("unrelated errors must not trigger retries, got %d: %v", len(queries), queries)
+			}
+		})
 	}
 }
 
@@ -1428,6 +2578,86 @@ func TestListObjectsUsesCatalogRoutinesOutsideMySQLCompat(t *testing.T) {
 	}
 }
 
+func TestListObjectsOnlyTriggersWithParentIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mode    kingbaseMode
+		catalog string
+		prefix  string
+	}{
+		{name: "sys catalog", catalog: "sys_catalog", prefix: "sys"},
+		{name: "pg catalog", mode: kingbaseMode{postgresCatalog: true}, catalog: "pg_catalog", prefix: "pg"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				triggerTable := test.catalog + "." + test.prefix + "_trigger"
+				if !strings.Contains(query, "FROM "+triggerTable+" tg") || !strings.Contains(query, "NOT tg.tgisinternal") {
+					return nil, errors.New("trigger-only request issued an unexpected query: " + query)
+				}
+				if !strings.Contains(query, test.catalog+"."+test.prefix+"_description") || !strings.Contains(query, "n.nspname = 'team''s'") {
+					return nil, errors.New("trigger query lost comment or quoted schema metadata: " + query)
+				}
+				return &valueRows{
+					columns: []string{"tgname", "relname", "description"},
+					rows: [][]driver.Value{
+						{"audit_before", "items", "items audit"},
+						{"audit_before", "orders", nil},
+					},
+				}, nil
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+			server.mode = test.mode
+
+			objects, err := server.listObjects("team's", metadataListConstraints{ObjectTypes: []string{"TRIGGER"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(objects) != 2 {
+				t.Fatalf("expected both table-scoped triggers, got %#v", objects)
+			}
+			for index, parent := range []string{"items", "orders"} {
+				object := objects[index]
+				if object.Name != "audit_before" || object.ObjectType != "TRIGGER" || object.Schema != "team's" || object.ParentSchema == nil || *object.ParentSchema != "team's" || object.ParentName == nil || *object.ParentName != parent {
+					t.Fatalf("unexpected trigger object at %d: %#v", index, object)
+				}
+			}
+			if queries := state.snapshotQueries(); len(queries) != 1 {
+				t.Fatalf("trigger-only request must use one bounded catalog query: %v", queries)
+			}
+			constraints := metadataListConstraints{ObjectTypes: []string{"TRIGGER"}}
+			if constraintsAllowsTableLike(constraints) || constraintsAllowRoutines(constraints) || constraintsAllowTypes(constraints) || !constraintsAllowTriggers(constraints) {
+				t.Fatalf("trigger-only constraint leaked into another object family: %#v", constraints)
+			}
+		})
+	}
+}
+
+func TestListObjectsTriggerFallbackExcludesConstraintTriggers(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "tg.tgisinternal") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "column TG.TGISINTERNAL does not exist"}
+		}
+		if !strings.Contains(query, "tg.tgkind <> 'c'") {
+			return nil, errors.New("legacy trigger query did not exclude constraint triggers: " + query)
+		}
+		return &valueRows{
+			columns: []string{"tgname", "relname", "description"},
+			rows:    [][]driver.Value{{"audit_before", "orders", nil}},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	objects, err := server.listObjects("public", metadataListConstraints{ObjectTypes: []string{"TRIGGER"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 1 || objects[0].ParentName == nil || *objects[0].ParentName != "orders" || !server.triggerInternalUnsupported {
+		t.Fatalf("unexpected legacy trigger objects: %#v", objects)
+	}
+}
+
 func TestListObjectsKeepsTablesWhenMySQLCompatRoutineQueryFails(t *testing.T) {
 	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
 		switch {
@@ -1671,7 +2901,7 @@ func TestKingbaseDomainConstraintReadFailuresMarkDDLIncomplete(t *testing.T) {
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "domain constraints could not be decoded") {
 		t.Fatalf("constraint scan failures must be retained as warnings: %v", warnings)
 	}
-	ddl := buildCustomTypeDDL("app", "email", customTypeKindDomain, sql.NullString{}, &[]customTypeMember{}, &properties, warnings)
+	ddl := server.buildCustomTypeDDL("app", "email", customTypeKindDomain, sql.NullString{}, &[]customTypeMember{}, &properties, warnings)
 	if ddl.Complete {
 		t.Fatalf("domain DDL must be incomplete after a constraint scan failure: %+v", ddl)
 	}
@@ -1729,12 +2959,13 @@ func TestKingbaseSystemSchemasAreRejectedForCustomTypeDetails(t *testing.T) {
 }
 
 func TestKingbaseCustomTypeDDL(t *testing.T) {
+	srv := newServer()
 	nullInput := sql.NullString{}
 	enumMembers := []customTypeMember{
 		{Ordinal: 1, EnumValue: stringPtr("draft")},
 		{Ordinal: 2, EnumValue: stringPtr("已归档")},
 	}
-	enumDDL := buildCustomTypeDDL("app", "status", customTypeKindEnum, nullInput, &enumMembers, &customTypeProperties{}, nil)
+	enumDDL := srv.buildCustomTypeDDL("app", "status", customTypeKindEnum, nullInput, &enumMembers, &customTypeProperties{}, nil)
 	if enumDDL.SQL != "CREATE TYPE \"app\".\"status\" AS ENUM ('draft', '已归档');" || !enumDDL.Complete {
 		t.Fatalf("unexpected enum DDL: %+v", enumDDL)
 	}
@@ -1742,34 +2973,34 @@ func TestKingbaseCustomTypeDDL(t *testing.T) {
 	compositeMembers := []customTypeMember{
 		{Name: "city", DataType: "text", Ordinal: 1, Comment: stringPtr("city name")},
 	}
-	compositeDDL := buildCustomTypeDDL("app", "address", customTypeKindComposite, nullInput, &compositeMembers, &customTypeProperties{}, nil)
+	compositeDDL := srv.buildCustomTypeDDL("app", "address", customTypeKindComposite, nullInput, &compositeMembers, &customTypeProperties{}, nil)
 	if !strings.Contains(compositeDDL.SQL, "\"city\" text") || !strings.Contains(compositeDDL.SQL, "COMMENT ON COLUMN \"app\".\"address\".\"city\" IS 'city name';") {
 		t.Fatalf("unexpected composite DDL: %+v", compositeDDL)
 	}
 
 	notNull := true
 	domainProps := customTypeProperties{BaseType: stringPtr("text"), NotNull: &notNull, DomainConstraints: []customTypeDomainConstraint{{Name: "email_valid", Definition: "CHECK ((VALUE <> ''::text))"}}}
-	domainDDL := buildCustomTypeDDL("app", "email", customTypeKindDomain, nullInput, &[]customTypeMember{}, &domainProps, nil)
+	domainDDL := srv.buildCustomTypeDDL("app", "email", customTypeKindDomain, nullInput, &[]customTypeMember{}, &domainProps, nil)
 	if !strings.Contains(domainDDL.SQL, "CREATE DOMAIN \"app\".\"email\" AS text") || !strings.Contains(domainDDL.SQL, "NOT NULL") || !strings.Contains(domainDDL.SQL, "CHECK ((VALUE <> ''::text))") {
 		t.Fatalf("unexpected domain DDL: %+v", domainDDL)
 	}
 
 	rangeProps := customTypeProperties{RangeSubtype: stringPtr("numeric"), RangeCanonicalFunction: stringPtr("\"extensions\".\"numeric_range_canonical\"")}
-	rangeDDL := buildCustomTypeDDL("app", "price_range", customTypeKindRange, nullInput, &[]customTypeMember{}, &rangeProps, nil)
+	rangeDDL := srv.buildCustomTypeDDL("app", "price_range", customTypeKindRange, nullInput, &[]customTypeMember{}, &rangeProps, nil)
 	if !rangeDDL.Complete || !strings.Contains(rangeDDL.SQL, "subtype = numeric") || !strings.Contains(rangeDDL.SQL, "canonical = \"extensions\".\"numeric_range_canonical\"") {
 		t.Fatalf("unexpected range DDL: %+v", rangeDDL)
 	}
-	missingSubtype := buildCustomTypeDDL("app", "price_range", customTypeKindRange, nullInput, &[]customTypeMember{}, &customTypeProperties{RangeMultirangeName: stringPtr("price_multirange")}, nil)
+	missingSubtype := srv.buildCustomTypeDDL("app", "price_range", customTypeKindRange, nullInput, &[]customTypeMember{}, &customTypeProperties{RangeMultirangeName: stringPtr("price_multirange")}, nil)
 	if missingSubtype.Complete || missingSubtype.SQL != "CREATE TYPE \"app\".\"price_range\" AS RANGE (subtype = unknown);" {
 		t.Fatalf("range DDL without subtype must be incomplete: %+v", missingSubtype)
 	}
 
-	multirangeDDL := buildCustomTypeDDL("app", "_price_range", customTypeKindMultirange, nullInput, &[]customTypeMember{}, &customTypeProperties{}, nil)
+	multirangeDDL := srv.buildCustomTypeDDL("app", "_price_range", customTypeKindMultirange, nullInput, &[]customTypeMember{}, &customTypeProperties{}, nil)
 	if multirangeDDL.Complete || len(multirangeDDL.Warnings) == 0 {
 		t.Fatalf("multirange DDL must be incomplete with warnings: %+v", multirangeDDL)
 	}
 
-	baseDDL := buildCustomTypeDDL("app", "point2d", customTypeKindBase, nullInput, &[]customTypeMember{}, &customTypeProperties{}, nil)
+	baseDDL := srv.buildCustomTypeDDL("app", "point2d", customTypeKindBase, nullInput, &[]customTypeMember{}, &customTypeProperties{}, nil)
 	if baseDDL.Complete || len(baseDDL.Warnings) == 0 {
 		t.Fatalf("base DDL must be incomplete with warnings: %+v", baseDDL)
 	}
@@ -1830,6 +3061,273 @@ func TestRoutineSourceUsesKingbaseCatalogFunction(t *testing.T) {
 	}
 	if !strings.HasPrefix(source["source"].(string), "CREATE FUNCTION public.format_name()") {
 		t.Fatalf("unexpected routine source: %#v", source)
+	}
+}
+
+func TestMaterializedViewSourceFallsBackFromEmptySysDefinition(t *testing.T) {
+	tests := []struct {
+		name        string
+		primaryRows [][]driver.Value
+	}{
+		{name: "blank definition", primaryRows: [][]driver.Value{{"  \n"}}},
+		{name: "missing definition", primaryRows: [][]driver.Value{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const expected = "SELECT product_id, sum(amount) FROM public.sales GROUP BY product_id"
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				switch {
+				case strings.Contains(query, "sys_get_viewdef("):
+					return &valueRows{columns: []string{"source"}, rows: test.primaryRows}, nil
+				case strings.Contains(query, "pg_get_viewdef("):
+					return &valueRows{columns: []string{"source"}, rows: [][]driver.Value{{expected}}}, nil
+				default:
+					return nil, errors.New("unexpected query: " + query)
+				}
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+
+			source, err := server.getObjectSource("public", "daily_sales", "MATERIALIZED_VIEW")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if source["source"] != expected {
+				t.Fatalf("unexpected materialized view source: %#v", source)
+			}
+			queries := state.snapshotQueries()
+			if len(queries) != 2 || !strings.Contains(queries[0], "sys_get_viewdef(") || !strings.Contains(queries[1], "pg_get_viewdef(") {
+				t.Fatalf("unexpected materialized view source fallback: %v", queries)
+			}
+			for _, query := range queries {
+				if !strings.Contains(query, "c.relkind = 'm'") {
+					t.Fatalf("materialized view query was not constrained by relation kind: %s", query)
+				}
+			}
+			if server.usePgViewDefinition {
+				t.Fatal("an empty definition for one materialized view must not change the ordinary-view function cache")
+			}
+		})
+	}
+}
+
+func TestMaterializedViewSourceRejectsEmptyDefinitionAfterFallback(t *testing.T) {
+	tests := []struct {
+		name string
+		rows [][]driver.Value
+	}{
+		{name: "blank definitions", rows: [][]driver.Value{{"\t"}}},
+		{name: "missing definitions", rows: [][]driver.Value{}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				if strings.Contains(query, "sys_get_viewdef(") || strings.Contains(query, "pg_get_viewdef(") {
+					return &valueRows{columns: []string{"source"}, rows: test.rows}, nil
+				}
+				return nil, errors.New("unexpected query: " + query)
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+
+			_, err := server.getObjectSource("public", "daily_sales", "MATERIALIZED_VIEW")
+			if err == nil || !strings.Contains(err.Error(), "materialized view") || !strings.Contains(err.Error(), "empty source") {
+				t.Fatalf("empty materialized view definitions must fail explicitly: %v", err)
+			}
+			if queries := state.snapshotQueries(); len(queries) != 2 {
+				t.Fatalf("expected the bounded sys/pg definition probes, got %v", queries)
+			}
+			if server.usePgViewDefinition {
+				t.Fatal("empty definitions must not change the ordinary-view function cache")
+			}
+		})
+	}
+}
+
+func TestMySQLCompatViewAndMaterializedViewSourcesUseSeparateCatalogs(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "information_schema.views") && strings.Contains(query, "table_name = 'active_orders'"):
+			return &valueRows{columns: []string{"view_definition"}, rows: [][]driver.Value{{"SELECT * FROM orders WHERE active"}}}, nil
+		case strings.Contains(query, "information_schema.views"):
+			return nil, errors.New("materialized views must not be read from information_schema.views: " + query)
+		case strings.Contains(query, "sys_get_viewdef(") && strings.Contains(query, "c.relkind = 'm'"):
+			return &valueRows{columns: []string{"source"}, rows: [][]driver.Value{{"SELECT product_id, sum(amount) FROM sales GROUP BY product_id"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+	server.mode.mysqlCompat = true
+
+	view, err := server.getObjectSource("app", "active_orders", "VIEW")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view["source"] != "SELECT * FROM orders WHERE active" {
+		t.Fatalf("unexpected ordinary view source: %#v", view)
+	}
+	materialized, err := server.getObjectSource("app", "daily_sales", "MATERIALIZED_VIEW")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(fmt.Sprint(materialized["source"]), "SELECT product_id") {
+		t.Fatalf("unexpected materialized view source: %#v", materialized)
+	}
+	queries := state.snapshotQueries()
+	if len(queries) != 2 || !strings.Contains(queries[0], "information_schema.views") || !strings.Contains(queries[1], "sys_get_viewdef(") {
+		t.Fatalf("view kinds used the wrong metadata paths: %v", queries)
+	}
+}
+
+func TestMaterializedViewSourceUsesPostgresCatalogDirectly(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if !strings.Contains(query, "SELECT pg_get_viewdef(c.oid)") ||
+			!strings.Contains(query, "FROM pg_catalog.pg_class") ||
+			!strings.Contains(query, "c.relkind = 'm'") {
+			return nil, errors.New("unexpected query: " + query)
+		}
+		return &valueRows{columns: []string{"source"}, rows: [][]driver.Value{{"SELECT * FROM public.sales"}}}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+	server.mode.postgresCatalog = true
+
+	source, err := server.getObjectSource("public", "daily_sales", "MATERIALIZED_VIEW")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source["source"] != "SELECT * FROM public.sales" {
+		t.Fatalf("unexpected materialized view source: %#v", source)
+	}
+	if queries := state.snapshotQueries(); len(queries) != 1 {
+		t.Fatalf("PostgreSQL catalog mode must use one direct pg_get_viewdef query: %v", queries)
+	}
+}
+
+func TestMaterializedViewUndefinedSysFunctionKeepsPgDefinitionCache(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "sys_get_viewdef("):
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function sys_get_viewdef(oid) does not exist"}
+		case strings.Contains(query, "pg_get_viewdef("):
+			return &valueRows{columns: []string{"source"}, rows: [][]driver.Value{{"SELECT * FROM public.sales"}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	if _, err := server.getObjectSource("public", "daily_sales", "MATERIALIZED_VIEW"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.getObjectSource("public", "active_sales", "VIEW"); err != nil {
+		t.Fatal(err)
+	}
+	queries := state.snapshotQueries()
+	if len(queries) != 3 || !strings.Contains(queries[0], "sys_get_viewdef(") ||
+		!strings.Contains(queries[1], "pg_get_viewdef(") || !strings.Contains(queries[2], "pg_get_viewdef(") ||
+		!server.usePgViewDefinition {
+		t.Fatalf("undefined sys_get_viewdef fallback cache changed: %v", queries)
+	}
+}
+
+func TestMaterializedViewSourceDoesNotFallbackOnUnrelatedErrors(t *testing.T) {
+	permissionErr := errors.New("permission denied for sys_class")
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "sys_get_viewdef(") {
+			return nil, permissionErr
+		}
+		return nil, errors.New("unexpected fallback query: " + query)
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	_, err := server.getObjectSource("public", "daily_sales", "MATERIALIZED_VIEW")
+	if !errors.Is(err, permissionErr) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if queries := state.snapshotQueries(); len(queries) != 1 || !strings.Contains(queries[0], "sys_get_viewdef(") {
+		t.Fatalf("unrelated error triggered a fallback: %v", queries)
+	}
+}
+
+func TestViewSourceUsesSysDefinitionOnce(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if !strings.Contains(query, "SELECT sys_get_viewdef(c.oid)") || !strings.Contains(query, "FROM sys_catalog.sys_class") {
+			return nil, errors.New("unexpected query: " + query)
+		}
+		return &valueRows{columns: []string{"source"}, rows: [][]driver.Value{{"SELECT * FROM public.orders WHERE active"}}}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	source, err := server.getObjectSource("public", "active_orders", "VIEW")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if source["source"] != "SELECT * FROM public.orders WHERE active" {
+		t.Fatalf("unexpected view source: %#v", source)
+	}
+	if queries := state.snapshotQueries(); len(queries) != 1 {
+		t.Fatalf("ordinary view source should use one query: %v", queries)
+	}
+}
+
+func TestTriggerObjectSourceUsesOwningRelation(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		for _, fragment := range []string{
+			"SELECT sys_catalog.sys_get_triggerdef(tg.oid, true)",
+			"FROM sys_catalog.sys_trigger tg",
+			"n.nspname = 'public'",
+			"c.relname = 'orders'",
+			"tg.tgname = 'audit_before'",
+			"NOT tg.tgisinternal",
+		} {
+			if !strings.Contains(query, fragment) {
+				return nil, errors.New("trigger source query missing " + fragment + ": " + query)
+			}
+		}
+		return &valueRows{columns: []string{"definition"}, rows: [][]driver.Value{{"CREATE TRIGGER audit_before BEFORE INSERT ON public.orders EXECUTE FUNCTION public.audit_row()"}}}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	source, err := server.getObjectSourceForRelation("public", "audit_before", "TRIGGER", "orders")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(fmt.Sprint(source["source"]), "ON public.orders") {
+		t.Fatalf("unexpected trigger source: %#v", source)
+	}
+	if source["editable"] != false {
+		t.Fatalf("trigger source must remain read-only: %#v", source)
+	}
+}
+
+func TestTriggerObjectSourceRejectsAmbiguousNameWithoutRelation(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		if strings.Contains(query, "AND c.relname =") || !strings.Contains(query, "tg.tgname = 'audit_before'") {
+			return nil, errors.New("unexpected unscoped trigger source query: " + query)
+		}
+		return &valueRows{
+			columns: []string{"definition"},
+			rows: [][]driver.Value{
+				{"CREATE TRIGGER audit_before BEFORE INSERT ON public.items EXECUTE FUNCTION public.audit_row()"},
+				{"CREATE TRIGGER audit_before BEFORE INSERT ON public.orders EXECUTE FUNCTION public.audit_row()"},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	_, err := server.getObjectSource("public", "audit_before", "TRIGGER")
+	if err == nil || !strings.Contains(err.Error(), "relation_name is required") {
+		t.Fatalf("ambiguous trigger name must require its owning relation: %v", err)
 	}
 }
 
@@ -1925,6 +3423,41 @@ func TestObjectSourceDoesNotFallbackOnUnrelatedErrors(t *testing.T) {
 	}
 }
 
+func TestObjectSourceFallsBackToV7RoutineDDLAndCachesChoice(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		switch {
+		case strings.Contains(query, "sys_get_functiondef("):
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function SYS_GET_FUNCTIONDEF(OID) does not exist"}
+		case strings.Contains(query, "pg_get_functiondef("):
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function PG_GET_FUNCTIONDEF(OID) does not exist"}
+		case strings.Contains(query, "DBMS_METADATA.GET_FUNC_DDL"):
+			if !strings.Contains(query, "CAST('format_name' AS varchar(128))") || !strings.Contains(query, "CAST('PUBLIC' AS varchar(128))") {
+				return nil, errors.New("legacy DDL query lost routine identity: " + query)
+			}
+			return &valueRows{columns: []string{"ddl"}, rows: [][]driver.Value{{"CREATE OR REPLACE FUNCTION PUBLIC.format_name() RETURN TEXT AS ..."}}}, nil
+		default:
+			return nil, errors.New("unexpected query: " + query)
+		}
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	for range 2 {
+		source, err := server.getObjectSource("PUBLIC", "format_name", "FUNCTION")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(fmt.Sprint(source["source"]), "CREATE OR REPLACE FUNCTION") {
+			t.Fatalf("unexpected source: %#v", source)
+		}
+	}
+
+	queries := state.snapshotQueries()
+	if len(queries) != 4 || !strings.Contains(queries[2], "DBMS_METADATA.GET_FUNC_DDL") || !strings.Contains(queries[3], "DBMS_METADATA.GET_FUNC_DDL") || !server.useLegacyRoutineDefinition {
+		t.Fatalf("V7 routine DDL choice was not cached: %v", queries)
+	}
+}
+
 func TestColumnsFallbackToPgGetExprAndCacheChoice(t *testing.T) {
 	registerExpressionFallbackDriver.Do(func() { sql.Register("kingbase-expression-fallback-test", fallbackDriver{}) })
 	state := &fallbackDriverState{}
@@ -2016,6 +3549,7 @@ func TestColumnsFallbackWhenCatalogHasNoAttidentityAndCacheChoice(t *testing.T) 
 }
 
 func TestKingbaseIdentityClausesAreExposedAndRendered(t *testing.T) {
+	srv := newServer()
 	tests := []struct {
 		name     string
 		code     string
@@ -2031,7 +3565,7 @@ func TestKingbaseIdentityClausesAreExposedAndRendered(t *testing.T) {
 			if extra == nil || *extra != test.expected {
 				t.Fatalf("unexpected identity clause for %q: %#v", test.code, extra)
 			}
-			definition := columnDDLDefinition(columnInfo{Name: "id", DataType: "integer", IsNullable: false, Extra: extra})
+			definition := srv.columnDDLDefinition(columnInfo{Name: "id", DataType: "integer", IsNullable: false, Extra: extra})
 			expected := `"id" integer ` + test.expected + " NOT NULL"
 			if definition != expected {
 				t.Fatalf("unexpected column DDL: %s", definition)
@@ -2079,10 +3613,11 @@ func TestTableDDLIncludesIdentityIndexesTriggersAndComments(t *testing.T) {
 }
 
 func TestRenderTableDDLIncludesEscapedComments(t *testing.T) {
+	srv := newServer()
 	primaryComment := "主键'编号"
 	emptyComment := "  "
 	tableComment := "订单'表"
-	ddl := renderTableDDL(
+	ddl := srv.renderTableDDL(
 		`app"schema`,
 		`order"items`,
 		[]columnInfo{
@@ -2108,12 +3643,13 @@ func TestRenderTableDDLIncludesEscapedComments(t *testing.T) {
 }
 
 func TestColumnDDLDefinitionPreservesCompatibilityExtras(t *testing.T) {
+	srv := newServer()
 	identity := "IDENTITY(1,1)"
 	defaultValue := "0"
-	if definition := columnDDLDefinition(columnInfo{Name: "id", DataType: "integer", IsNullable: false, Extra: &identity}); definition != `"id" integer IDENTITY(1,1) NOT NULL` {
+	if definition := srv.columnDDLDefinition(columnInfo{Name: "id", DataType: "integer", IsNullable: false, Extra: &identity}); definition != `"id" integer IDENTITY(1,1) NOT NULL` {
 		t.Fatalf("unexpected SQL Server-compatible DDL: %s", definition)
 	}
-	if definition := columnDDLDefinition(columnInfo{Name: "count", DataType: "integer", IsNullable: true, ColumnDefault: &defaultValue}); definition != `"count" integer DEFAULT 0` {
+	if definition := srv.columnDDLDefinition(columnInfo{Name: "count", DataType: "integer", IsNullable: true, ColumnDefault: &defaultValue}); definition != `"count" integer DEFAULT 0` {
 		t.Fatalf("unexpected regular column DDL: %s", definition)
 	}
 	if extra := kingbaseIdentityClause(""); extra != nil {
@@ -2121,7 +3657,25 @@ func TestColumnDDLDefinitionPreservesCompatibilityExtras(t *testing.T) {
 	}
 }
 
+func TestRenderTableDDLUsesBacktickIdentifiersInMySQLCompatMode(t *testing.T) {
+	srv := newServer()
+	srv.mode.mysqlCompat = true
+	ddl := srv.renderTableDDL(
+		"audit-schema",
+		"events",
+		[]columnInfo{
+			{Name: "id", DataType: "integer", IsNullable: false, IsPrimaryKey: true},
+		},
+		nil,
+	)
+	expected := "CREATE TABLE `audit-schema`.`events` (\n  `id` integer NOT NULL,\n  PRIMARY KEY (`id`)\n);"
+	if ddl != expected {
+		t.Fatalf("MySQL-compat DDL must use backtick identifiers:\ngot:  %s\nwant: %s", ddl, expected)
+	}
+}
+
 func TestColumnDDLDefinitionRestoresMySQLCompatibilityTypeModifiers(t *testing.T) {
+	srv := newServer()
 	length := 64
 	precision := 12
 	scale := 4
@@ -2141,7 +3695,7 @@ func TestColumnDDLDefinitionRestoresMySQLCompatibilityTypeModifiers(t *testing.T
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := columnDDLDefinition(test.column); got != test.want {
+			if got := srv.columnDDLDefinition(test.column); got != test.want {
 				t.Fatalf("unexpected column DDL: got %q, want %q", got, test.want)
 			}
 		})
@@ -2173,7 +3727,7 @@ func TestInformationSchemaColumnsPreserveFullTypesInDDL(t *testing.T) {
 	if len(columns) != 4 || columns[0].DataType != "integer" || columns[0].FullDataType != "integer unsigned" {
 		t.Fatalf("unexpected metadata columns: %#v", columns)
 	}
-	ddl := renderTableDDL("public", "orders", columns, nil)
+	ddl := server.renderTableDDL("public", "orders", columns, nil)
 	for _, expected := range []string{
 		`"count" integer unsigned`,
 		`"status" enum('new','done')`,
@@ -2216,7 +3770,7 @@ func TestInformationSchemaColumnsResolveUserDefinedTypeWithoutColumnType(t *test
 	if !strings.Contains(string(payload), `"data_type":"datetime"`) || strings.Contains(string(payload), "USER-DEFINED") {
 		t.Fatalf("unresolved user-defined type leaked into get_columns payload: %s", payload)
 	}
-	if ddl := renderTableDDL("public", "orders", columns, nil); !strings.Contains(ddl, `"created_at" datetime`) || strings.Contains(ddl, "USER-DEFINED") {
+	if ddl := server.renderTableDDL("public", "orders", columns, nil); !strings.Contains(ddl, `"created_at" datetime`) || strings.Contains(ddl, "USER-DEFINED") {
 		t.Fatalf("unexpected user-defined type DDL:\n%s", ddl)
 	}
 
@@ -2278,7 +3832,7 @@ func TestInformationSchemaColumnsPreserveColumnTypeWithoutUdtName(t *testing.T) 
 		if len(columns) != 1 || columns[0].FullDataType != "enum('new','done')" {
 			t.Fatalf("unexpected metadata columns: %#v", columns)
 		}
-		if ddl := renderTableDDL("public", table, columns, nil); !strings.Contains(ddl, `"status" enum('new','done')`) {
+		if ddl := server.renderTableDDL("public", table, columns, nil); !strings.Contains(ddl, `"status" enum('new','done')`) {
 			t.Fatalf("unexpected table DDL:\n%s", ddl)
 		}
 	}
@@ -2314,7 +3868,7 @@ func TestInformationSchemaColumnsFallbackWithoutExtendedTypeColumns(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(columns) != 1 || columnDDLDefinition(columns[0]) != `"label" varchar(64)` {
+		if len(columns) != 1 || server.columnDDLDefinition(columns[0]) != `"label" varchar(64)` {
 			t.Fatalf("unexpected fallback columns: %#v", columns)
 		}
 	}
@@ -2359,7 +3913,7 @@ func TestInformationSchemaColumnsRetriesOnlyForMissingTypeMetadataColumns(t *tes
 				if err != nil {
 					t.Fatal(err)
 				}
-				if len(columns) != 1 || columnDDLDefinition(columns[0]) != `"label" varchar(64)` {
+				if len(columns) != 1 || server.columnDDLDefinition(columns[0]) != `"label" varchar(64)` {
 					t.Fatalf("unexpected fallback columns: %#v", columns)
 				}
 			} else if !errors.Is(err, test.firstError) {
@@ -2390,6 +3944,54 @@ func TestDisconnectResetsInformationSchemaCapabilityCache(t *testing.T) {
 	}
 	if server.infoColumnTypeUnsupported || server.infoUdtNameUnsupported {
 		t.Fatal("disconnect must reset cached information_schema capabilities")
+	}
+}
+
+func TestConnectionLifecycleResetsCatalogOIDCapability(t *testing.T) {
+	state := &connectionAttemptState{pingErrors: map[string]error{}}
+	server := newServer()
+	server.openDatabase = state.open
+	server.catalogOIDUnsupported = true
+
+	if err := server.connect(connectParams{MySQLCompatMode: true, URLParams: "sslmode=disable"}); err != nil {
+		t.Fatal(err)
+	}
+	if server.catalogOIDUnsupported {
+		t.Fatal("connect must reset the cached catalog OID capability")
+	}
+
+	server.catalogOIDUnsupported = true
+	if err := server.disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if server.catalogOIDUnsupported {
+		t.Fatal("disconnect must reset the cached catalog OID capability")
+	}
+}
+
+func TestConnectionLifecycleResetsConstraintCapabilityCache(t *testing.T) {
+	state := &connectionAttemptState{pingErrors: map[string]error{}}
+	server := newServer()
+	server.openDatabase = state.open
+	server.constraintDefinitionUnsupported = true
+	server.constraintValidatedUnsupported = true
+	server.constraintStatusUnsupported = true
+
+	if err := server.connect(connectParams{MySQLCompatMode: true, URLParams: "sslmode=disable"}); err != nil {
+		t.Fatal(err)
+	}
+	if server.constraintDefinitionUnsupported || server.constraintValidatedUnsupported || server.constraintStatusUnsupported {
+		t.Fatal("connect must reset cached constraint capabilities")
+	}
+
+	server.constraintDefinitionUnsupported = true
+	server.constraintValidatedUnsupported = true
+	server.constraintStatusUnsupported = true
+	if err := server.disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if server.constraintDefinitionUnsupported || server.constraintValidatedUnsupported || server.constraintStatusUnsupported {
+		t.Fatal("disconnect must reset cached constraint capabilities")
 	}
 }
 
@@ -2424,6 +4026,9 @@ func TestMySQLCompatColumnsUsePostgresColumnComments(t *testing.T) {
 	}
 	if columns[0].Extra != nil {
 		t.Fatalf("MySQL-compatible metadata must not infer PostgreSQL identity: %#v", columns[0].Extra)
+	}
+	if columns[0].ResolvedSchema == nil || *columns[0].ResolvedSchema != "public" {
+		t.Fatalf("MySQL-compatible metadata must keep its effective schema: %#v", columns[0])
 	}
 
 	state.mu.Lock()
@@ -2637,6 +4242,157 @@ func TestExecuteQueryUsesSimpleProtocolAndReleasesContext(t *testing.T) {
 		t.Fatalf("unexpected result or bound arguments: rows=%v args=%d", result.Rows, state.queryArgs)
 	}
 	assertContextCanceled(t, state.queryCtx)
+}
+
+func TestExecuteStatementsPreserveSessionSearchPathWithoutSchema(t *testing.T) {
+	db, state := openFakeDB(t, 0)
+	server := newServer()
+	server.db = db
+
+	statements := []string{
+		"SET search_path TO app_data",
+		"CREATE TABLE issue_6134 (id integer)",
+	}
+	for _, statement := range statements {
+		if _, err := server.executeQuery(queryOptions{SQL: statement}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if strings.Join(state.execStatements, "\n") != strings.Join(statements, "\n") {
+		t.Fatalf("schema-less statements changed session search_path: %v", state.execStatements)
+	}
+	if len(state.execConnIDs) != len(statements) || state.execConnIDs[0] != state.execConnIDs[1] {
+		t.Fatalf("session statements used different connections: %v", state.execConnIDs)
+	}
+}
+
+func TestSchemaConnSkipsInitialAndRepeatedEmptySchema(t *testing.T) {
+	db, state := openFakeDB(t, 0)
+	server := newServer()
+	server.db = db
+
+	for range 2 {
+		conn, err := server.schemaConn(context.Background(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.execStatements) != 0 {
+		t.Fatalf("empty schema unexpectedly reset search_path: %v", state.execStatements)
+	}
+}
+
+func TestSchemaConnResetsOnceAfterExplicitSchema(t *testing.T) {
+	db, state := openFakeDB(t, 0)
+	server := newServer()
+	server.db = db
+
+	for _, schema := range []string{"app_data", "", ""} {
+		conn, err := server.schemaConn(context.Background(), schema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	expected := []string{`SET search_path TO "app_data"`, "RESET search_path"}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if strings.Join(state.execStatements, "\n") != strings.Join(expected, "\n") {
+		t.Fatalf("unexpected schema transition statements: %v", state.execStatements)
+	}
+	if len(state.execConnIDs) != len(expected) || state.execConnIDs[0] != state.execConnIDs[1] {
+		t.Fatalf("schema transitions used different connections: %v", state.execConnIDs)
+	}
+}
+
+func TestSchemaConnUsesBackticksInMySQLCompatMode(t *testing.T) {
+	db, state := openFakeDB(t, 0)
+	server := newServer()
+	server.db = db
+	server.mode.mysqlCompat = true
+
+	conn, err := server.schemaConn(context.Background(), "audit-schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.execStatements) != 1 || state.execStatements[0] != "SET search_path TO `audit-schema`" {
+		t.Fatalf("unexpected MySQL compatibility schema setup: %v", state.execStatements)
+	}
+}
+
+func TestKingbaseIdentifierQuoteEscapesModeSpecificDelimiter(t *testing.T) {
+	server := newServer()
+	server.mode.mysqlCompat = true
+	if got := server.quoteIdentifier("audit`schema"); got != "`audit``schema`" {
+		t.Fatalf("unexpected MySQL compatibility identifier: %s", got)
+	}
+	server.mode.mysqlCompat = false
+	if got := server.quoteIdentifier(`audit"schema`); got != `"audit""schema"` {
+		t.Fatalf("unexpected PostgreSQL-compatible identifier: %s", got)
+	}
+}
+
+func TestSchemaConnPropagatesSchemaErrors(t *testing.T) {
+	tests := []struct {
+		name          string
+		initialSchema string
+		schemaSet     bool
+		requested     string
+		statement     string
+	}{
+		{
+			name:      "set",
+			requested: "app_data",
+			statement: `SET search_path TO "app_data"`,
+		},
+		{
+			name:          "reset",
+			initialSchema: "app_data",
+			schemaSet:     true,
+			statement:     "RESET search_path",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			expectedErr := errors.New(test.name + " search_path failed")
+			db, state := openFakeDB(t, 0)
+			state.execErrors = map[string]error{test.statement: expectedErr}
+			server := newServer()
+			server.db = db
+			server.currentSchema = test.initialSchema
+			server.schemaSet = test.schemaSet
+
+			conn, err := server.schemaConn(context.Background(), test.requested)
+			if conn != nil {
+				t.Fatal("schemaConn returned a connection after schema setup failed")
+			}
+			if !errors.Is(err, expectedErr) {
+				t.Fatalf("unexpected schema error: %v", err)
+			}
+			if server.currentSchema != test.initialSchema || server.schemaSet != test.schemaSet {
+				t.Fatalf("failed schema setup changed server state: schema=%q set=%v", server.currentSchema, server.schemaSet)
+			}
+		})
+	}
 }
 
 func TestExecuteQueryReappliesSchemaForRepeatedRequests(t *testing.T) {
@@ -2862,4 +4618,36 @@ func containsString(values []string, target string) bool {
 		}
 	}
 	return false
+}
+
+// Regression test for https://github.com/t8y2/dbx/issues/7681: a timezone-less
+// "timestamp"/"date"/"time" column must not be labeled as an absolute UTC
+// instant (RFC3339Nano with a "Z"/offset suffix), or clients that convert it
+// to a display timezone will double-apply the shift.
+func TestNormalizeValueKingbaseTimezoneLessDateTime(t *testing.T) {
+	// gokb decodes "timestamp"/"date" wall-clock values into a time.Time in
+	// the process-local zone, which is not a real UTC instant.
+	wallClock := time.Date(2026, time.January, 30, 10, 0, 3, 0, time.UTC)
+
+	for _, columnType := range []string{"TIMESTAMP", "timestamp", "DATE", "TIME"} {
+		got := normalizeValue(wallClock, columnType)
+		want := "2026-01-30T10:00:03"
+		gotStr, ok := got.(string)
+		if !ok {
+			t.Fatalf("columnType=%s: expected a string, got %#v", columnType, got)
+		}
+		if gotStr != want {
+			t.Fatalf("columnType=%s: got %q, want %q", columnType, gotStr, want)
+		}
+		if strings.ContainsAny(gotStr, "Z+") {
+			t.Fatalf("columnType=%s: timezone-less value must not carry a Z/offset suffix, got %q", columnType, gotStr)
+		}
+	}
+
+	// A real timezone-aware column must keep its absolute-instant encoding.
+	tzAware := normalizeValue(wallClock, "TIMESTAMPTZ")
+	tzAwareStr, ok := tzAware.(string)
+	if !ok || tzAwareStr != "2026-01-30T10:00:03Z" {
+		t.Fatalf("TIMESTAMPTZ column: got %#v, want RFC3339Nano-encoded UTC instant", tzAware)
+	}
 }

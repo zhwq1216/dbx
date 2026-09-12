@@ -2,6 +2,7 @@ import type { EditorSettings } from "@/stores/settingsStore";
 import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
 import { normalizeCompletionTriggerMode } from "@/lib/sql/sqlCompletionTriggerPolicy";
+import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 
 export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "fontFamily",
@@ -16,25 +17,41 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "executeAllOnBlankLine",
   "showExecutionTargetPicker",
   "showStatementRunButtons",
+  "showLineNumbers",
   "showCurrentStatementFrame",
   "showInsertValueHints",
   "autoAliasTables",
   "insertSpaceAfterCompletion",
+  "sortCompletionColumnsAlphabetically",
+  "selectFirstCompletionOnOpen",
   "wordWrap",
   "vimModeEnabled",
   "autoCloseBrackets",
   "sqlSemanticDiagnosticsMode",
   "confirmDangerousSqlExecution",
   "confirmUnsavedSqlClose",
+  "appCloseUnsavedTabsMode",
   "savedSqlOpenTargetMode",
   "appLayout",
   "tabLayout",
+  "tabPlacement",
+  "tabGroupMode",
+  "tabSortMode",
   "showColumnCommentsInHeader",
   "showColumnTypesInHeader",
+  "dataGridShowTransposeFieldMetadata",
+  "colorizeDataGridCellTypes",
+  "dataGridTypeColorSchemes",
+  "activeDataGridTypeColorSchemeId",
   "showIndexIndicatorsInHeader",
   "compactColumnHeaderActions",
   "dataGridQuickEntry",
+  "dataGridFilterEditorView",
+  "dataGridTextFilterPanelHeight",
+  "multiStatementDefaultView",
   "dataGridAutoTransposeSingleRow",
+  "dataGridCellDetailButtonVisible",
+  "dataGridCrosshairHighlight",
   "pageSize",
   "tableOpenPageSize",
   "queryResultMaxRowsEnabled",
@@ -42,6 +59,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "infiniteScroll",
   "regexMaxMatchCount",
   "autoCalculateTotalRows",
+  "flatteningMultiLineText",
   "tableColumnTemplateFields",
   "shortcuts",
   "sqlFormatter",
@@ -50,15 +68,28 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "routineSourceOpenMode",
   "sidebarTableSearchEnabled",
   "autoSelectActiveSidebarNode",
+  "sidebarBrowseObjectsOnDatabaseActivation",
   "openTabsRestoreMode",
   "disconnectTabHandlingMode",
   "dataTabReuseMode",
+  "openDataTabsNextToActive",
   "prefillNewQueryWithSelect",
+  "generateSqlIncludeDatabaseName",
+  "generateSqlQuoteIdentifiers",
+  "formatSqlOnSqlFileSave",
+  "showTableDdlHoverPreview",
   "updateNotificationsEnabled",
   "sidebarObjectInfoMode",
   "sidebarAllowHorizontalScroll",
+  "sidebarShowTooltips",
+  "sidebarIndent",
+  "sidebarFontSize",
   "sidebarHiddenTablePrefixes",
+  "sidebarCopyTableNameSeparator",
+  "sidebarCopyTableNameIncludeSchema",
+  "redisKeyTemplates",
   "exportBatchSize",
+  "csvQuoteMode",
   "exportRowLimitEnabled",
   "exportRowLimit",
   "queryExportKeysetOptimizationEnabled",
@@ -68,10 +99,13 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "updateDownloadSource",
   "toolbarItems",
   "snippets",
+  "sqlShortcuts",
+  "sqlVariableSubstitutionEnabled",
   "sqlVariableSyntaxOverrides",
   "continueOnErrorOnBatch",
   "clickTableNavigationTarget",
   "completionTriggerMode",
+  "defaultTransactionMode",
 ] as const satisfies readonly (keyof EditorSettings)[];
 
 export type EditorSettingsDraftKey = (typeof EDITOR_SETTINGS_DRAFT_KEYS)[number];
@@ -95,6 +129,7 @@ function normalizedDraftValue(key: EditorSettingsDraftKey, value: unknown): unkn
   if (key === "pageSize" || key === "tableOpenPageSize") return normalizeTableOpenPageSizeDraft(value);
   if (key === "queryResultMaxRows") return normalizeQueryResultMaxRowsDraft(value);
   if (key === "completionTriggerMode") return normalizeCompletionTriggerMode(value);
+  if (key === "redisKeyTemplates") return normalizeRedisKeyTemplates(value);
   return value;
 }
 
@@ -122,4 +157,13 @@ export function editorSettingsPatchFromDraft(draft: EditorSettingsDraft, base: E
 
 export function editorSettingsDraftChanged(draft: EditorSettingsDraft, base: EditorSettingsDraft): boolean {
   return EDITOR_SETTINGS_DRAFT_KEYS.some((key) => draftValueChanged(key, draft[key], base[key]));
+}
+
+// Closing the settings dialog (Escape, clicking outside, the X button, or the
+// "Close" footer button) must never silently drop an unapplied draft — the
+// dialog only persists shortcuts/sidebarActivation/etc. to the store on an
+// explicit Apply. Route every close attempt through this check so an unsaved
+// draft always surfaces a confirmation instead of vanishing.
+export function shouldConfirmEditorSettingsDialogClose(nextOpen: boolean, hasUnsavedChanges: boolean): boolean {
+  return nextOpen === false && hasUnsavedChanges;
 }

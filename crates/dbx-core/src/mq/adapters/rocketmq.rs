@@ -1,14 +1,14 @@
-//! Apache RocketMQ admin adapter. Communicates with a Java agent process
-//! (`RocketMqAgent.java`) via JSON-RPC over stdin/stdout. The Java agent uses
-//! `DefaultMQAdminExt` for admin operations and `DefaultMQProducer` for
-//! message production.
+//! Apache RocketMQ admin adapter. Communicates with the Go native agent via
+//! JSON-RPC over stdin/stdout. The agent uses `rocketmq-admin-go` plus direct
+//! remoting calls for compatibility gaps in the upstream admin API.
 //!
-//! This adapter follows the same pattern as the ZooKeeper/Etcd agents:
-//! 1. Spawn a Java agent process via `AgentDriverClient`
+//! This adapter follows the same process-agent pattern as the other drivers:
+//! 1. Spawn the native agent process via `AgentDriverClient`
 //! 2. Perform JSON-RPC handshake + connect
 //! 3. Delegate all `MessageQueueAdmin` trait methods to JSON-RPC calls
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +65,9 @@ const ROCKETMQ_CAPABILITIES: MqCapabilities = MqCapabilities {
 const TOPIC_LIST_FETCH_LIMIT: i32 = i32::MAX;
 /// Fallback page size when an agent still returns a truncated first page (`topics.len() < total`).
 const TOPIC_LIST_FALLBACK_PAGE_SIZE: i32 = 200;
+/// Page size for consumer-group requests. The adapter follows the agent's `total`
+/// instead of treating this page size as a catalog limit.
+const CONSUMER_GROUP_LIST_PAGE_SIZE: i32 = 500;
 
 pub struct RocketMqAdmin {
     client: Arc<Mutex<AgentDriverClient>>,
@@ -97,10 +100,10 @@ fn cluster_info_from_agent_result(result: &serde_json::Value) -> MqClusterInfo {
 }
 
 impl RocketMqAdmin {
-    /// Spawn the RocketMQ Java agent, perform handshake, and connect.
+    /// Spawn the RocketMQ native agent, perform handshake, and connect.
     ///
     /// Callers must probe NameServer reachability before invoking this so the
-    /// connect-timeout wall covers only JVM spawn + handshake + connect.
+    /// connect-timeout wall covers only process spawn + handshake + connect.
     pub async fn new(cfg: MqAdminConfig, launch: AgentLaunchSpec) -> Result<Self, String> {
         let mut client = AgentDriverClient::spawn(launch).await?;
 
@@ -133,6 +136,20 @@ impl RocketMqAdmin {
     async fn call_ok(&self, method: &str, params: serde_json::Value) -> Result<(), String> {
         let _: serde_json::Value = self.call(method, params).await?;
         Ok(())
+    }
+
+    async fn list_all_cluster_consumer_groups(&self, enrich: bool) -> Result<Vec<SubscriptionInfo>, String> {
+        collect_paginated_consumer_group_pages(|offset| {
+            self.call("mq_list_consumer_groups", rocketmq_cluster_consumer_group_page_params(offset, enrich))
+        })
+        .await
+    }
+
+    async fn list_all_topic_consumer_groups(&self, topic: &str, enrich: bool) -> Result<Vec<SubscriptionInfo>, String> {
+        collect_paginated_consumer_group_pages(|offset| {
+            self.call("mq_list_consumer_groups", rocketmq_topic_consumer_group_page_params(topic, offset, enrich))
+        })
+        .await
     }
 }
 
@@ -286,6 +303,7 @@ impl MessageQueueAdmin for RocketMqAdmin {
             msg_out_counter: 0,
             subscription_count: 0,
             producer_count: 0,
+            rates_unavailable: false,
             raw: result,
         })
     }
@@ -365,52 +383,21 @@ impl MessageQueueAdmin for RocketMqAdmin {
     async fn list_subscriptions(&self, topic: &TopicRef) -> Result<Vec<SubscriptionInfo>, String> {
         if topic.topic.is_empty() {
             // Fast path: names/types only. UI enrichs online members/topics in a second pass.
-            let result: serde_json::Value = self
-                .call(
-                    "mq_list_consumer_groups",
-                    serde_json::json!({
-                        "limit": 500,
-                        "offset": 0,
-                        "enrich": false,
-                    }),
-                )
-                .await?;
-            let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-            return Ok(groups.iter().map(rocketmq_subscription_from_group).collect());
+            return self.list_all_cluster_consumer_groups(false).await;
         }
 
         // Topic path: skip list enrich; batch lag in one agent RPC (no N+1).
-        let result: serde_json::Value = self
-            .call(
-                "mq_list_consumer_groups",
-                serde_json::json!({
-                    "topic": topic.topic,
-                    "limit": 200,
-                    "offset": 0,
-                    "enrich": false,
-                    "includeLag": true,
-                }),
-            )
-            .await?;
-        let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        Ok(groups.iter().map(rocketmq_subscription_from_group).collect())
+        self.list_all_topic_consumer_groups(&topic.topic, false).await
     }
 
     async fn enrich_subscriptions(&self, topic: &TopicRef) -> Result<Vec<SubscriptionInfo>, String> {
-        // Cluster-wide second pass fills memberCount/topics after the fast list paint.
-        let mut params = serde_json::json!({
-            "limit": 500,
-            "offset": 0,
-            "enrich": true,
-        });
-        if !topic.topic.is_empty() {
-            params["topic"] = serde_json::json!(topic.topic);
-            params["limit"] = serde_json::json!(200);
-            params["includeLag"] = serde_json::json!(true);
+        if topic.topic.is_empty() {
+            // Cluster-wide second pass fills memberCount/topics after the fast list paint.
+            return self.list_all_cluster_consumer_groups(true).await;
         }
-        let result: serde_json::Value = self.call("mq_list_consumer_groups", params).await?;
-        let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        Ok(groups.iter().map(rocketmq_subscription_from_group).collect())
+
+        // Topic path: skip list enrich; batch lag in one agent RPC (no N+1).
+        self.list_all_topic_consumer_groups(&topic.topic, true).await
     }
 
     async fn create_subscription(&self, _topic: &TopicRef, _sub: &str, _pos: ResetPosition) -> Result<(), String> {
@@ -767,6 +754,7 @@ fn topic_info_from_agent_value(t: &serde_json::Value) -> TopicInfo {
         message_count: None,
         messages_ready: None,
         messages_unacked: None,
+        ..Default::default()
     }
 }
 
@@ -777,6 +765,71 @@ fn topic_infos_from_agent_list_response(response: &serde_json::Value) -> Vec<Top
 /// Prefer agent-reported `total`; fall back to the page length when absent.
 fn agent_list_total(response: &serde_json::Value, page_len: usize) -> u64 {
     response.get("total").and_then(|v| v.as_u64()).unwrap_or(page_len as u64)
+}
+
+fn rocketmq_cluster_consumer_group_page_params(offset: usize, enrich: bool) -> serde_json::Value {
+    serde_json::json!({
+        "limit": CONSUMER_GROUP_LIST_PAGE_SIZE,
+        "offset": offset,
+        "enrich": enrich,
+    })
+}
+
+fn rocketmq_topic_consumer_group_page_params(topic: &str, offset: usize, enrich: bool) -> serde_json::Value {
+    serde_json::json!({
+        "topic": topic,
+        "limit": CONSUMER_GROUP_LIST_PAGE_SIZE,
+        "offset": offset,
+        "enrich": enrich,
+        "includeLag": true,
+    })
+}
+
+/// Collect all pages from the agent while preserving its sorted order.
+///
+/// The offset advances by the number of rows actually returned, rather than the
+/// requested limit, so this also works with older agents that cap the page size.
+async fn collect_paginated_consumer_group_pages<F, Fut>(mut fetch_page: F) -> Result<Vec<SubscriptionInfo>, String>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    let mut subscriptions = Vec::new();
+    let mut seen_group_names = HashSet::new();
+    let mut offset = 0usize;
+
+    loop {
+        let response = fetch_page(offset).await?;
+        let groups = response.get("groups").and_then(|value| value.as_array()).cloned().unwrap_or_default();
+        let page_len = groups.len();
+        if page_len == 0 {
+            break;
+        }
+
+        let previous_len = subscriptions.len();
+        for group in &groups {
+            let subscription = rocketmq_subscription_from_group(group);
+            if seen_group_names.insert(subscription.name.clone()) {
+                subscriptions.push(subscription);
+            }
+        }
+        // A broken agent may ignore offset and repeat a page. Do not spin or
+        // return duplicate rows in that case.
+        if subscriptions.len() == previous_len {
+            break;
+        }
+
+        let next_offset = match offset.checked_add(page_len) {
+            Some(next_offset) if next_offset > offset => next_offset,
+            _ => break,
+        };
+        offset = next_offset;
+        if (offset as u64) >= agent_list_total(&response, page_len) {
+            break;
+        }
+    }
+
+    Ok(subscriptions)
 }
 
 /// Extract RocketMQ NameServer address from MqAdminConfig.extra.
@@ -814,7 +867,7 @@ fn rocketmq_topic_admin_params(topic: &TopicRef, partitions: Option<u32>) -> ser
     params
 }
 
-/// Build the connection params JSON from MqAdminConfig for the Java agent.
+/// Build the connection params JSON from MqAdminConfig for the native agent.
 fn build_connection_params(cfg: &MqAdminConfig) -> serde_json::Value {
     let extra = &cfg.extra;
     let access_key = extra_str(extra, "accessKey")
@@ -872,6 +925,9 @@ fn reset_cursor_params(topic: &TopicRef, sub: &str, pos: ResetPosition) -> Resul
             "position": "timestamp",
             "timestampMs": timestamp_ms,
         })),
+        ResetPosition::PartitionOffset { .. } => {
+            Err("RocketMQ does not support cursor reset by Kafka partition offset".to_string())
+        }
         ResetPosition::MessageId { .. } => {
             Err("RocketMQ does not support cursor reset by Pulsar message id".to_string())
         }
@@ -1294,6 +1350,23 @@ mod tests {
     }
 
     #[test]
+    fn reset_cursor_params_rejects_kafka_partition_offsets() {
+        let topic = TopicRef {
+            tenant: "_rocketmq".to_string(),
+            namespace: "default".to_string(),
+            topic: "events".to_string(),
+            persistent: true,
+            partitioned: None,
+            message_type: None,
+            ..TopicRef::default()
+        };
+
+        let error = reset_cursor_params(&topic, "group-a", ResetPosition::PartitionOffset { partition: 0, offset: 9 })
+            .expect_err("RocketMQ must not reinterpret Kafka partition offsets");
+        assert!(error.contains("Kafka partition offset"));
+    }
+
+    #[test]
     fn rocketmq_subscription_for_topic_includes_offline_group_with_committed_offsets() {
         let desc = serde_json::json!({ "groupId": "orders-service", "members": [] });
         let lag = serde_json::json!({
@@ -1370,6 +1443,145 @@ mod tests {
         assert_eq!(parsed.len(), 200);
         assert_eq!(agent_list_total(&response, parsed.len()), 338);
         assert!((parsed.len() as u64) < agent_list_total(&response, parsed.len()));
+    }
+
+    #[test]
+    fn cluster_consumer_group_page_params_include_offset_and_enrichment() {
+        let fast = rocketmq_cluster_consumer_group_page_params(0, false);
+        assert_eq!(fast.get("limit").and_then(|value| value.as_i64()), Some(500));
+        assert_eq!(fast.get("offset").and_then(|value| value.as_u64()), Some(0));
+        assert_eq!(fast.get("enrich").and_then(|value| value.as_bool()), Some(false));
+
+        let enriched = rocketmq_cluster_consumer_group_page_params(500, true);
+        assert_eq!(enriched.get("offset").and_then(|value| value.as_u64()), Some(500));
+        assert_eq!(enriched.get("enrich").and_then(|value| value.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn topic_consumer_group_pagination_loads_list_and_enrich_pages() {
+        let groups: Vec<serde_json::Value> = (1..=201)
+            .map(|index| serde_json::json!({ "groupId": format!("group-{index:04}"), "groupType": "NORMAL" }))
+            .collect();
+        let total = groups.len();
+
+        for enrich in [false, true] {
+            let mut offsets = Vec::new();
+            let subscriptions = collect_paginated_consumer_group_pages(|offset| {
+                offsets.push(offset);
+                let params = rocketmq_topic_consumer_group_page_params("orders", offset, enrich);
+                assert_eq!(params.get("topic").and_then(|value| value.as_str()), Some("orders"));
+                assert_eq!(params.get("limit").and_then(|value| value.as_i64()), Some(500));
+                assert_eq!(params.get("offset").and_then(|value| value.as_u64()), Some(offset as u64));
+                assert_eq!(params.get("enrich").and_then(|value| value.as_bool()), Some(enrich));
+                assert_eq!(params.get("includeLag").and_then(|value| value.as_bool()), Some(true));
+
+                let end = offset.saturating_add(200).min(total);
+                let page = groups[offset..end].to_vec();
+                async move { Ok(serde_json::json!({ "groups": page, "total": total })) }
+            })
+            .await
+            .expect("topic consumer group pages should be collected");
+
+            assert_eq!(offsets, vec![0, 200]);
+            assert_eq!(subscriptions.len(), 201);
+            assert_eq!(subscriptions[200].name, "group-0201");
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_group_pagination_loads_groups_after_first_page() {
+        let groups: Vec<serde_json::Value> = (1..=1000)
+            .map(|index| serde_json::json!({ "groupId": format!("group-{index:04}"), "groupType": "NORMAL" }))
+            .chain(std::iter::once(serde_json::json!({
+                "groupId": "z-target-group",
+                "groupType": "NORMAL"
+            })))
+            .collect();
+        let total = groups.len();
+        let mut offsets = Vec::new();
+
+        let subscriptions = collect_paginated_consumer_group_pages(|offset| {
+            offsets.push(offset);
+            let end = offset.saturating_add(CONSUMER_GROUP_LIST_PAGE_SIZE as usize).min(total);
+            let page = groups[offset..end].to_vec();
+            async move {
+                Ok(serde_json::json!({
+                    "groups": page,
+                    "total": total,
+                    "offset": offset,
+                    "limit": CONSUMER_GROUP_LIST_PAGE_SIZE,
+                }))
+            }
+        })
+        .await
+        .expect("all consumer group pages should be collected");
+
+        assert_eq!(offsets, vec![0, 500, 1000]);
+        assert_eq!(subscriptions.len(), 1001);
+        assert_eq!(subscriptions[500].name, "group-0501");
+        assert_eq!(subscriptions.last().map(|subscription| subscription.name.as_str()), Some("z-target-group"));
+        let unique_names = subscriptions.iter().map(|subscription| subscription.name.as_str()).collect::<HashSet<_>>();
+        assert_eq!(unique_names.len(), subscriptions.len());
+    }
+
+    #[tokio::test]
+    async fn consumer_group_pagination_advances_by_actual_page_length() {
+        let groups: Vec<serde_json::Value> = (1..=500)
+            .map(|index| serde_json::json!({ "groupId": format!("group-{index:03}"), "groupType": "NORMAL" }))
+            .chain(std::iter::once(serde_json::json!({
+                "groupId": "z-target-group",
+                "groupType": "NORMAL"
+            })))
+            .collect();
+        let total = groups.len();
+        let actual_page_size = 200usize;
+        let mut offsets = Vec::new();
+
+        let subscriptions = collect_paginated_consumer_group_pages(|offset| {
+            offsets.push(offset);
+            let end = offset.saturating_add(actual_page_size).min(total);
+            let page = groups[offset..end].to_vec();
+            async move {
+                Ok(serde_json::json!({
+                    "groups": page,
+                    "total": total,
+                    "offset": offset,
+                    "limit": CONSUMER_GROUP_LIST_PAGE_SIZE,
+                }))
+            }
+        })
+        .await
+        .expect("short agent pages should still be collected");
+
+        assert_eq!(offsets, vec![0, 200, 400]);
+        assert_eq!(subscriptions.len(), 501);
+        assert_eq!(subscriptions.last().map(|subscription| subscription.name.as_str()), Some("z-target-group"));
+    }
+
+    #[tokio::test]
+    async fn consumer_group_pagination_stops_on_empty_or_repeated_pages() {
+        let first_page = vec![serde_json::json!({ "groupId": "group-1", "groupType": "NORMAL" })];
+        let mut empty_page_calls = Vec::new();
+        let subscriptions = collect_paginated_consumer_group_pages(|offset| {
+            empty_page_calls.push(offset);
+            let groups = if empty_page_calls.len() == 1 { first_page.clone() } else { Vec::new() };
+            async move { Ok(serde_json::json!({ "groups": groups, "total": u64::MAX, "offset": offset })) }
+        })
+        .await
+        .expect("an empty page should finish pagination");
+        assert_eq!(empty_page_calls, vec![0, 1]);
+        assert_eq!(subscriptions.len(), 1);
+
+        let mut repeated_page_calls = Vec::new();
+        let subscriptions = collect_paginated_consumer_group_pages(|offset| {
+            repeated_page_calls.push(offset);
+            let groups = first_page.clone();
+            async move { Ok(serde_json::json!({ "groups": groups, "total": u64::MAX, "offset": offset })) }
+        })
+        .await
+        .expect("a repeated page should finish pagination");
+        assert_eq!(repeated_page_calls, vec![0, 1]);
+        assert_eq!(subscriptions.len(), 1);
     }
 
     #[test]

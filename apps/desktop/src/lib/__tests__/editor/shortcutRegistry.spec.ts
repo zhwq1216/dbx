@@ -1,12 +1,25 @@
 import { describe, expect, it } from "vitest";
-import { closeOtherTabsDefaultShortcut, DEFAULT_SHORTCUT_SETTINGS, SHORTCUT_DEFINITIONS, findShortcutConflict, formatShortcut, normalizeModifierOnlyShortcut, normalizeShortcutSettings, shortcutToCodeMirrorKey, type ShortcutActionId } from "@/lib/editor/shortcutRegistry";
+import {
+  closeOtherTabsDefaultShortcut,
+  DEFAULT_SHORTCUT_SETTINGS,
+  SHORTCUT_DEFINITIONS,
+  findShortcutConflict,
+  formatShortcut,
+  normalizeModifierOnlyShortcut,
+  normalizeShortcutSettings,
+  selectionOccurrenceDefaultShortcut,
+  shortcutToCodeMirrorKey,
+  type ShortcutActionId,
+} from "@/lib/editor/shortcutRegistry";
 
 describe("shortcutRegistry editor actions", () => {
   const formatterEditorActionIds: ShortcutActionId[] = [
     "formatSql",
     "toggleLineComment",
+    "toggleBlockComment",
     "indentMore",
     "indentLess",
+    "joinLines",
     "duplicateLine",
     "deleteLine",
     "moveLineUp",
@@ -16,12 +29,100 @@ describe("shortcutRegistry editor actions", () => {
     "undo",
     "redo",
     "selectAll",
+    "addNextSelectionOccurrence",
+    "selectAllSelectionOccurrences",
     "uppercaseSelection",
     "lowercaseSelection",
     "exPasteSqlInCondition",
     "toggleFold",
   ];
   const sidebarShortcutActionIds: ShortcutActionId[] = ["copySidebarSelection", "pasteSidebarSelection", "editSidebarConnection", "viewTableDdl"];
+
+  it("registers pagination navigation as unassigned grid shortcuts", () => {
+    const paginationActions = [
+      ["goToFirstPage", "settings.shortcutGoToFirstPage"],
+      ["goToPreviousPage", "settings.shortcutGoToPreviousPage"],
+      ["goToNextPage", "settings.shortcutGoToNextPage"],
+      ["goToLastPage", "settings.shortcutGoToLastPage"],
+    ] as const;
+
+    for (const [id, labelKey] of paginationActions) {
+      expect(SHORTCUT_DEFINITIONS.find((item) => item.id === id)).toMatchObject({ id, labelKey, scope: "grid", defaultShortcut: "" });
+      expect(DEFAULT_SHORTCUT_SETTINGS[id]).toBe("");
+    }
+  });
+
+  it("normalizes missing, legacy, cleared, and configured pagination shortcuts", () => {
+    const missing = normalizeShortcutSettings();
+    const legacy = normalizeShortcutSettings({ goToColumn: "Mod+G" });
+    const configured = normalizeShortcutSettings({ goToFirstPage: "Alt+F1", goToPreviousPage: "Alt+F2", goToNextPage: "Alt+F3", goToLastPage: "Alt+F4" });
+
+    for (const actionId of ["goToFirstPage", "goToPreviousPage", "goToNextPage", "goToLastPage"] as const) {
+      expect(missing[actionId]).toBe("");
+      expect(legacy[actionId]).toBe("");
+    }
+    expect(configured.goToFirstPage).toBe("Alt+F1");
+    expect(configured.goToPreviousPage).toBe("Alt+F2");
+    expect(configured.goToNextPage).toBe("Alt+F3");
+    expect(configured.goToLastPage).toBe("Alt+F4");
+    expect(configured.goToColumn).toBe("");
+  });
+
+  it("detects pagination shortcut conflicts in the grid scope", () => {
+    const shortcuts = normalizeShortcutSettings({ goToFirstPage: "Alt+F1", goToPreviousPage: "Alt+F1" });
+
+    expect(findShortcutConflict("goToFirstPage", shortcuts.goToFirstPage, shortcuts)).toBe("goToPreviousPage");
+    expect(findShortcutConflict("goToFirstPage", "Mod+F", shortcuts)).toBeNull();
+  });
+
+  it("registers go to column as an unassigned grid shortcut", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "goToColumn");
+
+    expect(definition).toMatchObject({
+      labelKey: "settings.shortcutGoToColumn",
+      scope: "grid",
+      defaultShortcut: "",
+    });
+    expect(DEFAULT_SHORTCUT_SETTINGS.goToColumn).toBe("");
+  });
+
+  it("normalizes missing, legacy, cleared, and configured go-to-column settings", () => {
+    expect(normalizeShortcutSettings().goToColumn).toBe("");
+    expect(normalizeShortcutSettings({ executeSql: "Mod+Shift+Enter" }).goToColumn).toBe("");
+    expect(normalizeShortcutSettings({ goToColumn: "" }).goToColumn).toBe("");
+    expect(normalizeShortcutSettings({ goToColumn: "Mod+G" }).goToColumn).toBe("Mod+G");
+  });
+
+  it("detects go-to-column conflicts only within the grid scope", () => {
+    const shortcuts = normalizeShortcutSettings({ goToColumn: "Mod+D" });
+
+    expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("copyCurrentRow");
+    expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBeNull();
+  });
+
+  it("registers copy-current-row Mod+D and edit-table-structure Mod+Shift+D as conflict-free grid defaults", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "editTableStructure");
+
+    expect(definition).toMatchObject({
+      labelKey: "settings.shortcutEditTableStructure",
+      scope: "grid",
+      defaultShortcut: "Mod+Shift+D",
+    });
+    expect(DEFAULT_SHORTCUT_SETTINGS.editTableStructure).toBe("Mod+Shift+D");
+    expect(DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow).toBe("Mod+D");
+    expect(findShortcutConflict("editTableStructure", DEFAULT_SHORTCUT_SETTINGS.editTableStructure, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("copyCurrentRow", DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("duplicateLine", DEFAULT_SHORTCUT_SETTINGS.duplicateLine, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("restores copy-current-row Mod+D after the previous edit-structure migration", () => {
+    expect(normalizeShortcutSettings()).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Shift+Mod+C" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Shift+Mod+C" });
+    expect(normalizeShortcutSettings({ editTableStructure: "", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ editTableStructure: "Mod+D", copyCurrentRow: "" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
+  });
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "openDataInNewTab");
@@ -60,6 +161,14 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
+  it("registers a conflict-free global shortcut for Zen mode", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "toggleZenMode");
+
+    expect(definition).toMatchObject({ labelKey: "settings.shortcutToggleZenMode", scope: "global", defaultShortcut: "Shift+Mod+F12" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.toggleZenMode).toBe("Shift+Mod+F12");
+    expect(findShortcutConflict("toggleZenMode", DEFAULT_SHORTCUT_SETTINGS.toggleZenMode, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
   it("uses Shift+Enter for inserting a complete line below", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "insertLineBelow");
 
@@ -67,6 +176,17 @@ describe("shortcutRegistry editor actions", () => {
     expect(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow).toBe("Shift+Enter");
     expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.insertLineBelow)).toBe("Shift-Enter");
     expect(findShortcutConflict("insertLineBelow", DEFAULT_SHORTCUT_SETTINGS.insertLineBelow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("registers a conflict-free platform shortcut for joining lines", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "joinLines");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Mod+J" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.joinLines).toBe("Mod+J");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.joinLines, "MacIntel")).toBe("Cmd+J");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.joinLines, "Win32")).toBe("Ctrl+J");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.joinLines)).toBe("Mod-j");
+    expect(findShortcutConflict("joinLines", DEFAULT_SHORTCUT_SETTINGS.joinLines, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("resolves the close-other-tabs default per platform and heals cross-platform synced defaults", () => {
@@ -114,8 +234,10 @@ describe("shortcutRegistry editor actions", () => {
     expect(shortcuts.executeSql).toBe("Mod+Shift+Enter");
     expect(shortcuts.formatSql).toBe("Shift+Mod+F");
     expect(shortcuts.toggleLineComment).toBe("Mod+/");
+    expect(shortcuts.toggleBlockComment).toBe("Shift+Alt+A");
     expect(shortcuts.indentMore).toBe("");
     expect(shortcuts.indentLess).toBe("Shift+Tab");
+    expect(shortcuts.joinLines).toBe("Mod+J");
     expect(shortcuts.duplicateLine).toBe("Mod+D");
     expect(shortcuts.deleteLine).toBe("Shift+Mod+K");
     expect(shortcuts.moveLineUp).toBe("Alt+ArrowUp");
@@ -126,6 +248,9 @@ describe("shortcutRegistry editor actions", () => {
     expect(shortcuts.redo).toBe("Shift+Mod+Z");
     expect(shortcuts.selectAll).toBe("Mod+A");
     expect(shortcuts.extendSelection).toBe("Alt+W");
+    // 测试平台（Linux runner）解析为非 mac 默认键；mac 变体在下方单独断言。
+    expect(shortcuts.addNextSelectionOccurrence).toBe(selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence"));
+    expect(shortcuts.selectAllSelectionOccurrences).toBe(selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences"));
     expect(shortcuts.uppercaseSelection).toBe("Shift+Alt+U");
     expect(shortcuts.lowercaseSelection).toBe("Shift+Alt+L");
     expect(shortcuts.exPasteSqlInCondition).toBe("");
@@ -137,6 +262,40 @@ describe("shortcutRegistry editor actions", () => {
 
     expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+W" });
     expect(DEFAULT_SHORTCUT_SETTINGS.extendSelection).toBe("Alt+W");
+  });
+
+  it("registers occurrence selection shortcuts for query editor multi-selection", () => {
+    const next = SHORTCUT_DEFINITIONS.find((item) => item.id === "addNextSelectionOccurrence");
+    const all = SHORTCUT_DEFINITIONS.find((item) => item.id === "selectAllSelectionOccurrences");
+
+    expect(next).toMatchObject({ scope: "editor", defaultShortcut: "Ctrl+G" });
+    expect(all).toMatchObject({ scope: "editor", defaultShortcut: "Ctrl+Mod+G" });
+    expect(findShortcutConflict("selectAllSelectionOccurrences", DEFAULT_SHORTCUT_SETTINGS.selectAllSelectionOccurrences, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("resolves occurrence selection defaults per platform", () => {
+    expect(selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", "MacIntel")).toBe("Ctrl+G");
+    expect(selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", "MacIntel")).toBe("Ctrl+Mod+G");
+    // Ctrl+Mod+G is unreachable on non-mac (CodeMirror expands Mod→Ctrl) and
+    // Ctrl+G there is find-next, so Windows/Linux use the JetBrains-style keys.
+    expect(selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", "Win32")).toBe("Alt+J");
+    expect(selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", "Win32")).toBe("Ctrl+Alt+Shift+J");
+    expect(selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", "Linux x86_64")).toBe("Alt+J");
+    expect(selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", "Linux x86_64")).toBe("Ctrl+Alt+Shift+J");
+    // Both platform defaults must survive the CodeMirror key conversion.
+    expect(shortcutToCodeMirrorKey(selectionOccurrenceDefaultShortcut("selectAllSelectionOccurrences", "Win32"))).toBe("Ctrl-Alt-Shift-j");
+    expect(shortcutToCodeMirrorKey(selectionOccurrenceDefaultShortcut("addNextSelectionOccurrence", "Win32"))).toBe("Alt-j");
+  });
+
+  it("registers an IDEA/DataGrip-style Alt+/ shortcut for manually triggering completion", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "triggerCompletion");
+
+    expect(definition).toMatchObject({ scope: "editor", defaultShortcut: "Alt+/" });
+    expect(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion).toBe("Alt+/");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, "Win32")).toBe("Alt+/");
+    expect(formatShortcut(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, "MacIntel")).toBe("Alt+/");
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.triggerCompletion)).toBe("Alt-/");
+    expect(findShortcutConflict("triggerCompletion", DEFAULT_SHORTCUT_SETTINGS.triggerCompletion, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
   it("detects conflicts between formatter editor shortcuts and other editor shortcuts", () => {

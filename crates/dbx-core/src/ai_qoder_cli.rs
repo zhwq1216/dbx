@@ -511,8 +511,10 @@ pub async fn run_qoder_agent(
 mod tests {
     use super::{
         build_qoder_command, classify_qoder_run_error, parse_qoder_jsonl_event, parse_qoder_models, qoder_cli_env,
-        qoder_process_env_with_path, QoderCommandSpec, QoderRunOptions,
+        QoderRunOptions,
     };
+    #[cfg(not(windows))]
+    use super::{qoder_process_env_with_path, QoderCommandSpec};
     use crate::agent_events::AgentEvent;
     use crate::ai::{AiApiStyle, AiAuthMethod, AiConfig, AiEffortSelection, AiProvider, AiReasoningLevel};
 
@@ -525,10 +527,13 @@ mod tests {
             model: model.to_string(),
             models: Vec::new(),
             api_style: AiApiStyle::Completions,
+            custom_headers: Default::default(),
             proxy_enabled: false,
             proxy_url: String::new(),
+            skip_tls_verify: false,
             enable_thinking: true,
             reasoning_level: AiReasoningLevel::Default,
+            max_output_tokens: None,
             runtime_effort: None,
             context_window: None,
             max_retries: None,

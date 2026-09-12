@@ -2,10 +2,11 @@
 import { computed, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
-import { ArrowDownWideNarrow, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Play, Search, Trash2, Upload, X } from "@lucide/vue";
+import { ArrowDownWideNarrow, ChevronsDownUp, Download, FilePlus, FileText, FolderCog, FolderClosed, FolderOpen, FolderPlus, Library, LocateFixed, Pencil, Play, Search, Trash2, Upload, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import CustomContextMenu, { type ContextMenuItem as CtxMenuItem } from "@/components/ui/CustomContextMenu.vue";
+import HelpTooltip from "@/components/ui/tooltip/HelpTooltip.vue";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
@@ -18,8 +19,13 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { focusSidebarRenameInput } from "@/lib/sidebar/sidebarRenameFocus";
 import { savedSqlFolderBranchFileCount } from "@/lib/savedSql/savedSqlFolderCounts";
 import { collectSavedSqlDirectoryImportFiles } from "@/lib/savedSql/savedSqlDirectoryImport";
+import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFileName";
+import { savedSqlImportTarget } from "@/lib/savedSql/savedSqlImportTarget";
 import { savedSqlExecutionTargetFromTab, type SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
+import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
+import { orderedListRangeAnchorIndex, orderedListSelectionIntent } from "@/lib/selection/orderedListSelection";
+import { resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
 import type { SavedSqlFile, SavedSqlFolder } from "@/types/database";
 
 const { t } = useI18n();
@@ -65,21 +71,14 @@ function folderPath(folder: SavedSqlFolder) {
   return parts.join(" / ");
 }
 
-function activeImportConnectionId() {
-  return connectionStore.activeConnectionId || connectionStore.connections[0]?.id || "";
-}
-
-function importConnectionIdForFolder(folder?: SavedSqlFolder) {
-  return folder?.connectionId || activeImportConnectionId();
-}
-
 function sanitizeFileSystemSegment(name: string) {
   return name.replace(/[<>:"/\\|?*\p{Cc}]/gu, "_").trim() || "untitled";
 }
 
 function uniqueImportedName(name: string, takenNames: Set<string>) {
   const normalized = ensureSqlExtension(name);
-  if (!takenNames.has(normalized)) {
+  const normalizedTakenNames = new Set([...takenNames].map((takenName) => ensureSqlExtension(takenName).toLocaleLowerCase()));
+  if (!normalizedTakenNames.has(normalized.toLocaleLowerCase())) {
     takenNames.add(normalized);
     return normalized;
   }
@@ -88,7 +87,7 @@ function uniqueImportedName(name: string, takenNames: Set<string>) {
   let counter = 2;
   while (true) {
     const candidate = `${base} (${counter}).sql`;
-    if (!takenNames.has(candidate)) {
+    if (!normalizedTakenNames.has(candidate.toLocaleLowerCase())) {
       takenNames.add(candidate);
       return candidate;
     }
@@ -96,34 +95,12 @@ function uniqueImportedName(name: string, takenNames: Set<string>) {
   }
 }
 
-async function downloadText(content: string, fileName: string) {
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = fileName;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
-
 async function exportSingleFile(file: SavedSqlFile) {
   try {
     const loadedFile = await savedSqlStore.ensureFileContent(file.id);
     if (!loadedFile) return;
-    const defaultFileName = sanitizeFileSystemSegment(ensureSqlExtension(file.name));
-    if (isTauriRuntime()) {
-      const { save } = await import("@tauri-apps/plugin-dialog");
-      const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-      const path = await save({
-        defaultPath: defaultFileName,
-        filters: [{ name: "SQL", extensions: ["sql"] }],
-      });
-      if (!path) return;
-      await writeTextFile(path, loadedFile.sql);
-    } else {
-      await downloadText(loadedFile.sql, defaultFileName);
-    }
-    toast(t("sqlLibrary.exported"), 2000);
+    const result = await exportSavedSqlFileContent(loadedFile.sql, file.name);
+    if (result === "saved") toast(t("sqlLibrary.exported"), 2000);
   } catch (e: any) {
     toast(t("sqlLibrary.exportFailed", { message: e?.message || String(e) }), 5000);
   }
@@ -223,12 +200,6 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
     return;
   }
 
-  const connectionId = importConnectionIdForFolder(targetFolder);
-  if (!connectionId) {
-    toast(t("sqlLibrary.noConnection"), 4000);
-    return;
-  }
-
   try {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
@@ -247,30 +218,35 @@ async function importDirectoryIntoLibrary(targetFolder?: SavedSqlFolder) {
 
     const folderCache = new Map<string, SavedSqlFolder>();
     const takenNamesByFolder = new Map<string, Set<string>>();
+    const folderConnectionId = targetFolder?.connectionId ?? "";
 
     for (const file of importFiles) {
-      const folderId = await resolveImportedFolder(connectionId, targetFolder?.id, file.folderNames, folderCache);
+      const sourceTarget = resolveExternalSqlFileTarget(file.path, (connectionId) => !!connectionStore.getConfig(connectionId), unassociatedExternalSqlFileTarget());
+      const importTarget = savedSqlImportTarget(sourceTarget, targetFolder);
+      const folderId = await resolveImportedFolder(folderConnectionId, targetFolder?.id, file.folderNames, folderCache);
       const folderKey = folderId || "";
       let takenNames = takenNamesByFolder.get(folderKey);
       if (!takenNames) {
-        takenNames = new Set(savedSqlStore.listFiles(connectionId, folderId).map((savedFile) => savedFile.name));
+        takenNames = new Set((folderId ? savedSqlStore.filesInFolder(folderId) : savedSqlStore.filesWithoutFolder()).map((savedFile) => savedFile.name));
         takenNamesByFolder.set(folderKey, takenNames);
       }
       const path = file.path;
       const content = await api.readExternalSqlFile(path);
       const displayName = uniqueImportedName(file.name, takenNames);
       await savedSqlStore.saveFile({
-        connectionId,
+        connectionId: importTarget.connectionId,
         folderId,
         name: displayName,
-        database: "",
+        database: importTarget.database,
+        catalog: importTarget.catalog,
         sql: content,
       });
     }
 
     toast(t("sqlLibrary.imported", { count: importFiles.length }), 2500);
   } catch (e: any) {
-    toast(t("sqlLibrary.importFailed", { message: externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params)) }), 5000);
+    const message = e?.code === "SAVED_SQL_NAME_CONFLICT" ? savedSqlErrorMessage(e, t) : externalSqlFileOpenErrorMessage(e, (key, params) => t(key, params));
+    toast(t("sqlLibrary.importFailed", { message }), 5000);
   }
 }
 
@@ -370,7 +346,7 @@ const visibleFolderRows = computed<SqlLibraryRow[]>(() => {
   const appendFolder = (folder: SavedSqlFolder, depth: number) => {
     if (!folderBranchMatchesQuery(folder)) return;
     rows.push({ type: "folder", folder, depth, folderIndex: folderIndex++ });
-    if (!isFolderExpanded(folder.id)) return;
+    if (!isFolderExpanded(folder)) return;
     for (const child of childFolders(folder.id)) {
       appendFolder(child, depth + 1);
     }
@@ -399,16 +375,52 @@ const hasAnyVisibleItem = computed(() => visibleFolderRows.value.length > 0 || v
 
 const collapsedFolders = ref<Set<string>>(new Set());
 
+// Seed a default-collapsed state when the library first becomes non-empty so
+// opening the panel shows every directory collapsed instead of fully expanded.
+// Guarded so a later in-session folder add/delete does not re-collapse folders
+// the user has already expanded.
+const collapseDefaultsSeeded = ref(false);
+watch(
+  () => savedSqlStore.allFolders.map((folder) => folder.id),
+  (folderIds) => {
+    if (collapseDefaultsSeeded.value || folderIds.length === 0) return;
+    collapseDefaultsSeeded.value = true;
+    collapsedFolders.value = new Set(folderIds);
+  },
+  { immediate: true },
+);
+
+function collapseAllFolders() {
+  // Collapse the whole tree: every folder currently known, including nested
+  // children, is marked collapsed in one shot.
+  const folderIds = savedSqlStore.allFoldersTreeOrder.map((folder) => folder.id);
+  if (folderIds.length === 0) return;
+  collapsedFolders.value = new Set(folderIds);
+}
+
+function hasAnyFolder(): boolean {
+  return savedSqlStore.allFolders.length > 0;
+}
+
 function toggleFolder(folderId: string) {
   if (suppressNextRowClick.value) return;
+  // While a search is active, matched branches are force-expanded for
+  // visibility; toggling them would only mutate hidden state that surprises
+  // after the search is cleared, so treat the click as a no-op.
+  if (searchQuery.value) {
+    const folder = savedSqlStore.allFolders.find((candidate) => candidate.id === folderId);
+    if (folder && folderBranchMatchesQuery(folder)) return;
+  }
   const next = new Set(collapsedFolders.value);
   if (next.has(folderId)) next.delete(folderId);
   else next.add(folderId);
   collapsedFolders.value = next;
 }
 
-function isFolderExpanded(folderId: string) {
-  return !collapsedFolders.value.has(folderId);
+function isFolderExpanded(folder: SavedSqlFolder) {
+  // 搜索激活时,命中的分支自动展开以便直接看到匹配文件;否则遵循折叠状态。
+  if (searchQuery.value && folderBranchMatchesQuery(folder)) return true;
+  return !collapsedFolders.value.has(folder.id);
 }
 
 async function openNewFolderInput(parentFolderId?: string) {
@@ -434,15 +446,19 @@ async function openNewQueryInFolder(folder?: SavedSqlFolder) {
 
   const takenNames = folder ? new Set(savedSqlStore.filesInFolder(folder.id).map((f) => f.name)) : new Set(savedSqlStore.filesWithoutFolder().map((f) => f.name));
   const name = uniqueImportedName("new_query.sql", takenNames);
-  const file = await savedSqlStore.saveFile({
-    connectionId,
-    folderId: folder?.id,
-    name,
-    database: "",
-    sql: "",
-  });
-  const tabId = queryStore.openSavedSql(file);
-  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
+  try {
+    const file = await savedSqlStore.saveFile({
+      connectionId,
+      folderId: folder?.id,
+      name,
+      database: "",
+      sql: "",
+    });
+    const tabId = queryStore.openSavedSql(file);
+    connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? file.connectionId;
+  } catch (error) {
+    toast(t("savedSql.saveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
 }
 
 // Batch selection state
@@ -496,6 +512,40 @@ function clearSelection() {
   lastClickedItemIndex.value = null;
 }
 
+function clearPanelSelection() {
+  clearSelection();
+  activeItemId.value = null;
+  activeItemType.value = null;
+}
+
+function rangeAnchorIndex() {
+  const activeItem = activeItemId.value && activeItemType.value ? { id: activeItemId.value, type: activeItemType.value } : null;
+  return orderedListRangeAnchorIndex(allSelectableItems.value, lastClickedItemIndex.value, activeItem);
+}
+
+function selectRangeTo(currentIndex: number) {
+  const anchorIndex = rangeAnchorIndex();
+  if (anchorIndex === null) {
+    const current = allSelectableItems.value[currentIndex];
+    selectedFileIds.value = new Set(current?.type === "file" ? [current.id] : []);
+    selectedFolderIds.value = new Set(current?.type === "folder" ? [current.id] : []);
+    lastClickedItemIndex.value = currentIndex;
+    return;
+  }
+
+  const start = Math.min(anchorIndex, currentIndex);
+  const end = Math.max(anchorIndex, currentIndex);
+  const nextFiles = new Set(selectedFileIds.value);
+  const nextFolders = new Set(selectedFolderIds.value);
+  for (let i = start; i <= end; i++) {
+    const item = allSelectableItems.value[i];
+    if (item?.type === "file") nextFiles.add(item.id);
+    else if (item?.type === "folder") nextFolders.add(item.id);
+  }
+  selectedFileIds.value = nextFiles;
+  selectedFolderIds.value = nextFolders;
+}
+
 function setActiveItem(id: string, type: "file" | "folder") {
   activeItemId.value = id;
   activeItemType.value = type;
@@ -517,22 +567,21 @@ function isFolderActive(folderId: string): boolean {
   return activeItemType.value === "folder" && activeItemId.value === folderId;
 }
 
-function selectionRowClass(selected: boolean, active: boolean): string {
-  if (selected) return "bg-primary/10 text-foreground";
-  if (active) return "bg-primary/12 text-foreground";
-  return "hover:bg-accent";
+function selectionRowClass(selected: boolean, active: boolean, contextOpen: boolean): string {
+  if (selected || active || contextOpen) return "bg-accent text-accent-foreground";
+  return "hover:bg-accent/40";
 }
 
 function fileRowClass(fileId: string): string {
-  return selectionRowClass(isFileSelected(fileId), isFileActive(fileId));
+  return selectionRowClass(isFileSelected(fileId), isFileActive(fileId), isContextFile(fileId));
 }
 
 function folderRowClass(folderId: string): string {
-  return selectionRowClass(isFolderSelected(folderId), isFolderActive(folderId));
+  return selectionRowClass(isFolderSelected(folderId), isFolderActive(folderId), isContextFolder(folderId));
 }
 
 function fileMetaClass(fileId: string): string {
-  return isFileSelected(fileId) || isFileActive(fileId) ? "text-foreground/70" : "text-muted-foreground";
+  return isFileSelected(fileId) || isFileActive(fileId) || isContextFile(fileId) ? "text-accent-foreground" : "text-muted-foreground";
 }
 
 function isFileDirty(file: SavedSqlFile): boolean {
@@ -605,7 +654,11 @@ async function confirmRename() {
   if (type === "folder") {
     await savedSqlStore.renameFolder(id, name);
   } else {
-    await savedSqlStore.renameFile(id, ensureSqlExtension(name));
+    try {
+      await savedSqlStore.renameFile(id, ensureSqlExtension(name));
+    } catch (error) {
+      toast(t("savedSql.renameFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+    }
   }
 }
 
@@ -662,9 +715,13 @@ async function executeBatchDelete() {
 async function moveFilesToFolder(fileIds: string[], folderId?: string) {
   const movableIds = [...new Set(fileIds)].filter((id) => savedSqlStore.getFile(id));
   if (movableIds.length === 0) return;
-  await savedSqlStore.moveFilesToFolder(movableIds, folderId);
-  clearSelection();
-  toast(t("sqlLibrary.moveSuccess", { count: movableIds.length }), 2000);
+  try {
+    await savedSqlStore.moveFilesToFolder(movableIds, folderId);
+    clearSelection();
+    toast(t("sqlLibrary.moveSuccess", { count: movableIds.length }), 2000);
+  } catch (error) {
+    toast(t("sqlLibrary.moveFailed", { message: savedSqlErrorMessage(error, t) }), 5000);
+  }
 }
 
 async function openFile(file: SavedSqlFile, targetMode?: SavedSqlOpenTargetMode) {
@@ -672,21 +729,25 @@ async function openFile(file: SavedSqlFile, targetMode?: SavedSqlOpenTargetMode)
   const loadedFile = await savedSqlStore.ensureFileContent(file.id);
   if (!loadedFile) return;
   const tabId = queryStore.openSavedSql(loadedFile, { targetMode });
-  connectionStore.activeConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? loadedFile.connectionId;
+  const openedConnectionId = queryStore.tabs.find((tab) => tab.id === tabId)?.connectionId ?? loadedFile.connectionId;
+  if (openedConnectionId) connectionStore.activeConnectionId = openedConnectionId;
   void savedSqlStore.recordFileUsage(loadedFile.id);
 }
 
 function handleFileClick(file: SavedSqlFile, event: MouseEvent) {
   if (suppressNextRowClick.value) return;
 
-  const isMeta = event.metaKey || event.ctrlKey;
-  const isShift = event.shiftKey;
+  const selectionIntent = orderedListSelectionIntent(event);
 
   // Find current file index in unified list
   const currentIndex = allSelectableItems.value.findIndex((item) => item.type === "file" && item.id === file.id);
   if (currentIndex < 0) return;
 
-  if (isMeta) {
+  if (selectionIntent === "range") {
+    event.preventDefault();
+    event.stopPropagation();
+    selectRangeTo(currentIndex);
+  } else if (selectionIntent === "toggle") {
     // Toggle selection
     event.preventDefault();
     event.stopPropagation();
@@ -698,55 +759,29 @@ function handleFileClick(file: SavedSqlFile, event: MouseEvent) {
     }
     selectedFileIds.value = next;
     lastClickedItemIndex.value = currentIndex;
-  } else if (isShift) {
-    // Range selection - additive mode (add to existing selection)
-    event.preventDefault();
-    event.stopPropagation();
-
-    const startIndex = lastClickedItemIndex.value ?? 0;
-    const start = Math.min(startIndex, currentIndex);
-    const end = Math.max(startIndex, currentIndex);
-
-    // Add to existing selection (additive mode)
-    const nextFiles = new Set(selectedFileIds.value);
-    const nextFolders = new Set(selectedFolderIds.value);
-    for (let i = start; i <= end; i++) {
-      const item = allSelectableItems.value[i];
-      if (item) {
-        if (item.type === "file") {
-          nextFiles.add(item.id);
-        } else {
-          nextFolders.add(item.id);
-        }
-      }
-    }
-    selectedFileIds.value = nextFiles;
-    selectedFolderIds.value = nextFolders;
-    lastClickedItemIndex.value = currentIndex;
   } else {
-    // Normal click - open file, clear selection but keep anchor, and set active
-    const hadSelection = hasSelection.value;
+    // A plain click exits batch selection and makes this the single active item.
     clearSelection();
+    lastClickedItemIndex.value = currentIndex;
     setActiveItem(file.id, "file");
     openFile(file);
-    // Set anchor for future shift-click even when not selecting
-    if (!hadSelection) {
-      lastClickedItemIndex.value = currentIndex;
-    }
   }
 }
 
 function handleFolderClick(folder: SavedSqlFolder, event: MouseEvent) {
   if (suppressNextRowClick.value) return;
 
-  const isMeta = event.metaKey || event.ctrlKey;
-  const isShift = event.shiftKey;
+  const selectionIntent = orderedListSelectionIntent(event);
 
   // Find current folder index in unified list
   const currentIndex = allSelectableItems.value.findIndex((item) => item.type === "folder" && item.id === folder.id);
   if (currentIndex < 0) return;
 
-  if (isMeta) {
+  if (selectionIntent === "range") {
+    event.preventDefault();
+    event.stopPropagation();
+    selectRangeTo(currentIndex);
+  } else if (selectionIntent === "toggle") {
     // Toggle selection
     event.preventDefault();
     event.stopPropagation();
@@ -758,45 +793,24 @@ function handleFolderClick(folder: SavedSqlFolder, event: MouseEvent) {
     }
     selectedFolderIds.value = next;
     lastClickedItemIndex.value = currentIndex;
-  } else if (isShift) {
-    // Range selection - additive mode (add to existing selection)
-    event.preventDefault();
-    event.stopPropagation();
-
-    const startIndex = lastClickedItemIndex.value ?? 0;
-    const start = Math.min(startIndex, currentIndex);
-    const end = Math.max(startIndex, currentIndex);
-
-    // Add to existing selection (additive mode)
-    const nextFiles = new Set(selectedFileIds.value);
-    const nextFolders = new Set(selectedFolderIds.value);
-    for (let i = start; i <= end; i++) {
-      const item = allSelectableItems.value[i];
-      if (item) {
-        if (item.type === "file") {
-          nextFiles.add(item.id);
-        } else {
-          nextFolders.add(item.id);
-        }
-      }
-    }
-    selectedFileIds.value = nextFiles;
-    selectedFolderIds.value = nextFolders;
-    lastClickedItemIndex.value = currentIndex;
   } else {
-    // Normal click - toggle folder expansion, clear selection but keep anchor, and set active
-    const hadSelection = hasSelection.value;
+    // A plain click exits batch selection and makes this the single active item.
     clearSelection();
+    lastClickedItemIndex.value = currentIndex;
     setActiveItem(folder.id, "folder");
     toggleFolder(folder.id);
-    // Set anchor for future shift-click even when not selecting
-    if (!hadSelection) {
-      lastClickedItemIndex.value = currentIndex;
-    }
   }
 }
 
 const contextTarget = ref<SavedSqlFolder | SavedSqlFile | "panel" | null>(null);
+
+function isContextFile(fileId: string): boolean {
+  return contextTarget.value !== null && contextTarget.value !== "panel" && "sql" in contextTarget.value && contextTarget.value.id === fileId;
+}
+
+function isContextFolder(folderId: string): boolean {
+  return contextTarget.value !== null && contextTarget.value !== "panel" && !("sql" in contextTarget.value) && contextTarget.value.id === folderId;
+}
 
 function folderMoveMenuItems(fileIds: string[]): CtxMenuItem[] {
   const files = [...new Set(fileIds)].map((id) => savedSqlStore.getFile(id)).filter((file): file is SavedSqlFile => Boolean(file));
@@ -1062,7 +1076,7 @@ function onDocumentMouseUp() {
   const dropPromise = hadActiveDrag ? performDrop() : Promise.resolve();
   if (hadActiveDrag) markSuppressedClick();
   resetDragState();
-  void dropPromise;
+  void dropPromise.catch((error) => toast(t("sqlLibrary.moveFailed", { message: savedSqlErrorMessage(error, t) }), 5000));
 }
 
 document.addEventListener("mousemove", onDocumentMouseMove, true);
@@ -1077,8 +1091,9 @@ onBeforeUnmount(() => {
 
 function handleDragMouseDown(event: MouseEvent, id: string, type: Extract<DragItemType, "folder" | "file">) {
   if (event.button !== 0) return;
-  // Skip drag when modifier keys are pressed (for selection)
-  if (event.shiftKey || event.metaKey || event.ctrlKey) return;
+  // Batch actions use the context menu. Starting a single-item drag here can
+  // suppress the plain click that is supposed to exit batch selection.
+  if (hasSelection.value || event.shiftKey || event.metaKey || event.ctrlKey) return;
   const target = event.target as HTMLElement | null;
   if (target?.closest("[data-no-drag='true']")) return;
   pendingDrag = {
@@ -1143,8 +1158,16 @@ function showDropInside(targetId: string) {
   <div class="h-full flex flex-col overflow-hidden border-l bg-background select-none">
     <div class="h-9 flex items-center gap-1 px-2 border-b shrink-0 bg-muted/20">
       <span class="text-[13px] font-medium">{{ t("sqlLibrary.title") }}</span>
+      <HelpTooltip :label="t('sqlLibrary.storageHelp')" side="bottom" :side-offset="4" trigger-class="h-4 w-4" content-class="max-w-[320px] whitespace-pre-line">
+        {{ t("sqlLibrary.storageHelp") }}
+      </HelpTooltip>
       <span v-if="hasSelection" class="text-[12px] text-muted-foreground ml-1">({{ selectedCount }})</span>
       <span class="flex-1" />
+      <LightTooltip :text="t('sqlLibrary.collapseAll')" side="bottom" :delay="0" :close-delay="0" nowrap :disabled="!hasAnyFolder()">
+        <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="!hasAnyFolder() || sortMode === 'date'" @click="collapseAllFolders">
+          <ChevronsDownUp class="h-3 w-3" />
+        </Button>
+      </LightTooltip>
       <LightTooltip :text="sortMode === 'folder' ? t('sqlLibrary.sortByDate') : t('sqlLibrary.sortByFolder')" side="bottom" :delay="0" :close-delay="0" nowrap>
         <Button variant="ghost" size="icon" class="h-5 w-5" @click="sortMode = sortMode === 'folder' ? 'date' : 'folder'">
           <ArrowDownWideNarrow :class="['h-3 w-3', sortMode === 'date' ? 'text-primary' : '']" />
@@ -1187,6 +1210,7 @@ function showDropInside(targetId: string) {
         <template #default="{ onContextMenu }">
           <div
             class="h-full"
+            @click.self="clearPanelSelection"
             @contextmenu.capture="contextTarget = 'panel'"
             @contextmenu.prevent="
               contextTarget = 'panel';
@@ -1293,7 +1317,7 @@ function showDropInside(targetId: string) {
                 >
                   <div v-if="showDropBefore(row.folder.id)" class="absolute left-2 right-2 top-0 border-t-2 border-primary" />
                   <div v-if="showDropAfter(row.folder.id)" class="absolute left-2 right-2 bottom-0 border-b-2 border-primary" />
-                  <component :is="isFolderExpanded(row.folder.id) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
+                  <component :is="isFolderExpanded(row.folder) ? FolderOpen : FolderClosed" class="h-4 w-4 text-amber-500 shrink-0" />
                   <template v-if="isRenamingFolder(row.folder.id)">
                     <input
                       :ref="setRenameInputRef"
@@ -1434,7 +1458,7 @@ function showDropInside(targetId: string) {
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" size="sm" @click="showDeleteConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
-          <Button variant="destructive" size="sm" @click="executeDelete">{{ t("dangerDialog.confirm") }}</Button>
+          <Button variant="destructive" size="sm" @click="executeDelete">{{ t("dangerDialog.deleteConfirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1450,7 +1474,7 @@ function showDropInside(targetId: string) {
         </DialogHeader>
         <DialogFooter>
           <Button variant="outline" size="sm" @click="showBatchDeleteConfirm = false">{{ t("dangerDialog.cancel") }}</Button>
-          <Button variant="destructive" size="sm" @click="executeBatchDelete">{{ t("dangerDialog.confirm") }}</Button>
+          <Button variant="destructive" size="sm" @click="executeBatchDelete">{{ t("dangerDialog.deleteConfirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

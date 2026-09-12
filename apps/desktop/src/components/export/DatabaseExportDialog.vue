@@ -12,8 +12,8 @@ import * as api from "@/lib/backend/api";
 import type { ExportProgress } from "@/lib/backend/api";
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildAllDatabaseExportPlan, generateDatabaseExportId, runDatabaseExportUntilTerminal, runWithDatabaseBackupSnapshot, shouldUseDatabaseBackupSnapshot, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
-import { buildSelectedTablesPayload } from "@/lib/export/databaseExportSelection";
+import { buildAllDatabaseExportPlan, filterExportableSchemas, generateDatabaseExportId, runDatabaseExportUntilTerminal, runWithDatabaseBackupSnapshot, shouldUseDatabaseBackupSnapshot, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
+import { buildSelectedTablesPayload, isDatabaseExportTableSelectionValid } from "@/lib/export/databaseExportSelection";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { Input } from "@/components/ui/input";
@@ -103,13 +103,24 @@ const exportElapsedText = computed(() => {
   return formatDataTransferDuration((exportFinishedAt.value ?? currentTime.value) - exportStartedAt.value);
 });
 
-const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
+const sqlConnections = computed(() => store.connections.filter((c) => !["redis", "mongodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(c.db_type)));
 
 const canExport = computed(() => {
   const hasContent = includeStructure.value || includeData.value || includeObjects.value;
   if (!connectionId.value || !hasContent || isExporting.value) return false;
   if (exportAllDatabases.value) return selectedDatabases.value.length > 0 && !loadingMeta.value;
-  return database.value && schema.value && !loadingTables.value && !tableError.value && (tables.value.length === 0 || selectedTables.value.length > 0);
+  return (
+    database.value &&
+    schema.value &&
+    !loadingTables.value &&
+    !tableError.value &&
+    isDatabaseExportTableSelectionValid({
+      allTableCount: tables.value.length,
+      selectedTableCount: selectedTables.value.length,
+      includeStructure: includeStructure.value,
+      includeData: includeData.value,
+    })
+  );
 });
 
 const selectedTableSet = computed(() => new Set(selectedTables.value));
@@ -139,6 +150,17 @@ function sanitizeFileName(value: string): string {
 function joinExportPath(directory: string, fileName: string): string {
   const separator = directory.includes("\\") ? "\\" : "/";
   return `${directory.replace(/[\\/]+$/, "")}${separator}${fileName}`;
+}
+
+// Lenient exports write per-object failures into the SQL file as `-- ERROR`
+// comments and still finish; completion must warn instead of reporting plain
+// success (#8184).
+function toastDatabaseExportCompletion(errorCount: number, errorSummary: string | null) {
+  if (errorCount > 0) {
+    toast(t("databaseExport.exportSuccessWithErrors", { count: errorCount, firstError: errorSummary ?? "" }), 8000);
+    return;
+  }
+  toast(t("databaseExport.exportSuccess"), 3000);
 }
 
 async function loadDatabases(connId: string) {
@@ -193,7 +215,7 @@ async function loadSchemas(preferredSchema = "") {
     return;
   }
 
-  const schemaList = await api.listSchemas(connectionId.value, database.value);
+  const schemaList = filterExportableSchemas(await api.listSchemas(connectionId.value, database.value), config?.db_type);
   const selected = preferredSchema && schemaList.includes(preferredSchema) ? preferredSchema : schemaList.includes("public") ? "public" : (schemaList[0] ?? "");
   schemas.value = schemaList;
   schema.value = selected;
@@ -267,7 +289,7 @@ async function buildExportPlanForDatabases(dbs: string[]): Promise<AllDatabaseEx
   const schemasByDatabase: Record<string, string[]> = {};
   if (schemaAware) {
     for (const db of dbs) {
-      schemasByDatabase[db] = await api.listSchemas(connectionId.value, db);
+      schemasByDatabase[db] = filterExportableSchemas(await api.listSchemas(connectionId.value, db), dbType);
     }
   }
   return buildAllDatabaseExportPlan({ databases: dbs, schemaAware, schemasByDatabase, dbType });
@@ -294,6 +316,8 @@ async function startExport() {
       });
       if (!path) return;
       filePath = path;
+      const { dirname } = await import("@tauri-apps/api/path");
+      await api.recordDatabaseExportDestination(await dirname(path));
     } catch (e: any) {
       toast(e?.message || String(e), 5000);
       return;
@@ -340,7 +364,7 @@ async function startExport() {
           database: database.value,
           schema: schema.value,
           filePath,
-          selectedTables: buildSelectedTablesPayload(tables.value, selectedTables.value),
+          selectedTables: includeStructure.value || includeData.value ? buildSelectedTablesPayload(tables.value, selectedTables.value) : undefined,
           includeStructure: includeStructure.value,
           includeData: includeData.value,
           includeObjects: includeObjects.value,
@@ -357,7 +381,7 @@ async function startExport() {
             finishExportTiming();
             exportDone.value = true;
             isExporting.value = false;
-            toast(t("databaseExport.exportSuccess"), 3000);
+            toastDatabaseExportCompletion(progress.errorCount ?? 0, progress.errorSummary ?? null);
           } else if (progress.status === "Error") {
             finishExportTiming();
             exportError.value = progress.error;
@@ -404,6 +428,7 @@ async function startAllDatabasesExport() {
       });
       if (!path || Array.isArray(path)) return;
       directoryPath = path;
+      await api.recordDatabaseExportDestination(path);
     } catch (e: any) {
       toast(e?.message || String(e), 5000);
       return;
@@ -418,6 +443,8 @@ async function startAllDatabasesExport() {
   exportCancelled.value = false;
   batchDatabaseIndex.value = 0;
   batchRowsExported.value = 0;
+  let batchLenientErrorCount = 0;
+  let batchFirstErrorSummary: string | null = null;
 
   const dbs = [...selectedDatabases.value];
   const connectionType = store.getConfig(connectionId.value)?.db_type;
@@ -461,7 +488,7 @@ async function startAllDatabasesExport() {
       const filePath = isTauriRuntime() ? joinExportPath(directoryPath, `${sanitizeFileName(item.fileStem)}.sql`) : `__web_export_${currentExportId}.sql`;
       let currentDatabaseRowsExported = 0;
 
-      await runWithDatabaseBackupSnapshot(
+      const terminal = await runWithDatabaseBackupSnapshot(
         {
           connectionId: connectionId.value,
           database: item.database,
@@ -516,6 +543,8 @@ async function startAllDatabasesExport() {
         (terminal) => terminal.status === "Done",
       );
 
+      batchLenientErrorCount += terminal.errorCount ?? 0;
+      batchFirstErrorSummary ??= terminal.errorSummary ?? null;
       if (exportError.value || exportCancelled.value) break;
       activeDatabaseExportId.value = "";
     }
@@ -533,10 +562,16 @@ async function startAllDatabasesExport() {
         totalRows: null,
         status: "Done",
         error: null,
+        errorCount: batchLenientErrorCount,
+        errorSummary: batchFirstErrorSummary,
       };
       exportProgress.value = finalProgress;
       updateDatabaseExportTask(batchId, finalProgress);
-      toast(t("databaseExport.exportAllSuccess", { count: dbs.length }), 3000);
+      if (batchLenientErrorCount > 0) {
+        toast(t("databaseExport.exportAllSuccessWithErrors", { count: dbs.length, errorCount: batchLenientErrorCount, firstError: batchFirstErrorSummary ?? "" }), 8000);
+      } else {
+        toast(t("databaseExport.exportAllSuccess", { count: dbs.length }), 3000);
+      }
     }
   } catch (e: any) {
     exportError.value = e?.message || String(e);
@@ -893,7 +928,7 @@ watch(
               <div v-else class="h-full rounded-full transition-[width] duration-300" :class="exportError ? 'bg-destructive' : exportCancelled ? 'bg-yellow-500' : exportDone ? 'bg-green-500' : 'bg-primary'" :style="{ width: `${exportDone ? 100 : progressPercent}%` }" />
             </div>
 
-            <div v-if="exportProgress && !isPreparingExport" class="text-xs text-muted-foreground">
+            <div v-if="exportProgress && !isPreparingExport" class="text-xs text-muted-foreground tabular-nums">
               {{ exportAllDatabases ? t("databaseExport.allRowsExported", { count: exportProgress.rowsExported.toLocaleString() }) : t("databaseExport.rowsExported", { current: exportProgress.objectIndex, total: exportProgress.totalObjects, count: exportProgress.rowsExported.toLocaleString() }) }}
             </div>
             <div v-if="exportElapsedText" class="text-xs text-muted-foreground tabular-nums">

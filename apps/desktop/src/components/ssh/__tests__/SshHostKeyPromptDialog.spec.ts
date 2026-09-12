@@ -124,6 +124,15 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     expect(dialogSource).not.toContain(':dismissible="false"');
   });
 
+  it("stacks above dialogs that mount later than it does", () => {
+    // Dialog portals teleport into <body> when their component mounts, so paint
+    // order at the shared z-50 follows mount order. This prompt mounts once at
+    // app start, so an on-demand dialog (e.g. the connection editor) would bury
+    // it and block the whole window. It must opt out of the default layer.
+    expect(dialogSource).toContain('overlay-class="z-[200]"');
+    expect(dialogSource).toContain('portal-class="z-[200]"');
+  });
+
   it("shows an SSE host-key prompt and posts the user's acceptance", async () => {
     await mountDialog();
 
@@ -227,6 +236,34 @@ describe("SshHostKeyPromptDialog web bridge", () => {
     // A disconnect re-arms polling so prompts are not lost during the outage.
     eventSource?.error();
     expect(setSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows worker-upload consent buttons and wraps the digest and path", async () => {
+    await mountDialog();
+
+    const eventSource = MockEventSource.instances[0];
+    eventSource?.emit({
+      type: "prompt",
+      request: {
+        id: "worker-1",
+        kind: "WorkerUploadConsent",
+        host: "203.0.113.10",
+        port: 22,
+        fingerprint: "08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+        prompt: "/home/testuser/.cache/dbx/sqlite-worker/session-ebd207de-8f26cd6e-08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709",
+      },
+    });
+    await nextTick();
+
+    expect(document.body.textContent).toContain("203.0.113.10:22");
+    expect(document.body.textContent).toContain("08ca4746e8fbf97038a93105d3ef023112e3f66bc097869401628c00acea7709");
+    expect(document.body.textContent).toContain("/home/testuser/.cache/dbx/sqlite-worker/");
+    expect(dialogSource).toContain("break-all");
+    expect(dialogSource).toContain("shrink-0");
+
+    const buttons = [...document.body.querySelectorAll("button")].map((button) => button.textContent?.trim());
+    expect(buttons).toContain("Cancel");
+    expect(buttons).toContain("Upload");
   });
 
   it("submits a keyboard-interactive TOTP challenge as a secret response", async () => {
