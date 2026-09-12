@@ -21,6 +21,11 @@ describe("right sidebar panel entry points", () => {
     expect(appSource).toContain("@close=\"closeRightSidebarPanel('sqlFile')\"");
   });
 
+  it("toggles the AI panel through the configured global shortcut", () => {
+    expect(appSource).toContain("isToggleAiPanelShortcut(e, shortcuts)");
+    expect(appSource).toContain('toggleRightSidebarPanel("ai");');
+  });
+
   it("routes welcome, history analysis, selection, and error-fix opens through the same controller", () => {
     expect(appSource).toContain("@show-history=\"openRightSidebarPanel('history')\"");
     expect(functionSource("fixWithAi", "sendSelectionToAi")).toContain('openRightSidebarPanel("ai")');
@@ -67,7 +72,10 @@ describe("right sidebar panel entry points", () => {
     expect(appSource).toContain("isToggleZenModeShortcut(e, shortcuts) && supportsZenMode(activeTab.value?.mode)");
     expect(appSource).toContain('@toggle-zen-mode="toggleZenMode"');
     expect(appSource).toContain('v-show="sidebarOpen && !isZenMode"');
-    expect(appSource).toContain('v-show="!sidebarOpen && !isZenMode"');
+    expect(appSource).toContain(':show-sidebar-expand="!sidebarOpen && !isZenMode"');
+    expect(toolbarSource).toContain('<Tooltip v-if="showSidebarExpand">');
+    expect(toolbarSource).toContain("@click=\"emit('expand-sidebar')\"");
+    expect(appSource).toContain('@expand-sidebar="setSidebarOpen(true)"');
     expect(appSource).toContain('v-show="!isAiPanelMaximized || isZenMode"');
     expect(appSource).toContain('v-show="!isZenMode"');
   });

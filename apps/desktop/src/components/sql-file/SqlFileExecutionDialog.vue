@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { uuid } from "@/lib/common/utils";
 import { useI18n } from "vue-i18n";
 import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
@@ -18,8 +18,8 @@ import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { connectionIsEffectivelyReadOnly, ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
 import { fetchSqlFileTargetOptions } from "@/composables/useDatabaseOptions";
-import { requiresSqlFileTargetDatabaseSelection } from "@/lib/connection/connectionLevelDatabaseBootstrap";
-import { cancelSqlFileExecution, executeSqlFiles, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus } from "@/lib/backend/api";
+import { requiresSqlFileTargetDatabaseSelection, supportsConnectionLevelDatabaseBootstrap } from "@/lib/connection/connectionLevelDatabaseBootstrap";
+import { cancelSqlFileExecution, executeSqlFiles, inspectSqlFileTables, listenSqlFileProgress, previewSqlFile, type SqlFilePreview, type SqlFileProgress, type SqlFileStatus, type SqlFileTable } from "@/lib/backend/api";
 import { buildDisplayFileNames, tooltipText as computeTooltipText } from "./sqlFilePreviewLabel";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -97,7 +97,21 @@ const terminalError = ref("");
 const activeExecutionTask = ref<ExportTask | null>(null);
 const failureDetailsExpanded = ref(false);
 const refreshedTarget = ref(false);
-const MAX_WEB_SQL_FILE_BYTES = 200 * 1024 * 1024;
+const DEFAULT_WEB_SQL_FILE_BYTES = 200 * 1024 * 1024;
+const webSqlFileUploadMaxBytes = ref(DEFAULT_WEB_SQL_FILE_BYTES);
+
+// The web server caps SQL file uploads via DBX_SQL_FILE_UPLOAD_MAX_MB; fetch the
+// effective limit once so the client-side pre-check matches the server rule.
+onMounted(async () => {
+  if (isDesktopRuntime) return;
+  try {
+    const { loadSqlFileUploadMaxBytes } = await import("@/lib/backend/http");
+    const value = await loadSqlFileUploadMaxBytes();
+    if (Number.isFinite(value) && value > 0) webSqlFileUploadMaxBytes.value = value;
+  } catch {
+    // Fall back to the built-in default; the server still rejects oversized uploads.
+  }
+});
 
 // Per-file results accumulated from backend file-boundary events during
 // multi-file execution.  Populated only when previews.length > 1.
@@ -121,9 +135,59 @@ const sqlConnections = computed(() => store.connections.filter((c) => !["redis",
 
 const selectedConnection = computed(() => sqlConnections.value.find((c) => c.id === connectionId.value));
 
+const restoreSelectedTables = ref(false);
+const backupTables = ref<SqlFileTable[]>([]);
+const selectedTableKeys = ref(new Set<string>());
+const tableSearch = ref("");
+const loadingTables = ref(false);
+const tableScanError = ref("");
+let tableScanGeneration = 0;
+const canSelectTables = computed(() => previews.value.length === 1 && supportsConnectionLevelDatabaseBootstrap(selectedConnection.value));
+const tableKey = (table: SqlFileTable) => JSON.stringify([table.database, table.name]);
+const tableLabel = (table: SqlFileTable) => (table.database ? `${table.database}.${table.name}` : table.name);
+const filteredBackupTables = computed(() => backupTables.value.filter((table) => tableLabel(table).toLocaleLowerCase().includes(tableSearch.value.trim().toLocaleLowerCase())));
+const selectedTables = computed(() => backupTables.value.filter((table) => selectedTableKeys.value.has(tableKey(table))));
+const allFilteredTablesSelected = computed(() => filteredBackupTables.value.length > 0 && filteredBackupTables.value.every((table) => selectedTableKeys.value.has(tableKey(table))));
+
+function toggleTable(table: SqlFileTable) {
+  const key = tableKey(table);
+  if (selectedTableKeys.value.has(key)) selectedTableKeys.value.delete(key);
+  else selectedTableKeys.value.add(key);
+}
+
+function toggleFilteredTables() {
+  const deselect = allFilteredTablesSelected.value;
+  for (const table of filteredBackupTables.value) {
+    if (deselect) selectedTableKeys.value.delete(tableKey(table));
+    else selectedTableKeys.value.add(tableKey(table));
+  }
+}
+
+watch([restoreSelectedTables, canSelectTables, () => previews.value[0]?.filePath, connectionId, open], async () => {
+  const generation = ++tableScanGeneration;
+  backupTables.value = [];
+  selectedTableKeys.value = new Set();
+  tableSearch.value = "";
+  tableScanError.value = "";
+  loadingTables.value = false;
+  if (!canSelectTables.value) restoreSelectedTables.value = false;
+  if (!open.value || !restoreSelectedTables.value || !canSelectTables.value) return;
+  loadingTables.value = true;
+  try {
+    const tables = await inspectSqlFileTables(previews.value[0]!.filePath);
+    if (generation !== tableScanGeneration) return;
+    backupTables.value = tables;
+  } catch (error: any) {
+    if (generation === tableScanGeneration) tableScanError.value = error?.message || String(error);
+  } finally {
+    if (generation === tableScanGeneration) loadingTables.value = false;
+  }
+});
+
 const canStart = computed(() => {
   const connection = selectedConnection.value;
   if (previews.value.length === 0 || !connection || running.value || loadingPreview.value || loadingDatabases.value) return false;
+  if (restoreSelectedTables.value && (loadingTables.value || tableScanError.value || selectedTables.value.length === 0)) return false;
   let hasDatabaseContext = false;
   const canExecuteWithoutSelectedDatabase = previews.value.every((item) => {
     if (!hasDatabaseContext && !item.canExecuteWithoutSelectedDatabase) return false;
@@ -245,6 +309,7 @@ function resetState() {
   databaseOptions.value = [];
   loadingDatabases.value = false;
   continueOnError.value = false;
+  restoreSelectedTables.value = false;
   resetExecution();
 }
 
@@ -285,8 +350,9 @@ async function previewSelectedSqlFile(fileOrPath: string | File) {
     return previewSqlFile(fileOrPath as string);
   }
   const file = fileOrPath as File;
-  if (file.size > MAX_WEB_SQL_FILE_BYTES) {
-    throw new Error(`File too large: ${file.size} bytes (max ${MAX_WEB_SQL_FILE_BYTES} bytes)`);
+  const uploadLimit = webSqlFileUploadMaxBytes.value;
+  if (file.size > uploadLimit) {
+    throw new Error(`File too large: ${file.size} bytes (max ${uploadLimit} bytes)`);
   }
   const { previewSqlFile: previewWebSqlFile } = await import("@/lib/backend/http");
   return previewWebSqlFile(file);
@@ -480,6 +546,7 @@ async function startExecution() {
           database: database.value.trim(),
           filePath: previews.value[0]!.filePath,
           continueOnError: continueOnError.value,
+          ...(restoreSelectedTables.value ? { selectedTables: selectedTables.value.map((table) => ({ ...table })) } : {}),
         },
         previews.value.map((item) => item.filePath),
       );
@@ -685,6 +752,33 @@ watch(
               </div>
             </div>
           </div>
+        </div>
+
+        <div v-if="canSelectTables" class="min-w-0 space-y-2.5" data-table-restore>
+          <Label class="text-xs">{{ t("sqlFile.restoreScope") }}</Label>
+          <div class="flex items-center gap-4 text-xs">
+            <label class="flex items-center gap-2"><input v-model="restoreSelectedTables" type="radio" :value="false" :disabled="running" name="sql-file-restore-scope" />{{ t("sqlFile.restoreAll") }}</label>
+            <label class="flex items-center gap-2"><input v-model="restoreSelectedTables" type="radio" :value="true" :disabled="running" name="sql-file-restore-scope" />{{ t("sqlFile.restoreSelectedTables") }}</label>
+          </div>
+          <template v-if="restoreSelectedTables">
+            <p class="text-xs text-muted-foreground">{{ t("sqlFile.restoreTablesOnly") }}</p>
+            <div v-if="loadingTables" class="flex items-center gap-2 text-xs" role="status"><Loader2 class="h-3.5 w-3.5 animate-spin" />{{ t("sqlFile.scanningTables") }}</div>
+            <p v-else-if="tableScanError" class="break-words text-xs text-destructive" role="alert">{{ tableScanError }}</p>
+            <template v-else>
+              <Input v-model="tableSearch" :placeholder="t('sqlFile.searchBackupTables')" :aria-label="t('sqlFile.searchBackupTables')" :disabled="running" class="h-8 text-xs" />
+              <div class="flex items-center justify-between gap-3 text-xs">
+                <label class="flex items-center gap-2"><input type="checkbox" :checked="allFilteredTablesSelected" :disabled="running || filteredBackupTables.length === 0" @change="toggleFilteredTables" />{{ t("sqlFile.selectVisibleTables") }}</label>
+                <span>{{ t("sqlFile.selectedTableCount", { selected: selectedTables.length, total: backupTables.length }) }}</span>
+              </div>
+              <div class="max-h-44 overflow-y-auto border rounded-md p-2 text-xs">
+                <label v-for="table in filteredBackupTables" :key="tableKey(table)" class="flex min-w-0 items-center gap-2 py-1">
+                  <input type="checkbox" :checked="selectedTableKeys.has(tableKey(table))" :disabled="running" @change="toggleTable(table)" />
+                  <span class="min-w-0 break-all">{{ tableLabel(table) }}</span>
+                </label>
+                <p v-if="filteredBackupTables.length === 0" class="text-muted-foreground">{{ t("sqlFile.noBackupTables") }}</p>
+              </div>
+            </template>
+          </template>
         </div>
 
         <div class="min-w-0 space-y-2.5">

@@ -3,6 +3,7 @@ import { isMacShortcutPlatform, parseShortcutStrokes, shortcutDisplayParts } fro
 export type ShortcutActionId =
   | "executeSql"
   | "executeSqlInNewResultTab"
+  | "explainSql"
   | "formatSql"
   | "expandSelectStar"
   | "toggleLineComment"
@@ -45,6 +46,7 @@ export type ShortcutActionId =
   | "closeOtherTabs"
   | "focusSearch"
   | "quickOpen"
+  | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
   | "tabSwitcher"
@@ -118,12 +120,19 @@ export function tabNavigationHistoryDefaultShortcut(direction: "back" | "forward
   return `${modifier}+Alt+${key}`;
 }
 
+// Match the shortcut used by VS Code to open its chat sidebar on macOS while
+// keeping a reachable, non-conflicting equivalent on Windows/Linux.
+export function toggleAiPanelDefaultShortcut(platform = globalThis.navigator?.platform || ""): string {
+  return isMacShortcutPlatform(platform) ? "Ctrl+Mod+I" : "Ctrl+Alt+I";
+}
+
 const PLATFORM_DEFAULT_SHORTCUTS: Partial<Record<ShortcutActionId, ReadonlySet<string>>> = {
   closeOtherTabs: new Set(["Alt+Mod+W", "Shift+Alt+W"]),
   navigateTabHistoryBack: new Set(["Ctrl+Alt+ArrowLeft", "Mod+Alt+ArrowLeft"]),
   navigateTabHistoryForward: new Set(["Ctrl+Alt+ArrowRight", "Mod+Alt+ArrowRight"]),
   addNextSelectionOccurrence: new Set(["Ctrl+G", "Alt+J"]),
   selectAllSelectionOccurrences: new Set(["Ctrl+Mod+G", "Ctrl+Alt+Shift+J"]),
+  toggleAiPanel: new Set(["Ctrl+Mod+I", "Ctrl+Alt+I"]),
 };
 const LEGACY_CLOSE_TAB_DEFAULT = "Meta+W";
 const LEGACY_COPY_CURRENT_ROW_DEFAULT = "Mod+D";
@@ -142,6 +151,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutExecuteSqlInNewResultTab",
     scope: "editor",
     defaultShortcut: "Mod+\\",
+  },
+  {
+    id: "explainSql",
+    labelKey: "toolbar.explainPlan",
+    scope: "editor",
+    defaultShortcut: "Mod+E",
   },
   {
     id: "formatSql",
@@ -396,6 +411,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+P",
   },
   {
+    id: "toggleAiPanel",
+    labelKey: "settings.shortcutToggleAiPanel",
+    scope: "global",
+    defaultShortcut: toggleAiPanelDefaultShortcut(),
+  },
+  {
     id: "navigateTabHistoryBack",
     labelKey: "settings.shortcutNavigateTabHistoryBack",
     scope: "global",
@@ -614,6 +635,7 @@ function shortcutDefaultForPlatform(definition: ShortcutDefinition, platform: st
   if (definition.id === "closeOtherTabs") return closeOtherTabsDefaultShortcut(platform);
   if (definition.id === "navigateTabHistoryBack") return tabNavigationHistoryDefaultShortcut("back", platform);
   if (definition.id === "navigateTabHistoryForward") return tabNavigationHistoryDefaultShortcut("forward", platform);
+  if (definition.id === "toggleAiPanel") return toggleAiPanelDefaultShortcut(platform);
   return definition.defaultShortcut;
 }
 

@@ -9,7 +9,7 @@ use redis::{
     TlsMode, Value as RedisRawValue,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, future::Future, time::Duration, time::Instant};
+use std::{collections::HashMap, future::Future, sync::OnceLock, time::Duration, time::Instant};
 use tokio::sync::{Mutex, MutexGuard};
 
 use super::json_value_for_js;
@@ -26,6 +26,9 @@ const CLUSTER_CURSOR_NODE_MASK: u64 = (1 << CLUSTER_CURSOR_NODE_BITS) - 1;
 const CLUSTER_CURSOR_SCAN_MASK: u64 = (1 << (64 - CLUSTER_CURSOR_NODE_BITS)) - 1;
 const CLUSTER_SCAN_SESSION_LIMIT: usize = 128;
 const CLUSTER_SCAN_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const COLLECTION_OVERFLOW_SESSION_LIMIT: usize = 128;
+const COLLECTION_OVERFLOW_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const COLLECTION_OVERFLOW_CURSOR_START: u64 = 1 << 52;
 const INVALID_CLUSTER_SCAN_CURSOR_ERROR: &str = "Redis cluster scan cursor is invalid or expired";
 const MAX_SAFE_INTEGER_CURSOR: u64 = (1 << 53) - 1;
 
@@ -66,6 +69,45 @@ pub struct RedisScanResult {
     pub cursor: u64,
     pub keys: Vec<RedisKeyInfo>,
     pub total_keys: u64,
+}
+
+/// The expiration shapes the Key Browser may apply to a batch of selected keys.
+///
+/// The variants mirror [`set_ttl`] and [`set_expire_at`] exactly, so a batch edit
+/// and a single-key edit send the same Redis command for the same user choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisKeysExpiry {
+    Persist,
+    Ttl(i64),
+    At(i64),
+}
+
+impl RedisKeysExpiry {
+    /// Keeps the single-key convention where a non-positive TTL means PERSIST.
+    pub fn from_ttl(ttl: i64) -> Self {
+        if ttl > 0 {
+            Self::Ttl(ttl)
+        } else {
+            Self::Persist
+        }
+    }
+
+    fn command(self) -> &'static str {
+        match self {
+            Self::Persist => "PERSIST",
+            Self::Ttl(_) => "EXPIRE",
+            Self::At(_) => "EXPIREAT",
+        }
+    }
+}
+
+/// Per-key outcome of a batch expiration so a partial failure stays reportable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedisKeysExpiryResult {
+    /// Keys the server confirmed as updated.
+    pub applied: u64,
+    /// Selected keys that no longer exist, so the caller can offer a retry.
+    pub missing_key_raws: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +461,102 @@ impl RedisClusterScanSessions {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisCollectionOverflowKind {
+    Hash,
+    Set,
+}
+
+#[derive(Debug, Clone)]
+enum RedisCollectionOverflowItems {
+    Hash(Vec<RedisHashItem>),
+    Set(Vec<RedisSetItem>),
+}
+
+#[derive(Debug, Clone)]
+struct RedisCollectionOverflowSession {
+    key: Vec<u8>,
+    kind: RedisCollectionOverflowKind,
+    filter: Option<String>,
+    sort_direction: Option<String>,
+    followup_cursor: u64,
+    items: RedisCollectionOverflowItems,
+    last_used: Instant,
+}
+
+#[derive(Debug)]
+struct RedisCollectionOverflowSessions {
+    next_cursor: u64,
+    entries: HashMap<u64, RedisCollectionOverflowSession>,
+}
+
+impl Default for RedisCollectionOverflowSessions {
+    fn default() -> Self {
+        Self { next_cursor: COLLECTION_OVERFLOW_CURSOR_START, entries: HashMap::new() }
+    }
+}
+
+impl RedisCollectionOverflowSessions {
+    fn take_matching(
+        &mut self,
+        cursor: u64,
+        key: &[u8],
+        kind: RedisCollectionOverflowKind,
+        filter: Option<&str>,
+        sort_direction: Option<&str>,
+    ) -> Option<RedisCollectionOverflowSession> {
+        self.remove_expired();
+        let matches = self.entries.get(&cursor).is_some_and(|session| {
+            session.key == key
+                && session.kind == kind
+                && session.filter.as_deref() == filter
+                && session.sort_direction.as_deref() == sort_direction
+        });
+        matches.then(|| self.entries.remove(&cursor)).flatten()
+    }
+
+    fn insert(&mut self, mut session: RedisCollectionOverflowSession) -> u64 {
+        self.remove_expired();
+        while self.entries.len() >= COLLECTION_OVERFLOW_SESSION_LIMIT {
+            let Some(oldest) = self.entries.iter().min_by_key(|(_, entry)| entry.last_used).map(|(id, _)| *id) else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+
+        let cursor = self.next_available_cursor();
+        session.last_used = Instant::now();
+        self.entries.insert(cursor, session);
+        cursor
+    }
+
+    fn reinsert(&mut self, cursor: u64, mut session: RedisCollectionOverflowSession) {
+        self.remove_expired();
+        session.last_used = Instant::now();
+        self.entries.insert(cursor, session);
+    }
+
+    fn remove_expired(&mut self) {
+        self.entries.retain(|_, entry| entry.last_used.elapsed() < COLLECTION_OVERFLOW_SESSION_TTL);
+    }
+
+    fn next_available_cursor(&mut self) -> u64 {
+        loop {
+            let cursor = self.next_cursor;
+            self.next_cursor =
+                if cursor >= MAX_SAFE_INTEGER_CURSOR { COLLECTION_OVERFLOW_CURSOR_START } else { cursor + 1 };
+            if cursor != 0 && !self.entries.contains_key(&cursor) {
+                return cursor;
+            }
+        }
+    }
+}
+
+fn collection_overflow_sessions() -> &'static Mutex<RedisCollectionOverflowSessions> {
+    static SESSIONS: OnceLock<Mutex<RedisCollectionOverflowSessions>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(RedisCollectionOverflowSessions::default()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1020,6 +1158,35 @@ pub async fn connect_direct_node(
         redis::Client::open(connection_info(&endpoint.host, endpoint.port, tls, insecure, username, password, 0))
             .map_err(|e| format!("Redis connection failed: {e}"))?;
     connect_client(client).await
+}
+
+pub async fn connect_monitor(
+    config: &ConnectionConfig,
+    host: &str,
+    port: u16,
+    timeout: std::time::Duration,
+) -> Result<redis::aio::Monitor, String> {
+    let mut last_error = String::new();
+    for info in standalone_connection_infos(config, host, port) {
+        let client = redis::Client::open(info).map_err(|error| error.to_string())?;
+        let connect = async {
+            let mut validation = client.get_multiplexed_async_connection().await?;
+            redis::cmd("MONITOR").query_async::<()>(&mut validation).await?;
+            drop(validation);
+            client.get_async_monitor().await
+        };
+        match tokio::time::timeout(timeout, connect).await {
+            Ok(Ok(monitor)) => return Ok(monitor),
+            Ok(Err(error)) => {
+                last_error = error.to_string();
+                if !is_redis_auth_error(&last_error) {
+                    break;
+                }
+            }
+            Err(_) => return Err("Redis MONITOR connection timed out".to_string()),
+        }
+    }
+    Err(last_error)
 }
 
 pub async fn connect_pubsub(
@@ -2119,6 +2286,11 @@ where
 {
     let argv = parse_command_argv(command_text)?;
     let command = argv[0].to_ascii_uppercase();
+    if command == "MONITOR" {
+        return Err(
+            "MONITOR requires a dedicated streaming connection; run MONITOR alone in the query editor".to_string()
+        );
+    }
     let safety = classify_command(&command);
     if !skip_safety_check && safety == RedisCommandSafety::Blocked {
         return Err(format!("Redis command is blocked for safety: {command}"));
@@ -2484,7 +2656,7 @@ where
         }
         "set" => {
             let len: u64 = redis::cmd("SCARD").arg(key).query_async(con).await.unwrap_or(0);
-            let (cursor, items) = sscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE).await?;
+            let (cursor, items) = sscan_bounded_page(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
             RedisValueData::Set { items, total: len, scan_cursor: (cursor > 0).then_some(cursor) }
         }
         "zset" => {
@@ -2496,7 +2668,7 @@ where
         }
         "hash" => {
             let len: u64 = redis::cmd("HLEN").arg(key).query_async(con).await.unwrap_or(0);
-            let (cursor, mut items) = hscan_page_raw(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
+            let (cursor, mut items) = hscan_bounded_page(con, key, 0, COLLECTION_PAGE_SIZE, None).await?;
             attach_hash_field_ttls(con, key, &mut items).await?;
             RedisValueData::Hash { items, total: len, scan_cursor: (cursor > 0).then_some(cursor) }
         }
@@ -3064,9 +3236,12 @@ where
 /// source deletion in the same server-side critical section.  Hash-field
 /// expiry commands were introduced after hashes themselves, so the script
 /// probes them with `pcall` and preserves expiry when the server supports
-/// HTTL/HEXPIRE while remaining usable on older Redis versions.  Permission
-/// errors are surfaced instead of being mistaken for an unsupported command,
-/// since silently dropping a field TTL would be data loss.
+/// HTTL/HEXPIRE while remaining usable on older Redis versions.  Some Redis
+/// cluster implementations reject the whole script before Lua can probe those
+/// commands, so this also retries with an equivalent script that never
+/// references field-expiry commands.  Permission errors are surfaced instead
+/// of being mistaken for an unsupported command, since silently dropping a
+/// field TTL would be data loss.
 pub async fn hash_field_update<C>(
     con: &mut C,
     key: &[u8],
@@ -3077,7 +3252,7 @@ pub async fn hash_field_update<C>(
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    const SCRIPT: &str = r#"
+    const SCRIPT_WITH_FIELD_TTL: &str = r#"
         local key = KEYS[1]
         local old_field = ARGV[1]
         local new_field = ARGV[2]
@@ -3205,8 +3380,76 @@ where
         return 2
     "#;
 
+    const SCRIPT_WITHOUT_FIELD_TTL: &str = r#"
+        local key = KEYS[1]
+        local old_field = ARGV[1]
+        local new_field = ARGV[2]
+        local value = ARGV[3]
+
+        if redis.call('HEXISTS', key, old_field) == 0 then
+            return 0
+        end
+        if redis.call('HGET', key, old_field) == false then
+            return 0
+        end
+        if old_field ~= new_field and redis.call('HEXISTS', key, new_field) == 1 then
+            return -1
+        end
+
+        if old_field ~= new_field then
+            local delete_probe = redis.pcall('HDEL', key, new_field)
+            if type(delete_probe) == 'table' and delete_probe.err ~= nil then
+                return -3
+            end
+        end
+
+        local written = redis.pcall('HSET', key, new_field, value)
+        if type(written) == 'table' and written.err ~= nil then
+            return -3
+        end
+
+        if old_field == new_field then
+            return 1
+        end
+
+        local deleted = redis.pcall('HDEL', key, old_field)
+        if type(deleted) == 'table' and deleted.err ~= nil then
+            redis.pcall('HDEL', key, new_field)
+            return -3
+        end
+        if tonumber(deleted) ~= 1 then
+            redis.pcall('HDEL', key, new_field)
+            return 0
+        end
+        return 2
+    "#;
+
+    let error =
+        match execute_hash_field_update_script(con, SCRIPT_WITH_FIELD_TTL, key, old_field, new_field, value).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+    if !is_hash_field_update_cluster_script_rejection(&error) {
+        return Err(error);
+    }
+
+    execute_hash_field_update_script(con, SCRIPT_WITHOUT_FIELD_TTL, key, old_field, new_field, value).await
+}
+
+async fn execute_hash_field_update_script<C>(
+    con: &mut C,
+    script: &str,
+    key: &[u8],
+    old_field: &str,
+    new_field: &str,
+    value: &str,
+) -> Result<(), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
     let result = redis::cmd("EVAL")
-        .arg(SCRIPT)
+        .arg(script)
         .arg(1)
         .arg(key)
         .arg(old_field)
@@ -3248,6 +3491,11 @@ fn is_hash_field_update_acl_compatibility_error(error: &redis::RedisError) -> bo
         || detail.contains("hdel")
         || detail.contains("httl")
         || detail.contains("hexpire")
+}
+
+fn is_hash_field_update_cluster_script_rejection(error: &str) -> bool {
+    let detail = error.to_ascii_lowercase();
+    detail.contains("bad lua script for redis cluster") && (detail.contains("httl") || detail.contains("hexpire"))
 }
 
 pub async fn list_push<C>(con: &mut C, key: &[u8], value: &str, ttl: Option<i64>) -> Result<(), String>
@@ -3453,6 +3701,69 @@ where
     }
 }
 
+/// Applies one expiration command per selected key in a single bounded round trip.
+///
+/// Keys the caller already selected may disappear concurrently, so this reports
+/// them instead of failing the whole batch. `PERSIST` stays idempotent: Redis
+/// answers 0 both for a missing key and for a key that is already persistent.
+pub async fn set_keys_expiry<C>(
+    con: &mut C,
+    keys: &[Vec<u8>],
+    expiry: RedisKeysExpiry,
+) -> Result<RedisKeysExpiryResult, String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    if keys.is_empty() {
+        return Ok(RedisKeysExpiryResult::default());
+    }
+
+    let mut pipeline = Pipeline::with_capacity(keys.len());
+    for key in keys {
+        match expiry {
+            RedisKeysExpiry::Persist => {
+                pipeline.cmd("PERSIST").arg(key.as_slice());
+            }
+            RedisKeysExpiry::Ttl(ttl) => {
+                pipeline.cmd("EXPIRE").arg(key.as_slice()).arg(ttl);
+            }
+            RedisKeysExpiry::At(expire_at) => {
+                pipeline.cmd("EXPIREAT").arg(key.as_slice()).arg(expire_at);
+            }
+        }
+    }
+
+    let replies: Vec<RedisRawValue> = pipeline.query_async(con).await.map_err(|error| error.to_string())?;
+    summarize_keys_expiry(keys, expiry, &replies)
+}
+
+fn summarize_keys_expiry(
+    keys: &[Vec<u8>],
+    expiry: RedisKeysExpiry,
+    replies: &[RedisRawValue],
+) -> Result<RedisKeysExpiryResult, String> {
+    let mut result = RedisKeysExpiryResult::default();
+    for (index, key) in keys.iter().enumerate() {
+        let applied = match expiry {
+            // Redis answers 0 for an already-persistent key as well, so PERSIST
+            // must not be reported as a missing key.
+            RedisKeysExpiry::Persist => true,
+            _ => match replies.get(index) {
+                Some(RedisRawValue::Int(reply)) => *reply == 1,
+                // A server error or a short reply must not be silently counted
+                // as a per-key miss, or the batch would report a false success.
+                _ => return Err(format!("{} did not return one reply per selected key", expiry.command())),
+            },
+        };
+        if applied {
+            result.applied += 1;
+        } else {
+            result.missing_key_raws.push(redis_key_bytes_to_raw(key));
+        }
+    }
+    Ok(result)
+}
+
 pub async fn set_hash_field_ttl<C>(con: &mut C, key: &[u8], field: &str, ttl: i64) -> Result<(), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -3556,9 +3867,9 @@ where
         }
         "set" => {
             let (next_cursor, items) = if let Some(query) = filter_query {
-                sscan_filtered_page_raw(con, key, cursor, count, query).await?
+                sscan_bounded_page(con, key, cursor, count, Some(query)).await?
             } else {
-                sscan_page_raw(con, key, cursor, count).await?
+                sscan_bounded_page(con, key, cursor, count, None).await?
             };
             Ok(RedisCollectionPage::Set { items, scan_cursor: (next_cursor > 0).then_some(next_cursor) })
         }
@@ -3583,9 +3894,9 @@ where
         }
         "hash" => {
             let (next_cursor, mut items) = if let Some(query) = filter_query {
-                hscan_filtered_page_raw(con, key, cursor, count, query).await?
+                hscan_bounded_page(con, key, cursor, count, Some(query)).await?
             } else {
-                hscan_page_raw(con, key, cursor, count, None).await?
+                hscan_bounded_page(con, key, cursor, count, None).await?
             };
             attach_hash_field_ttls(con, key, &mut items).await?;
             Ok(RedisCollectionPage::Hash { items, scan_cursor: (next_cursor > 0).then_some(next_cursor) })
@@ -3754,6 +4065,162 @@ where
     Ok((items, cur))
 }
 
+async fn hscan_bounded_page<C>(
+    con: &mut C,
+    key: &[u8],
+    cursor: u64,
+    count: usize,
+    filter_query: Option<&str>,
+) -> Result<(u64, Vec<RedisHashItem>), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let count = count.max(1);
+    if let Some(page) = take_hash_overflow_page(key, cursor, count, filter_query).await {
+        return Ok(page);
+    }
+
+    let (next_cursor, mut items) = if let Some(query) = filter_query {
+        hscan_filtered_page_raw(con, key, cursor, count, query).await?
+    } else {
+        hscan_page_raw(con, key, cursor, count, None).await?
+    };
+    let next_cursor = store_hash_overflow_page(key, &mut items, count, next_cursor, filter_query).await;
+    Ok((next_cursor, items))
+}
+
+async fn sscan_bounded_page<C>(
+    con: &mut C,
+    key: &[u8],
+    cursor: u64,
+    count: usize,
+    filter_query: Option<&str>,
+) -> Result<(u64, Vec<RedisSetItem>), String>
+where
+    C: ConnectionLike + Send + Sync + Unpin,
+{
+    let count = count.max(1);
+    if let Some(page) = take_set_overflow_page(key, cursor, count, filter_query).await {
+        return Ok(page);
+    }
+
+    let (next_cursor, mut items) = if let Some(query) = filter_query {
+        sscan_filtered_page_raw(con, key, cursor, count, query).await?
+    } else {
+        sscan_page_raw(con, key, cursor, count).await?
+    };
+    let next_cursor = store_set_overflow_page(key, &mut items, count, next_cursor, filter_query).await;
+    Ok((next_cursor, items))
+}
+
+async fn take_hash_overflow_page(
+    key: &[u8],
+    cursor: u64,
+    count: usize,
+    filter_query: Option<&str>,
+) -> Option<(u64, Vec<RedisHashItem>)> {
+    if cursor == 0 {
+        return None;
+    }
+
+    let mut sessions = collection_overflow_sessions().lock().await;
+    let mut session = sessions.take_matching(cursor, key, RedisCollectionOverflowKind::Hash, filter_query, None)?;
+    let page = match &mut session.items {
+        RedisCollectionOverflowItems::Hash(items) => take_vec_page(items, count),
+        RedisCollectionOverflowItems::Set(_) => return None,
+    };
+    let has_buffered_items = match &session.items {
+        RedisCollectionOverflowItems::Hash(items) => !items.is_empty(),
+        RedisCollectionOverflowItems::Set(_) => false,
+    };
+    let next_cursor = if has_buffered_items { cursor } else { session.followup_cursor };
+    if has_buffered_items {
+        sessions.reinsert(cursor, session);
+    }
+    Some((next_cursor, page))
+}
+
+async fn take_set_overflow_page(
+    key: &[u8],
+    cursor: u64,
+    count: usize,
+    filter_query: Option<&str>,
+) -> Option<(u64, Vec<RedisSetItem>)> {
+    if cursor == 0 {
+        return None;
+    }
+
+    let mut sessions = collection_overflow_sessions().lock().await;
+    let mut session = sessions.take_matching(cursor, key, RedisCollectionOverflowKind::Set, filter_query, None)?;
+    let page = match &mut session.items {
+        RedisCollectionOverflowItems::Set(items) => take_vec_page(items, count),
+        RedisCollectionOverflowItems::Hash(_) => return None,
+    };
+    let has_buffered_items = match &session.items {
+        RedisCollectionOverflowItems::Set(items) => !items.is_empty(),
+        RedisCollectionOverflowItems::Hash(_) => false,
+    };
+    let next_cursor = if has_buffered_items { cursor } else { session.followup_cursor };
+    if has_buffered_items {
+        sessions.reinsert(cursor, session);
+    }
+    Some((next_cursor, page))
+}
+
+async fn store_hash_overflow_page(
+    key: &[u8],
+    items: &mut Vec<RedisHashItem>,
+    count: usize,
+    followup_cursor: u64,
+    filter_query: Option<&str>,
+) -> u64 {
+    if items.len() <= count {
+        return followup_cursor;
+    }
+
+    let overflow = items.split_off(count);
+    let session = RedisCollectionOverflowSession {
+        key: key.to_vec(),
+        kind: RedisCollectionOverflowKind::Hash,
+        filter: filter_query.map(str::to_string),
+        sort_direction: None,
+        followup_cursor,
+        items: RedisCollectionOverflowItems::Hash(overflow),
+        last_used: Instant::now(),
+    };
+    collection_overflow_sessions().lock().await.insert(session)
+}
+
+async fn store_set_overflow_page(
+    key: &[u8],
+    items: &mut Vec<RedisSetItem>,
+    count: usize,
+    followup_cursor: u64,
+    filter_query: Option<&str>,
+) -> u64 {
+    if items.len() <= count {
+        return followup_cursor;
+    }
+
+    let overflow = items.split_off(count);
+    let session = RedisCollectionOverflowSession {
+        key: key.to_vec(),
+        kind: RedisCollectionOverflowKind::Set,
+        filter: filter_query.map(str::to_string),
+        sort_direction: None,
+        followup_cursor,
+        items: RedisCollectionOverflowItems::Set(overflow),
+        last_used: Instant::now(),
+    };
+    collection_overflow_sessions().lock().await.insert(session)
+}
+
+fn take_vec_page<T>(items: &mut Vec<T>, count: usize) -> Vec<T> {
+    let page_size = items.len().min(count.max(1));
+    let overflow = items.split_off(page_size);
+    std::mem::replace(items, overflow)
+}
+
 async fn attach_hash_field_ttls<C>(con: &mut C, key: &[u8], items: &mut [RedisHashItem]) -> Result<(), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
@@ -3818,6 +4285,7 @@ where
 fn is_optional_hash_field_expiry_error(error: &redis::RedisError) -> bool {
     let detail = error.detail().unwrap_or_default().to_ascii_lowercase();
     detail.contains("unknown command")
+        || detail.contains("unknown redis command")
         || detail.contains("unsupported")
         || detail.contains("syntax error")
         || detail.contains("noperm")
@@ -4080,6 +4548,22 @@ mod tests {
     fn hscan_response(cursor: &str, pairs: Vec<(&str, &str)>) -> RedisRawValue {
         let entries = pairs.into_iter().flat_map(|(field, value)| [bulk(field), bulk(value)]).collect();
         RedisRawValue::Array(vec![bulk(cursor), RedisRawValue::Array(entries)])
+    }
+
+    fn hscan_response_owned(cursor: &str, pairs: Vec<(String, String)>) -> RedisRawValue {
+        let entries = pairs.into_iter().flat_map(|(field, value)| [bulk(&field), bulk(&value)]).collect();
+        RedisRawValue::Array(vec![bulk(cursor), RedisRawValue::Array(entries)])
+    }
+
+    fn int_scan_response_owned(cursor: &str, members: Vec<String>) -> RedisRawValue {
+        RedisRawValue::Array(vec![
+            bulk(cursor),
+            RedisRawValue::Array(members.into_iter().map(|member| bulk(&member)).collect()),
+        ])
+    }
+
+    fn httl_response(count: usize, ttl: i64) -> RedisRawValue {
+        RedisRawValue::Array((0..count).map(|_| RedisRawValue::Int(ttl)).collect())
     }
 
     fn zrange_response(pairs: Vec<(&str, &str)>) -> RedisRawValue {
@@ -4455,6 +4939,136 @@ mod tests {
         assert_eq!(con.command_count("GETRANGE"), 1);
         assert_eq!(con.command_count("GET"), 0);
         assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    #[tokio::test]
+    async fn hash_value_pages_compact_hscan_before_field_ttls() {
+        let pairs = (0..512).map(|index| (format!("field:{index}"), format!("value:{index}"))).collect();
+        let mut con = FakeRedisConnection::new(vec![
+            bulk("hash"),
+            RedisRawValue::Int(-1),
+            RedisRawValue::Int(512),
+            hscan_response_owned("0", pairs),
+            httl_response(super::COLLECTION_PAGE_SIZE, -1),
+            httl_response(super::COLLECTION_PAGE_SIZE, -1),
+            httl_response(112, -1),
+        ]);
+
+        let value = super::get_value(&mut con, b"large-hash").await.unwrap();
+
+        let RedisValueData::Hash { items, total, scan_cursor } = value.data else {
+            panic!("expected a Hash value");
+        };
+        let cursor = scan_cursor.expect("overflow cursor");
+        assert!(cursor >= super::COLLECTION_OVERFLOW_CURSOR_START);
+        assert_eq!(total, 512);
+        assert_eq!(items.len(), super::COLLECTION_PAGE_SIZE);
+        assert_eq!(redis_blob_display_text(&items[0].field), "field:0");
+        assert_eq!(redis_blob_display_text(&items[199].field), "field:199");
+        assert!(items.iter().all(|item| item.field_ttl == Some(-1)));
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert_eq!(con.command_count("HTTL"), 1);
+        let httl_command = con.commands.iter().find(|command| command.contains("\r\nHTTL\r\n")).unwrap();
+        assert!(httl_command.contains("\r\nFIELDS\r\n"));
+        assert!(httl_command.contains("\r\n200\r\n"));
+        assert!(!httl_command.contains("\r\nfield:200\r\n"));
+
+        let second =
+            super::load_more_collection(&mut con, b"large-hash", "hash", cursor, 200, None, None).await.unwrap();
+        let RedisCollectionPage::Hash { items, scan_cursor } = second else {
+            panic!("expected a Hash page");
+        };
+        assert_eq!(scan_cursor, Some(cursor));
+        assert_eq!(items.len(), 200);
+        assert_eq!(redis_blob_display_text(&items[0].field), "field:200");
+        assert_eq!(redis_blob_display_text(&items[199].field), "field:399");
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert_eq!(con.command_count("HTTL"), 2);
+
+        let third =
+            super::load_more_collection(&mut con, b"large-hash", "hash", cursor, 200, None, None).await.unwrap();
+        let RedisCollectionPage::Hash { items, scan_cursor } = third else {
+            panic!("expected a Hash page");
+        };
+        assert_eq!(scan_cursor, None);
+        assert_eq!(items.len(), 112);
+        assert_eq!(redis_blob_display_text(&items[0].field), "field:400");
+        assert_eq!(redis_blob_display_text(&items[111].field), "field:511");
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert_eq!(con.command_count("HTTL"), 3);
+    }
+
+    #[tokio::test]
+    async fn large_hash_value_stays_bounded_when_httl_is_unsupported() {
+        let pairs = (0..512).map(|index| (format!("field:{index}"), format!("value:{index}"))).collect();
+        let unsupported = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown command 'HTTL'".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("hash")),
+            Ok(RedisRawValue::Int(-1)),
+            Ok(RedisRawValue::Int(512)),
+            Ok(hscan_response_owned("0", pairs)),
+            Err(unsupported),
+        ]);
+
+        let value = super::get_value(&mut con, b"large-hash-no-httl").await.unwrap();
+
+        let RedisValueData::Hash { items, total, scan_cursor } = value.data else {
+            panic!("expected a Hash value");
+        };
+        assert_eq!(total, 512);
+        assert_eq!(items.len(), super::COLLECTION_PAGE_SIZE);
+        assert!(scan_cursor.is_some());
+        assert!(items.iter().all(|item| item.field_ttl.is_none()));
+        assert_eq!(con.command_count("HSCAN"), 1);
+        assert_eq!(con.command_count("HTTL"), 1);
+    }
+
+    #[tokio::test]
+    async fn set_value_pages_compact_sscan_response() {
+        let members = (0..512).map(|index| format!("member:{index}")).collect();
+        let mut con = FakeRedisConnection::new(vec![
+            bulk("set"),
+            RedisRawValue::Int(-1),
+            RedisRawValue::Int(512),
+            int_scan_response_owned("0", members),
+        ]);
+
+        let value = super::get_value(&mut con, b"large-intset").await.unwrap();
+
+        let RedisValueData::Set { items, total, scan_cursor } = value.data else {
+            panic!("expected a Set value");
+        };
+        let cursor = scan_cursor.expect("overflow cursor");
+        assert!(cursor >= super::COLLECTION_OVERFLOW_CURSOR_START);
+        assert_eq!(total, 512);
+        assert_eq!(items.len(), super::COLLECTION_PAGE_SIZE);
+        assert_eq!(redis_blob_display_text(&items[0].member), "member:0");
+        assert_eq!(redis_blob_display_text(&items[199].member), "member:199");
+
+        let second =
+            super::load_more_collection(&mut con, b"large-intset", "set", cursor, 200, None, None).await.unwrap();
+        let RedisCollectionPage::Set { items, scan_cursor } = second else {
+            panic!("expected a Set page");
+        };
+        assert_eq!(scan_cursor, Some(cursor));
+        assert_eq!(items.len(), 200);
+        assert_eq!(redis_blob_display_text(&items[0].member), "member:200");
+        assert_eq!(redis_blob_display_text(&items[199].member), "member:399");
+
+        let third =
+            super::load_more_collection(&mut con, b"large-intset", "set", cursor, 200, None, None).await.unwrap();
+        let RedisCollectionPage::Set { items, scan_cursor } = third else {
+            panic!("expected a Set page");
+        };
+        assert_eq!(scan_cursor, None);
+        assert_eq!(items.len(), 112);
+        assert_eq!(redis_blob_display_text(&items[0].member), "member:400");
+        assert_eq!(redis_blob_display_text(&items[111].member), "member:511");
+        assert_eq!(con.command_count("SSCAN"), 1);
     }
 
     #[tokio::test]
@@ -4850,6 +5464,82 @@ mod tests {
         assert_eq!(con.command_count("PERSIST"), 1);
         assert_eq!(con.command_count("EXISTS"), 0);
         assert_eq!(con.command_count("EVAL"), 0);
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_expires_every_selected_key_in_one_pipeline() {
+        let mut con =
+            FakeRedisConnection::new(vec![RedisRawValue::Int(1), RedisRawValue::Int(1), RedisRawValue::Int(1)]);
+        let keys = vec![b"key:a".to_vec(), b"key:b".to_vec(), b"key:c".to_vec()];
+
+        let result = super::set_keys_expiry(&mut con, &keys, super::RedisKeysExpiry::Ttl(3_600)).await.unwrap();
+
+        assert_eq!(result, super::RedisKeysExpiryResult { applied: 3, missing_key_raws: Vec::new() });
+        // One pipeline for the whole selection, with one command per selected key.
+        assert_eq!(con.commands.len(), 1);
+        assert_eq!(con.commands[0].matches("\r\nEXPIRE\r\n").count(), 3);
+        assert_eq!(con.commands[0].matches("\r\nEXPIREAT\r\n").count(), 0);
+        assert_eq!(con.commands[0].matches("\r\nPERSIST\r\n").count(), 0);
+        assert_eq!(con.commands[0].matches("\r\n3600\r\n").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_reports_only_the_keys_that_disappeared() {
+        let mut con =
+            FakeRedisConnection::new(vec![RedisRawValue::Int(1), RedisRawValue::Int(0), RedisRawValue::Int(1)]);
+        let keys = vec![b"key:a".to_vec(), b"key:b".to_vec(), b"key:c".to_vec()];
+
+        let result = super::set_keys_expiry(&mut con, &keys, super::RedisKeysExpiry::At(1_735_689_600)).await.unwrap();
+
+        assert_eq!(result.applied, 2);
+        assert_eq!(result.missing_key_raws, vec![super::redis_key_bytes_to_raw(b"key:b")]);
+        assert_eq!(con.commands[0].matches("\r\nEXPIREAT\r\n").count(), 3);
+        assert!(con.commands[0].contains("\r\n1735689600\r\n"));
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_treats_persist_as_idempotent_for_every_key() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(0), RedisRawValue::Int(1)]);
+        let keys = vec![b"key:a".to_vec(), b"key:b".to_vec()];
+
+        let result = super::set_keys_expiry(&mut con, &keys, super::RedisKeysExpiry::from_ttl(-1)).await.unwrap();
+
+        assert_eq!(result, super::RedisKeysExpiryResult { applied: 2, missing_key_raws: Vec::new() });
+        assert_eq!(con.commands.len(), 1);
+        assert_eq!(con.commands[0].matches("\r\nPERSIST\r\n").count(), 2);
+        assert_eq!(con.commands[0].matches("\r\nEXPIRE\r\n").count(), 0);
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_keeps_ttl_zero_on_the_persist_path() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+
+        let result =
+            super::set_keys_expiry(&mut con, &[b"key:a".to_vec()], super::RedisKeysExpiry::from_ttl(0)).await.unwrap();
+
+        assert_eq!(result.applied, 1);
+        assert_eq!(con.command_count("PERSIST"), 1);
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_does_not_send_a_command_for_an_empty_selection() {
+        let mut con = FakeRedisConnection::new(Vec::new());
+
+        let result = super::set_keys_expiry(&mut con, &[], super::RedisKeysExpiry::Ttl(60)).await.unwrap();
+
+        assert_eq!(result, super::RedisKeysExpiryResult::default());
+        assert!(con.commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_keys_expiry_fails_loudly_when_a_reply_is_missing() {
+        let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(1)]);
+        let keys = vec![b"key:a".to_vec(), b"key:b".to_vec()];
+
+        let error = super::set_keys_expiry(&mut con, &keys, super::RedisKeysExpiry::Ttl(60)).await.unwrap_err();
+
+        // A short or failed reply must not be reported as two successful keys.
+        assert!(error.contains("EXPIRE did not return one reply per selected key"));
     }
 
     #[tokio::test]
@@ -5917,6 +6607,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hash_set_degrades_when_field_ttl_is_rejected_as_unknown_redis_command() {
+        let unsupported = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "unknown redis command HTTL".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(unsupported), Ok(RedisRawValue::Okay)]);
+
+        super::hash_set(&mut con, b"hash-key", "session", "Grace", None).await.unwrap();
+
+        assert_eq!(con.command_count("HTTL"), 1);
+        assert_eq!(con.command_count("HSET"), 1);
+        assert_eq!(con.command_count("HEXPIRE"), 0);
+    }
+
+    #[tokio::test]
     async fn hash_field_update_uses_one_atomic_script_and_carries_field_ttl() {
         let mut con = FakeRedisConnection::new(vec![RedisRawValue::Int(2)]);
 
@@ -6034,6 +6740,42 @@ mod tests {
         assert_eq!(con.command_count("EVAL"), 1);
         assert_eq!(con.command_count("HSET"), 0);
         assert_eq!(con.command_count("HDEL"), 0);
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_falls_back_when_cluster_rejects_field_ttl_script() {
+        let rejection = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "bad lua script for redis cluster, redis.call/pcall unknown redis command HTTL".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(rejection), Ok(RedisRawValue::Int(1))]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "session", "Grace").await.unwrap();
+
+        assert_eq!(con.command_count("EVAL"), 2);
+        assert!(con.commands[0].contains("redis.pcall('HTTL'"));
+        assert!(!con.commands[1].contains("redis.pcall('HTTL'"));
+        assert!(!con.commands[1].contains("redis.pcall('HEXPIRE'"));
+        assert!(con.commands[1].contains("redis.call('HSET'") || con.commands[1].contains("redis.pcall('HSET'"));
+    }
+
+    #[tokio::test]
+    async fn hash_field_update_falls_back_for_renames_when_cluster_rejects_field_ttl_script() {
+        let rejection = redis::RedisError::from((
+            redis::ErrorKind::ResponseError,
+            "An error was signalled by the server",
+            "bad lua script for redis cluster, redis.call/pcall unknown redis command HTTL".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![Err(rejection), Ok(RedisRawValue::Int(2))]);
+
+        super::hash_field_update(&mut con, b"hash-key", "session", "account", "Grace").await.unwrap();
+
+        assert_eq!(con.command_count("EVAL"), 2);
+        assert!(!con.commands[1].contains("redis.pcall('HTTL'"));
+        assert!(!con.commands[1].contains("redis.pcall('HEXPIRE'"));
+        assert!(con.commands[1].contains("old_field ~= new_field"));
+        assert!(con.commands[1].contains("redis.pcall('HDEL', key, old_field)"));
     }
 
     #[tokio::test]
@@ -6587,6 +7329,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -32,6 +32,30 @@ const EXPORT_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub fn database_export_client_session_id(export_id: &str) -> String {
     task_client_session_id("database-export", export_id)
+}
+
+async fn database_export_query_options(
+    state: &crate::connection::AppState,
+    connection_id: &str,
+    client_session_id: &str,
+    max_rows: Option<usize>,
+) -> crate::query::QueryExecutionOptions {
+    let timeout_secs =
+        state.configs.read().await.get(connection_id).map(|config| config.effective_query_timeout_secs()).unwrap_or(0);
+    database_export_query_options_for_timeout(timeout_secs, client_session_id, max_rows)
+}
+
+fn database_export_query_options_for_timeout(
+    timeout_secs: u64,
+    client_session_id: &str,
+    max_rows: Option<usize>,
+) -> crate::query::QueryExecutionOptions {
+    crate::query::QueryExecutionOptions {
+        max_rows,
+        timeout_secs: Some(timeout_secs),
+        client_session_id: Some(client_session_id.to_string()),
+        ..Default::default()
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,16 +117,28 @@ pub struct DatabaseExportRequest {
     pub omit_auto_increment: bool,
     #[serde(default)]
     pub fail_on_error: bool,
+    /// Refuse to truncate an existing destination. Scheduled backups enable
+    /// this because user-defined templates may resolve to a previous file.
+    #[serde(default)]
+    pub prevent_overwrite: bool,
     #[serde(default)]
     pub output_compression: DatabaseExportOutputCompression,
     #[serde(default)]
     pub snapshot_session_id: Option<String>,
     pub batch_size: usize,
+    /// When set, the export is packaged as a `.zip` archive containing
+    /// multiple `part-N.sql` entries (plus a `manifest.json`), each capped
+    /// at this many megabytes, instead of one unbounded `.sql`/`.sql.gz`
+    /// file. Mutually exclusive with `output_compression` -- a zip archive
+    /// is its own compressed container.
+    #[serde(default)]
+    pub split_max_mb: Option<u32>,
 }
 
 enum DatabaseExportWriter {
     Plain(BufWriter<std::fs::File>),
     Gzip(Box<GzEncoder<BufWriter<std::fs::File>>>),
+    SplitZip(Box<crate::export_split_zip::SplitZipExportWriter>),
 }
 
 impl Write for DatabaseExportWriter {
@@ -110,6 +146,7 @@ impl Write for DatabaseExportWriter {
         match self {
             Self::Plain(writer) => writer.write(buffer),
             Self::Gzip(writer) => writer.write(buffer),
+            Self::SplitZip(writer) => writer.write(buffer),
         }
     }
 
@@ -117,17 +154,23 @@ impl Write for DatabaseExportWriter {
         match self {
             Self::Plain(writer) => writer.flush(),
             Self::Gzip(writer) => writer.flush(),
+            Self::SplitZip(writer) => writer.flush(),
         }
     }
 }
 
 impl DatabaseExportWriter {
-    fn finish(self) -> Result<(), String> {
+    fn finish(self, source_file_name: &str) -> Result<(), String> {
         match self {
-            Self::Plain(mut writer) => writer.flush(),
-            Self::Gzip(writer) => writer.finish().and_then(|mut output| output.flush()),
+            Self::Plain(mut writer) => {
+                writer.flush().map_err(|error| format!("Failed to finalize export file: {error}"))
+            }
+            Self::Gzip(writer) => writer
+                .finish()
+                .and_then(|mut output| output.flush())
+                .map_err(|error| format!("Failed to finalize export file: {error}")),
+            Self::SplitZip(writer) => writer.finish(source_file_name),
         }
-        .map_err(|error| format!("Failed to finalize export file: {error}"))
     }
 }
 
@@ -196,7 +239,9 @@ async fn list_mysql_export_view_dependencies(
     state: &crate::connection::AppState,
     connection_id: &str,
     database: &str,
+    client_session_id: &str,
 ) -> Result<Vec<(String, String)>, String> {
+    let options = database_export_query_options(state, connection_id, client_session_id, Some(usize::MAX)).await;
     let result = crate::query::execute_sql_statement_with_options(
         state,
         connection_id,
@@ -204,7 +249,7 @@ async fn list_mysql_export_view_dependencies(
         &mysql_view_dependencies_sql(database),
         None,
         None,
-        crate::query::QueryExecutionOptions { max_rows: Some(usize::MAX), ..Default::default() },
+        options,
     )
     .await?;
     Ok(mysql_view_dependencies_from_rows(&result.rows))
@@ -237,18 +282,21 @@ fn mysql_database_export_preamble(database: &str, charset: Option<&str>, collati
 async fn mysql_database_export_preamble_for_request(
     state: &crate::connection::AppState,
     request: &DatabaseExportRequest,
+    client_session_id: &str,
 ) -> String {
     let metadata_sql = format!(
         "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = {}",
         mysql_sql_string_literal(&request.database)
     );
-    let metadata = crate::query::execute_sql_statement(
+    let options = database_export_query_options(state, &request.connection_id, client_session_id, Some(1)).await;
+    let metadata = crate::query::execute_sql_statement_with_options(
         state,
         &request.connection_id,
         &request.database,
         &metadata_sql,
         None,
         None,
+        options,
     )
     .await
     .ok()
@@ -1399,133 +1447,13 @@ fn normalize_export_table_ddl(
 
 fn format_export_table_ddl(ddl: &str, database_type: Option<DatabaseType>, opts: DdlNormalizeOptions) -> String {
     let ddl = normalize_export_table_ddl(ddl, database_type, opts);
-    let ddl =
-        if database_type == Some(DatabaseType::OpenGauss) { normalize_opengauss_table_ddl_comments(&ddl) } else { ddl };
+    let ddl = if database_type == Some(DatabaseType::OpenGauss) {
+        crate::schema::normalize_opengauss_table_ddl_comments(&ddl)
+    } else {
+        ddl
+    };
     let ddl = ddl.trim().trim_end_matches(';').trim_end();
     format!("{ddl};")
-}
-
-/// openGauss 6.x `pg_get_tabledef` can concatenate comment text into a
-/// `COMMENT ON` literal without escaping embedded single quotes. Normalize
-/// only those generated comment statements; all other DDL text remains
-/// untouched.
-fn normalize_opengauss_table_ddl_comments(ddl: &str) -> String {
-    let mut normalized = String::with_capacity(ddl.len());
-    for line in ddl.split_inclusive('\n') {
-        let (line_body, line_ending) = match line.strip_suffix('\n') {
-            Some(body) => match body.strip_suffix('\r') {
-                Some(body) => (body, "\r\n"),
-                None => (body, "\n"),
-            },
-            None => (line, ""),
-        };
-        let leading = line_body.len() - line_body.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
-        let statement = &line_body[leading..];
-        if let Some(statement) = normalize_opengauss_comment_statement(statement) {
-            normalized.push_str(&line_body[..leading]);
-            normalized.push_str(&statement);
-        } else {
-            normalized.push_str(line_body);
-        }
-        normalized.push_str(line_ending);
-    }
-    normalized
-}
-
-fn normalize_opengauss_comment_statement(statement: &str) -> Option<String> {
-    let uppercase = statement.to_ascii_uppercase();
-    if !uppercase.starts_with("COMMENT ON ") {
-        return None;
-    }
-
-    let is_pos = find_opengauss_comment_is_keyword(statement, &uppercase)?;
-    let value_start = is_pos + " IS ".len();
-    let value = &statement[value_start..];
-    let value_leading = value.len() - value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
-    let value = &value[value_leading..];
-    let quote_offset = match value.as_bytes() {
-        [b'\'', ..] => 0,
-        [b'e' | b'E', b'\'', ..] => 1,
-        _ => return None,
-    };
-    let opening_quote = value_start + value_leading + quote_offset;
-    let statement_end = statement.trim_end().len();
-    let literal_end = statement[..statement_end]
-        .strip_suffix(';')
-        .map_or(statement_end, |without_terminator| without_terminator.len());
-    if opening_quote >= literal_end {
-        return None;
-    }
-
-    let closing_quote = statement[..literal_end].rfind('\'')?;
-    if closing_quote <= opening_quote || !statement[closing_quote + 1..literal_end].trim().is_empty() {
-        return None;
-    }
-    let literal = &statement[opening_quote..=closing_quote];
-    if opengauss_comment_literal_is_valid(literal) {
-        return Some(statement.to_string());
-    }
-
-    let raw_comment = &statement[opening_quote + 1..closing_quote];
-    let escaped_comment = raw_comment.replace('\'', "''");
-    let mut normalized = String::with_capacity(statement.len() + escaped_comment.len() - raw_comment.len());
-    normalized.push_str(&statement[..opening_quote + 1]);
-    normalized.push_str(&escaped_comment);
-    normalized.push_str(&statement[closing_quote..]);
-    Some(normalized)
-}
-
-fn find_opengauss_comment_is_keyword(statement: &str, uppercase: &str) -> Option<usize> {
-    let mut cursor = "COMMENT ON ".len();
-    while cursor + " IS ".len() <= statement.len() {
-        if statement.as_bytes().get(cursor) == Some(&b'\"') {
-            cursor = skip_opengauss_quoted_identifier(statement, cursor);
-            continue;
-        }
-        if uppercase.get(cursor..cursor + " IS ".len()) == Some(" IS ") {
-            return Some(cursor);
-        }
-        cursor += statement[cursor..].chars().next()?.len_utf8();
-    }
-    None
-}
-
-fn skip_opengauss_quoted_identifier(sql: &str, start: usize) -> usize {
-    let bytes = sql.as_bytes();
-    let mut cursor = start + 1;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b'\"' {
-            if bytes.get(cursor + 1) == Some(&b'\"') {
-                cursor += 2;
-            } else {
-                return cursor + 1;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    bytes.len()
-}
-
-fn opengauss_comment_literal_is_valid(literal: &str) -> bool {
-    let bytes = literal.as_bytes();
-    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
-        return false;
-    }
-
-    let mut cursor = 1;
-    while cursor < bytes.len() - 1 {
-        if bytes[cursor] == b'\'' {
-            if cursor + 1 < bytes.len() - 1 && bytes[cursor + 1] == b'\'' {
-                cursor += 2;
-            } else {
-                return false;
-            }
-        } else {
-            cursor += 1;
-        }
-    }
-    true
 }
 
 fn split_postgres_export_table_triggers(ddl: &str, database_type: DatabaseType) -> (String, Vec<String>) {
@@ -2328,24 +2256,76 @@ async fn save_export_destination_identity(
     state.storage.save_state(&export_destination_state_key(dir), &value, "application/octet-stream").await
 }
 
+/// Returns whether this macOS destination still has the transient, untagged
+/// `st_dev` identity written by DBX versions before persistent volume UUIDs
+/// were introduced. The caller must require an explicit directory selection
+/// before replacing it; unattended backups must continue to fail closed.
+pub async fn export_destination_identity_needs_confirmation(
+    state: &crate::connection::AppState,
+    dir: &std::path::Path,
+) -> Result<bool, String> {
+    let recorded_identity = state
+        .storage
+        .load_state(&export_destination_state_key(dir))
+        .await?
+        .map(|(bytes, _content_type)| ExportDestinationIdentity::decode(&bytes))
+        .transpose()?;
+    Ok(cfg!(target_os = "macos") && matches!(recorded_identity, Some(Some(ExportDestinationIdentity::LegacyDevice(_)))))
+}
+
+/// Verifies the nearest persisted destination ancestor before a new child is
+/// created. Scheduled runs always create new leaf directories, so checking
+/// only the leaf would otherwise bypass the configured destination's mount
+/// identity protection.
+async fn ensure_recorded_export_destination_ancestor(
+    state: &crate::connection::AppState,
+    dir: &std::path::Path,
+) -> Result<(), String> {
+    let mut ancestor = dir.parent();
+    while let Some(candidate) = ancestor {
+        let recorded_identity = state
+            .storage
+            .load_state(&export_destination_state_key(candidate))
+            .await?
+            .map(|(bytes, _content_type)| ExportDestinationIdentity::decode(&bytes))
+            .transpose()?;
+
+        if let Some(recorded_identity) = recorded_identity {
+            if !candidate.is_dir() {
+                return Err(format!(
+                    "Backup directory {} is missing. Its parent {} was configured or previously used for exports, so dbx will not recreate a child directory automatically -- if this is on a removable or network drive, reconnect it and try again.",
+                    dir.display(),
+                    candidate.display()
+                ));
+            }
+            if let Some(recorded_identity) = recorded_identity {
+                let current_identity = export_destination_identity_for_path(candidate);
+                if recorded_export_destination_identity_mismatch(&recorded_identity, current_identity.as_ref()) {
+                    return Err(format!(
+                        "Backup directory {} now resolves to a different filesystem than the configured parent {}. Refusing to create a child directory automatically -- make sure the correct removable or network drive is connected before running the backup.",
+                        dir.display(),
+                        candidate.display()
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        ancestor = candidate.parent();
+    }
+    Ok(())
+}
+
 /// Ensures `dir` exists for an export destination, without ever silently
 /// recreating a directory that previously produced a successful export (or
 /// was recorded via [`record_export_destination_identity`]) and has since
-/// disappeared. Auto-creating on every run is what the original fix for
-/// #6109 did, but that is unsafe for a destination on a removable or network
-/// drive: if the mount is temporarily gone when a run executes, blindly
-/// recreating the path resurrects it on the local root filesystem and the
-/// export "succeeds" while silently writing to the wrong disk. A directory
-/// dbx has never seen before is safe to create (normal first-time
-/// configuration of a local folder); a directory dbx has seen before but
-/// that is now missing, or that now resolves to a different filesystem than
-/// last time, is refused instead. See #6327.
+/// disappeared. Auto-creating on every run is unsafe for a destination on a
+/// removable or network drive: a missing mount could be recreated on the
+/// local filesystem. A new directory is safe to create only after any
+/// recorded parent destination has been verified. See #6327.
 ///
-/// Returns the device identity that was just verified (or recorded for a
-/// newly created directory), if the current platform can determine one, so
-/// the caller can re-verify it against the file it actually opens -- the
-/// directory check here and the later `File::create` are separate
-/// operations, and the mount can change in between.
+/// Returns the identity that was just verified (or recorded for a newly
+/// created directory), so the caller can re-verify it against the file it
+/// actually opens.
 async fn ensure_export_destination_dir(
     state: &crate::connection::AppState,
     dir: &std::path::Path,
@@ -2382,6 +2362,11 @@ async fn ensure_export_destination_dir(
                 dir.display()
             ));
         }
+        // A run-specific child directory is intentionally new on every
+        // scheduled backup. Before creating it, still honor a recorded parent
+        // destination so a missing external/NAS mount is never recreated on
+        // the local filesystem merely because this child has no state yet.
+        ensure_recorded_export_destination_ancestor(state, dir).await?;
         std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create backup directory: {e}"))?;
     }
 
@@ -2557,10 +2542,21 @@ pub async fn export_database_sql_core(
     request: &DatabaseExportRequest,
     on_progress: impl Fn(ExportProgress) + Sync,
 ) -> Result<(), String> {
+    let db_type = state
+        .configs
+        .read()
+        .await
+        .get(&request.connection_id)
+        .map(|config| config.db_type)
+        .ok_or_else(|| format!("Connection config not found: {}", request.connection_id))?;
     // Keep the large export state machine on the heap. Besides making the
     // caller future small, this prevents the metadata-prefetch locals from
     // exhausting the bounded stack used by test and runtime worker threads.
-    let result = Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await;
+    let result = if matches!(db_type, DatabaseType::Postgres) && request.schema.trim().is_empty() {
+        Box::pin(export_postgres_all_schemas_sql_core(state, request, &on_progress)).await
+    } else {
+        Box::pin(export_database_sql_core_inner(state, request, &on_progress)).await
+    };
     let metadata_session_id = database_export_client_session_id(&request.export_id);
     if let Err(error) =
         state.close_metadata_session_pool(&request.connection_id, Some(&request.database), &metadata_session_id).await
@@ -2580,6 +2576,249 @@ pub async fn export_database_sql_core(
     } else {
         result
     }
+}
+
+/// Destination directory that must exist (and stay on the same filesystem)
+/// before the export file may be written there, or `None` when the file path
+/// has no parent (e.g. a bare file name or the filesystem root). Shared by
+/// [`create_database_export_writer`] and the all-schemas export, which
+/// validates the destination up front instead of only after exporting every
+/// schema to temporary files.
+fn export_destination_parent_dir(file_path: &str) -> Option<&std::path::Path> {
+    let parent = std::path::Path::new(file_path).parent()?;
+    (!parent.as_os_str().is_empty()).then_some(parent)
+}
+
+/// Name recorded inside `manifest.json` as the logical "source file" the
+/// split parts represent, e.g. `mydb.zip` -> `mydb.sql`. When splitting is
+/// disabled this is unused (the writer variant never calls it).
+fn export_source_file_name(file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("export");
+    format!("{stem}.sql")
+}
+
+async fn create_database_export_writer(
+    state: &Arc<crate::connection::AppState>,
+    request: &DatabaseExportRequest,
+) -> Result<DatabaseExportWriter, String> {
+    let mut expected_destination_identity = None;
+    if let Some(parent) = export_destination_parent_dir(&request.file_path) {
+        expected_destination_identity = ensure_export_destination_dir(state, parent).await?;
+    }
+    if let Some(max_mb) = request.split_max_mb {
+        let zip_path = std::path::Path::new(&request.file_path);
+        let stem = zip_path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("export");
+        let writer = crate::export_split_zip::SplitZipExportWriter::create_with_overwrite(
+            zip_path,
+            max_mb,
+            stem,
+            "sql",
+            request.prevent_overwrite,
+        )?;
+        let opened_destination_identity =
+            std::fs::File::open(&request.file_path).ok().as_ref().and_then(export_destination_identity_for_file);
+        if export_destination_identity_mismatch(
+            expected_destination_identity.as_ref(),
+            opened_destination_identity.as_ref(),
+        ) {
+            let _ = std::fs::remove_file(&request.file_path);
+            return Err(format!(
+                "Backup destination for {} changed while opening the output file -- the directory now \
+                 resolves to a different filesystem than the one just verified. If a removable or network \
+                 drive was disconnected and reconnected, retry the backup.",
+                request.file_path
+            ));
+        }
+        return Ok(DatabaseExportWriter::SplitZip(Box::new(writer)));
+    }
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(!request.prevent_overwrite)
+        .create_new(request.prevent_overwrite)
+        .open(&request.file_path)
+        .map_err(|error| {
+            if request.prevent_overwrite && error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("Backup file already exists: {}", request.file_path)
+            } else {
+                format!("Failed to write file: {error}")
+            }
+        })?;
+    // The directory check above and this file open are separate
+    // operations: the mount can disappear and be replaced by something else
+    // at the same path in between. Re-check the identity of the handle we
+    // actually opened, not just the path, and refuse to keep a backup that
+    // landed on the wrong filesystem. See #6327.
+    let opened_destination_identity = export_destination_identity_for_file(&file);
+    if export_destination_identity_mismatch(
+        expected_destination_identity.as_ref(),
+        opened_destination_identity.as_ref(),
+    ) {
+        drop(file);
+        let _ = std::fs::remove_file(&request.file_path);
+        return Err(format!(
+            "Backup destination for {} changed while opening the output file -- the directory now \
+             resolves to a different filesystem than the one just verified. If a removable or network \
+             drive was disconnected and reconnected, retry the backup.",
+            request.file_path
+        ));
+    }
+    Ok(match request.output_compression {
+        DatabaseExportOutputCompression::None => DatabaseExportWriter::Plain(BufWriter::new(file)),
+        DatabaseExportOutputCompression::Gzip => {
+            DatabaseExportWriter::Gzip(Box::new(GzEncoder::new(BufWriter::new(file), Compression::default())))
+        }
+    })
+}
+
+fn postgres_export_schema_names(schemas: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    schemas
+        .into_iter()
+        .map(|schema| schema.trim().to_string())
+        .filter(|schema| !schema.is_empty() && schema != "information_schema" && !schema.starts_with("pg_"))
+        .filter(|schema| seen.insert(schema.clone()))
+        .collect()
+}
+
+fn postgres_create_schema_sql(schema: &str) -> String {
+    format!("CREATE SCHEMA IF NOT EXISTS {};", quote_identifier(schema, &DatabaseType::Postgres))
+}
+
+// Copy one line at a time so a `SplitZipExportWriter` can only rotate between
+// complete SQL statements; `std::io::copy` would feed it arbitrary 8KB chunks.
+fn combine_schema_sql_export<W: Write>(source: &mut dyn BufRead, destination: &mut W) -> std::io::Result<()> {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = source.read_until(b'\n', &mut line)?;
+        if bytes_read == 0 {
+            break;
+        }
+        destination.write_all(&line)?;
+    }
+    Ok(())
+}
+
+async fn export_postgres_all_schemas_sql_core(
+    state: &Arc<crate::connection::AppState>,
+    request: &DatabaseExportRequest,
+    on_progress: impl Fn(ExportProgress) + Sync,
+) -> Result<(), String> {
+    let schemas = postgres_export_schema_names(
+        crate::schema::list_schemas_core(state, &request.connection_id, &request.database).await?,
+    );
+    if schemas.is_empty() {
+        return Err(format!("No exportable schemas found in database '{}'.", request.database));
+    }
+
+    // Validate the destination before exporting every schema to temporary
+    // files: the writer below only runs after the loop, which for large
+    // databases can be hours away, and a missing or unwritable destination
+    // must fail fast instead. This is an early fail, not a replacement -- the
+    // writer still performs its own checks when it opens the output file.
+    if let Some(parent) = export_destination_parent_dir(&request.file_path) {
+        ensure_export_destination_dir(state, parent).await?;
+    }
+
+    let temp_dir =
+        tempfile::tempdir().map_err(|error| format!("Failed to create temporary export directory: {error}"))?;
+    let result = async {
+        let mut schema_outputs = Vec::with_capacity(schemas.len());
+        let mut rows_exported = 0_u64;
+        let mut error_count = 0_u64;
+        let mut error_summary = None;
+
+        for (schema_index, schema_name) in schemas.iter().enumerate() {
+            let mut schema_request = request.clone();
+            schema_request.schema = schema_name.clone();
+            schema_request.file_path = temp_dir.path().join(format!("schema-{schema_index}.sql")).display().to_string();
+            schema_request.output_compression = DatabaseExportOutputCompression::None;
+            schema_request.split_max_mb = None;
+
+            let terminal = Arc::new(std::sync::Mutex::new(None::<ExportProgress>));
+            let terminal_for_callback = terminal.clone();
+            let schema_name_for_callback = schema_name.clone();
+            let completed_rows = rows_exported;
+            let child_progress = |mut progress: ExportProgress| {
+                if matches!(progress.status, ExportStatus::Done | ExportStatus::Cancelled) {
+                    *terminal_for_callback.lock().expect("export terminal mutex poisoned") = Some(progress);
+                    return;
+                }
+                progress.export_id = request.export_id.clone();
+                progress.current_object = if progress.current_object.is_empty() {
+                    schema_name_for_callback.clone()
+                } else {
+                    format!("{schema_name_for_callback}: {}", progress.current_object)
+                };
+                progress.rows_exported = completed_rows.saturating_add(progress.rows_exported);
+                on_progress(progress);
+            };
+
+            Box::pin(export_database_sql_core_inner(state, &schema_request, child_progress)).await?;
+            let terminal = terminal.lock().expect("export terminal mutex poisoned").clone();
+            if terminal.as_ref().is_some_and(|progress| matches!(progress.status, ExportStatus::Cancelled)) {
+                return Err(EXPORT_CANCELLED_ERROR.to_string());
+            }
+            if let Some(progress) = terminal {
+                rows_exported = rows_exported.saturating_add(progress.rows_exported);
+                error_count = error_count.saturating_add(progress.error_count);
+                // Aggregate lenient failure summaries across schemas; keeping
+                // only the first schema's summary would understate the errors
+                // behind an error_count that accumulates over all schemas.
+                if let Some(summary) = progress.error_summary {
+                    error_summary = Some(match error_summary.take() {
+                        Some(existing) => format!("{existing}; {summary}"),
+                        None => summary,
+                    });
+                }
+            }
+            schema_outputs.push((schema_name.clone(), schema_request.file_path));
+        }
+
+        let mut file = create_database_export_writer(state, request).await?;
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        writeln!(file, "-- Database export: {}", request.database).map_err(|e| format!("Failed to write file: {e}"))?;
+        writeln!(file, "-- Date: {timestamp}").map_err(|e| format!("Failed to write file: {e}"))?;
+        writeln!(file, "-- Generated by DBX").map_err(|e| format!("Failed to write file: {e}"))?;
+        writeln!(file, "-- PostgreSQL schemas: {}", schemas.join(", "))
+            .map_err(|e| format!("Failed to write file: {e}"))?;
+        writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
+        for schema_name in &schemas {
+            writeln!(file, "{}", postgres_create_schema_sql(schema_name))
+                .map_err(|e| format!("Failed to write file: {e}"))?;
+        }
+        writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
+
+        for (schema_name, path) in schema_outputs {
+            writeln!(file, "-- Schema export: {schema_name}").map_err(|e| format!("Failed to write file: {e}"))?;
+            let mut source = std::io::BufReader::new(
+                std::fs::File::open(path).map_err(|e| format!("Failed to read temporary schema export: {e}"))?,
+            );
+            combine_schema_sql_export(&mut source, &mut file)
+                .map_err(|e| format!("Failed to combine schema export: {e}"))?;
+            writeln!(file).map_err(|e| format!("Failed to write file: {e}"))?;
+        }
+        file.finish(&export_source_file_name(&request.file_path))?;
+        on_progress(ExportProgress {
+            export_id: request.export_id.clone(),
+            current_object: request.database.clone(),
+            object_index: schemas.len(),
+            total_objects: schemas.len(),
+            rows_exported,
+            total_rows: None,
+            status: ExportStatus::Done,
+            error: None,
+            preparing: false,
+            error_count,
+            error_summary,
+        });
+        Ok(())
+    }
+    .await;
+
+    result
 }
 
 async fn export_database_sql_core_inner(
@@ -2629,41 +2868,10 @@ async fn export_database_sql_core_inner(
     ))
     .await?;
     // 4. Create file
-    let mut expected_destination_identity = None;
-    if let Some(parent) = std::path::Path::new(&request.file_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            expected_destination_identity = ensure_export_destination_dir(state, parent).await?;
-        }
-    }
-    let file = std::fs::File::create(&request.file_path).map_err(|e| format!("Failed to write file: {e}"))?;
-    // The directory check above and this `File::create` are separate
-    // operations: the mount can disappear and be replaced by something else
-    // at the same path in between. Re-check the identity of the handle we
-    // actually opened, not just the path, and refuse to keep a backup that
-    // landed on the wrong filesystem. See #6327.
-    let opened_destination_identity = export_destination_identity_for_file(&file);
-    if export_destination_identity_mismatch(
-        expected_destination_identity.as_ref(),
-        opened_destination_identity.as_ref(),
-    ) {
-        drop(file);
-        let _ = std::fs::remove_file(&request.file_path);
-        return Err(format!(
-            "Backup destination for {} changed while opening the output file -- the directory now \
-             resolves to a different filesystem than the one just verified. If a removable or network \
-             drive was disconnected and reconnected, retry the backup.",
-            request.file_path
-        ));
-    }
-    let mut file = match request.output_compression {
-        DatabaseExportOutputCompression::None => DatabaseExportWriter::Plain(BufWriter::new(file)),
-        DatabaseExportOutputCompression::Gzip => {
-            DatabaseExportWriter::Gzip(Box::new(GzEncoder::new(BufWriter::new(file), Compression::default())))
-        }
-    };
+    let mut file = create_database_export_writer(state, request).await?;
 
     let create_database_preamble = if request.include_create_database && matches!(db_type, DatabaseType::Mysql) {
-        Some(mysql_database_export_preamble_for_request(state, request).await)
+        Some(mysql_database_export_preamble_for_request(state, request, &client_session_id).await)
     } else {
         None
     };
@@ -2739,7 +2947,9 @@ async fn export_database_sql_core_inner(
     let mut tables: Vec<_> = all_tables.iter().filter(|t| !t.table_type.contains("VIEW")).collect();
     let mut views: Vec<_> = all_tables.iter().filter(|t| t.table_type.contains("VIEW")).collect();
     if request.include_objects && db_type == DatabaseType::Mysql && views.len() > 1 {
-        match list_mysql_export_view_dependencies(state, &request.connection_id, &request.database).await {
+        match list_mysql_export_view_dependencies(state, &request.connection_id, &request.database, &client_session_id)
+            .await
+        {
             Ok(dependencies) => views = sort_export_views_by_dependencies(&views, &dependencies),
             Err(error) => {
                 log::debug!(
@@ -3270,7 +3480,24 @@ async fn export_database_sql_core_inner(
                             );
                             replace_database_export_select_list(sql, &col_names, &col_types, &db_type)
                         };
-                        let result = match crate::transfer::execute_read_on_pool(state, &pool_key, &sql).await {
+                        let options = database_export_query_options(
+                            state,
+                            &request.connection_id,
+                            &client_session_id,
+                            Some(batch_size),
+                        )
+                        .await;
+                        let result = match crate::query::execute_sql_statement_with_options(
+                            state,
+                            &request.connection_id,
+                            &request.database,
+                            &sql,
+                            Some(&request.schema),
+                            None,
+                            options,
+                        )
+                        .await
+                        {
                             Ok(result) => result,
                             Err(error) => {
                                 record_export_error(
@@ -3535,7 +3762,7 @@ async fn export_database_sql_core_inner(
         writeln!(file, "SET FOREIGN_KEY_CHECKS = 1;").map_err(|e| format!("Failed to write file: {e}"))?;
     }
 
-    file.finish()?;
+    file.finish(&export_source_file_name(&request.file_path))?;
 
     // Emit Done progress
     on_progress(ExportProgress {
@@ -3598,25 +3825,25 @@ fn build_database_export_object_source_sql(
 #[cfg(test)]
 mod tests {
     use super::{
-        await_export_operation, await_export_stream_operation, clear_export_cancelled,
+        await_export_operation, await_export_stream_operation, clear_export_cancelled, combine_schema_sql_export,
         concurrent_metadata_prefetch_allowed, database_export_metadata_prefetch_concurrency,
-        emit_database_export_cancelled, set_export_cancelled, snapshot_batch_cancelled, ExportStatus,
-        EXPORT_CANCELLED_ERROR,
+        emit_database_export_cancelled, postgres_create_schema_sql, postgres_export_schema_names, set_export_cancelled,
+        snapshot_batch_cancelled, ExportStatus, EXPORT_CANCELLED_ERROR,
     };
     use super::{
         build_database_export_object_source_sql, build_database_sql_export, build_export_insert_statements,
-        database_export_select_sql, database_export_total_objects, drop_table_if_exists_sql,
-        ensure_export_destination_dir, export_destination_identity_mismatch, filter_export_table_infos,
-        format_export_sql_literal, format_export_table_ddl, format_mysql_spatial_export_literal,
-        format_xugu_spatial_export_literal, generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl,
-        generate_postgres_sequence_owner_ddl, generate_postgres_sequence_setval_sql,
-        is_postgres_extension_member_routine, mysql_database_export_preamble, mysql_view_dependencies_from_rows,
-        mysql_view_dependencies_sql, normalize_export_table_ddl, record_export_destination_identity,
-        record_export_error, replace_database_export_select_list, sort_export_views_by_dependencies,
-        split_postgres_export_table_triggers, write_database_export_rows, BuildDatabaseSqlExportOptions,
-        BuildExportInsertStatementsOptions, DatabaseExportObjectCounts, DatabaseExportRequest, DatabaseExportWriter,
-        DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension, PostgresExportSequence,
-        PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
+        create_database_export_writer, database_export_query_options_for_timeout, database_export_select_sql,
+        database_export_total_objects, drop_table_if_exists_sql, ensure_export_destination_dir,
+        export_destination_identity_mismatch, filter_export_table_infos, format_export_sql_literal,
+        format_export_table_ddl, format_mysql_spatial_export_literal, format_xugu_spatial_export_literal,
+        generate_postgres_extension_ddl, generate_postgres_sequence_create_ddl, generate_postgres_sequence_owner_ddl,
+        generate_postgres_sequence_setval_sql, is_postgres_extension_member_routine, mysql_database_export_preamble,
+        mysql_view_dependencies_from_rows, mysql_view_dependencies_sql, normalize_export_table_ddl,
+        record_export_destination_identity, record_export_error, replace_database_export_select_list,
+        sort_export_views_by_dependencies, split_postgres_export_table_triggers, write_database_export_rows,
+        BuildDatabaseSqlExportOptions, BuildExportInsertStatementsOptions, DatabaseExportObjectCounts,
+        DatabaseExportRequest, DatabaseExportWriter, DdlNormalizeOptions, ExportedTableSql, PostgresExportExtension,
+        PostgresExportSequence, PostgresExtensionMembers, DATABASE_EXPORT_INSERT_BATCH_SIZE, DATABASE_EXPORT_ROW_LIMIT,
     };
     use super::{ExportProgress, LenientExportErrors};
     use crate::connection::AppState;
@@ -3631,6 +3858,19 @@ mod tests {
         Arc, Mutex,
     };
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn database_export_query_options_preserve_connection_timeout() {
+        let options = database_export_query_options_for_timeout(7, "database-export-session", Some(500));
+
+        assert_eq!(options.timeout_secs, Some(7));
+        assert_eq!(options.max_rows, Some(500));
+        assert_eq!(options.client_session_id.as_deref(), Some("database-export-session"));
+
+        let unlimited = database_export_query_options_for_timeout(0, "database-export-session", None);
+        assert_eq!(unlimited.timeout_secs, Some(0));
+        assert_eq!(unlimited.max_rows, None);
+    }
 
     #[tokio::test]
     async fn await_export_operation_drops_pending_metadata_after_cancel() {
@@ -3801,9 +4041,11 @@ mod tests {
             drop_table_if_exists: false,
             omit_auto_increment: false,
             fail_on_error: false,
+            prevent_overwrite: false,
             output_compression: Default::default(),
             snapshot_session_id: None,
             batch_size: 1000,
+            split_max_mb: None,
         }
     }
 
@@ -3817,11 +4059,30 @@ mod tests {
             flate2::Compression::default(),
         )));
         writer.write_all(b"SELECT 1;\n").unwrap();
-        writer.finish().unwrap();
+        writer.finish("backup.sql").unwrap();
 
         let mut output = String::new();
         flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()).read_to_string(&mut output).unwrap();
         assert_eq!(output, "SELECT 1;\n");
+    }
+
+    #[tokio::test]
+    async fn backup_writer_does_not_overwrite_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sql");
+        std::fs::write(&path, b"keep me").unwrap();
+        let state = Arc::new(test_app_state(directory.path()).await);
+        let mut request = export_request(true, true, true, Vec::new());
+        request.file_path = path.to_string_lossy().to_string();
+        request.prevent_overwrite = true;
+
+        let error = match create_database_export_writer(&state, &request).await {
+            Ok(_) => panic!("existing backup should not be overwritten"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
     }
 
     #[test]
@@ -3885,6 +4146,26 @@ mod tests {
 
         assert_eq!(ddl, "CREATE EXTENSION IF NOT EXISTS \"pg_trgm\" WITH SCHEMA \"addons\";");
         assert!(!ddl.contains("VERSION"));
+    }
+
+    #[test]
+    fn postgres_all_schema_export_filters_system_schemas_and_deduplicates() {
+        assert_eq!(
+            postgres_export_schema_names(vec![
+                " public ".to_string(),
+                "pg_catalog".to_string(),
+                "information_schema".to_string(),
+                "private".to_string(),
+                "private".to_string(),
+                "".to_string(),
+            ]),
+            vec!["public".to_string(), "private".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_all_schema_export_creates_quoted_schema_if_missing() {
+        assert_eq!(postgres_create_schema_sql("tenant\"data"), "CREATE SCHEMA IF NOT EXISTS \"tenant\"\"data\";");
     }
 
     #[test]
@@ -5259,6 +5540,136 @@ mod tests {
     }
 
     #[test]
+    fn split_zip_export_writer_splits_across_insert_batches_into_valid_sql() {
+        let directory = tempfile::tempdir().unwrap();
+        let zip_path = directory.path().join("orders.zip");
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "orders",
+            "sql",
+        )
+        .unwrap();
+
+        // Each call is one full INSERT batch statement, exactly like the real
+        // write_database_export_rows call sites -- the writer must only cut
+        // between these calls, never inside one.
+        let long_value = "x".repeat(200_000);
+        for row_index in 0..20 {
+            write_database_export_rows(
+                &mut writer,
+                &[vec![json!(row_index), json!(long_value.clone())]],
+                &["id".to_string(), "payload".to_string()],
+                &[Some("bigint".to_string()), Some("text".to_string())],
+                &[None, None],
+                "orders",
+                "shop",
+                &DatabaseType::Postgres,
+            )
+            .unwrap();
+        }
+        writer.finish("orders.sql").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".sql") {
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() > 1,
+            "expected the large export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a syntactically complete INSERT
+            // statement -- proof that no cut landed inside one.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut: {line}"
+                );
+            }
+        }
+        // Reassembling every part in order must reproduce all 20 rows.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined.matches("INSERT INTO").count(), 20);
+    }
+
+    #[test]
+    fn all_schemas_combine_keeps_split_part_boundaries_statement_safe() {
+        // Mirror of the per-schema temporary files that
+        // `export_postgres_all_schemas_sql_core` combines: whole SQL
+        // statements, one per line, each newline-terminated.
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema-0.sql");
+        let long_value = "x".repeat(200_000);
+        let mut schema_sql = String::new();
+        for row_index in 0..20 {
+            schema_sql.push_str(&format!("INSERT INTO orders VALUES ({row_index}, '{long_value}');\n"));
+        }
+        std::fs::write(&schema_path, &schema_sql).unwrap();
+
+        let zip_path = directory.path().join("combined.zip");
+        let mut writer = crate::export_split_zip::SplitZipExportWriter::create(
+            &zip_path,
+            crate::export_split_zip::MIN_SPLIT_PART_MAX_MB,
+            "combined",
+            "sql",
+        )
+        .unwrap();
+        let mut source = std::io::BufReader::new(std::fs::File::open(&schema_path).unwrap());
+        combine_schema_sql_export(&mut source, &mut writer).unwrap();
+        writer.finish("combined.sql").unwrap();
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut sql_parts = Vec::new();
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".sql") {
+                continue;
+            }
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            sql_parts.push((entry.name().to_string(), contents));
+        }
+        sql_parts.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert!(
+            sql_parts.len() > 1,
+            "expected the combined export to be split into multiple parts, got {}",
+            sql_parts.len()
+        );
+        for (name, contents) in &sql_parts {
+            assert!(!contents.is_empty(), "{name} must not be empty");
+            // Every non-blank line must be a complete statement -- proof that
+            // the copy never cut inside one.
+            for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+                assert!(
+                    line.trim_start().starts_with("INSERT INTO") && line.trim_end().ends_with(';'),
+                    "{name} has a malformed line from a mid-statement cut"
+                );
+            }
+        }
+        // Reassembling the parts in order must reproduce the temporary file
+        // byte for byte: the line-by-line copy adds, drops, and alters
+        // nothing, including the trailing newline.
+        let combined: String = sql_parts.iter().map(|(_, contents)| contents.as_str()).collect();
+        assert_eq!(combined, schema_sql);
+        assert_eq!(combined.matches("INSERT INTO").count(), 20);
+    }
+
+    #[test]
     fn dameng_identity_export_inserts_enable_identity_insert() {
         let statements = build_export_insert_statements(BuildExportInsertStatementsOptions {
             database_type: Some(DatabaseType::Dameng),
@@ -5665,6 +6076,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_export_destination_dir_refuses_a_new_child_when_its_recorded_parent_is_missing() {
+        let scratch = std::env::temp_dir().join(format!("dbx-export-dest-child-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let state = test_app_state(&scratch).await;
+
+        let destination = scratch.join("mounted-drive").join("backups");
+        std::fs::create_dir_all(&destination).unwrap();
+        record_export_destination_identity(&state, &destination)
+            .await
+            .expect("the configured root should be recorded before scheduled runs begin");
+
+        std::fs::remove_dir_all(scratch.join("mounted-drive")).unwrap();
+        let run_directory = destination.join("dbx-backup__nightly__20260908-220000__12345678");
+
+        let result = ensure_export_destination_dir(&state, &run_directory).await;
+
+        assert!(result.is_err(), "a unique run directory must not recreate a missing configured parent");
+        assert!(!run_directory.exists(), "the run directory must not be created on the local filesystem");
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test]
     async fn record_export_destination_identity_rejects_a_directory_that_disappeared_before_save() {
         let scratch = std::env::temp_dir().join(format!("dbx-export-dest-eager-new-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&scratch).unwrap();
@@ -5795,6 +6229,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
+            super::export_destination_identity_needs_confirmation(&state, &destination).await.unwrap(),
+            "legacy macOS destination state should require explicit confirmation"
+        );
+        assert!(
             ensure_export_destination_dir(&state, &destination).await.is_err(),
             "an unattended export must not silently replace legacy identity state, even when st_dev still matches"
         );
@@ -5802,6 +6240,10 @@ mod tests {
         record_export_destination_identity(&state, &destination)
             .await
             .expect("explicitly confirming the destination should replace legacy state");
+        assert!(
+            !super::export_destination_identity_needs_confirmation(&state, &destination).await.unwrap(),
+            "persistent volume identity should not require another confirmation"
+        );
         ensure_export_destination_dir(&state, &destination)
             .await
             .expect("the confirmed persistent volume identity should match");

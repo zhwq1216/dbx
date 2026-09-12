@@ -77,6 +77,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  DownloadedUpdate,
   UpdateDownloadSource,
   RedisCollectionPage,
   RedisDatabaseInfo,
@@ -85,6 +86,7 @@ import type {
   RedisStreamPage,
   RedisStreamPendingPage,
   RedisValue,
+  RedisKeysExpiryResult,
   RedisScanResult,
   RedisCommandResult,
   RedisSlowlogEntry,
@@ -120,6 +122,7 @@ import type {
   HistoryConnectionOption,
   SqlFileRequest,
   SqlFilePreview,
+  SqlFileTable,
   SqlFileProgress,
   TransferRequest,
   TransferProgress,
@@ -129,6 +132,14 @@ import type {
   TableImportRequest,
   TableImportSummary,
   TableImportProgress,
+  MongoImportPreviewRequest,
+  MongoImportPreview,
+  MongoImportRequest,
+  MongoImportProgress,
+  MongoImportSummary,
+  MongoExportRequest,
+  MongoExportProgress,
+  MongoExportSummary,
   DatabaseBackupSnapshot,
   DatabaseExportRequest,
   ExportProgress,
@@ -244,6 +255,7 @@ import type {
 } from "@/types/nacos";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
+import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 import { normalizeConnectionTestResult } from "@/lib/connection/connectionDatabaseInfo";
 import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 
@@ -765,7 +777,7 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
 }
 
-export async function deleteDatabaseBackupFiles(_paths: string[]): Promise<number> {
+export async function deleteDatabaseBackupFiles(_paths: string[], _allowedRoots: string[] = []): Promise<number> {
   throw new Error("Database backup file management is only available in the desktop app.");
 }
 
@@ -1848,6 +1860,19 @@ export async function loadMaxAgentTurns(): Promise<number> {
   return get("/api/app-settings/max-agent-turns");
 }
 
+export async function loadSqlFileUploadMaxBytes(): Promise<number> {
+  return get("/api/app-settings/sql-file-upload-max-bytes");
+}
+
+export async function saveSqlFileUploadMaxMb(sqlFileUploadMaxMb: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/sql-file-upload-max-bytes"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sqlFileUploadMaxMb }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+}
+
 export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   const res = await fetch(apiUrl("/api/app-settings/max-agent-turns"), {
     method: "PUT",
@@ -1879,6 +1904,28 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   await saveBrowserAppState("editor_settings", settings);
+}
+
+// Background images are desktop-only: the web backend has no local data dir.
+export interface BackgroundImageInfo {
+  storedPath: string;
+  fileName: string;
+}
+
+export async function saveBackgroundImage(_sourcePath: string): Promise<BackgroundImageInfo> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function clearBackgroundImage(_storedPath: string): Promise<void> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function readBackgroundImage(_storedPath: string): Promise<string> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function checkBackgroundImage(_storedPath: string): Promise<boolean> {
+  throw new Error("Background images are only supported in the desktop app");
 }
 
 export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> {
@@ -2216,6 +2263,10 @@ export async function executeSqlFile(request: SqlFileRequest): Promise<void> {
   return post("/api/sql-file/execute", { request });
 }
 
+export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
+  return post("/api/sql-file/tables", { filePath });
+}
+
 export async function executeSqlFiles(request: SqlFileRequest, filePaths: string[]): Promise<void> {
   return post("/api/sql-file/execute", { request, filePaths });
 }
@@ -2248,11 +2299,11 @@ export async function pendingOpenAiConfigLinks(): Promise<string[]> {
   return [];
 }
 
-export async function readExternalSqlFile(_path: string): Promise<string> {
+export async function readExternalSqlFile(_path: string, _maxSizeBytes?: number): Promise<string> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
-export async function readExternalSqlFileSnapshot(_path: string): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
+export async function readExternalSqlFileSnapshot(_path: string, _maxSizeBytes?: number): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
@@ -2426,6 +2477,122 @@ export async function releaseTableImportSource(sourceRef: string): Promise<boole
   return result.released;
 }
 
+export async function previewMongodbImportFile(fileOrPath: string | File | MongoImportPreviewRequest, options: Partial<MongoImportPreviewRequest> = {}): Promise<MongoImportPreview> {
+  if (typeof fileOrPath === "object" && !(fileOrPath instanceof File)) {
+    throw new Error("previewMongodbImportFile in web mode requires a File object for upload previews");
+  }
+  if (typeof fileOrPath === "string") {
+    if (!options.sourceRef) {
+      throw new Error("previewMongodbImportFile in web mode requires a File object for new uploads");
+    }
+    const res = await fetch(apiUrl("/api/mongo/import/preview-source"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sourceRef: options.sourceRef,
+        format: options.format,
+        parseOptions: options.parseOptions,
+        previewLimit: options.previewLimit,
+      }),
+    });
+    if (!res.ok) throw await backendResponseError(res);
+    return res.json();
+  }
+  const formData = new FormData();
+  formData.append("file", fileOrPath);
+  if (options.format) formData.append("format", options.format);
+  if (options.parseOptions) formData.append("parseOptions", JSON.stringify(options.parseOptions));
+  if (options.previewLimit != null) formData.append("previewLimit", String(options.previewLimit));
+  const res = await fetch(apiUrl("/api/mongo/import/preview"), {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return res.json();
+}
+
+export async function importMongodbFile(request: MongoImportRequest, onProgress: (progress: MongoImportProgress) => void): Promise<MongoImportSummary> {
+  const res = await fetch(apiUrl("/api/mongo/import/execute"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(apiUrl(`/api/mongo/import/progress/${request.importId}`));
+    es.onmessage = (e) => {
+      const progress: MongoImportProgress = JSON.parse(e.data);
+      onProgress(progress);
+      if (progress.status === "done") {
+        es.close();
+        resolve({
+          importId: progress.importId,
+          rowsInserted: progress.rowsInserted,
+          rowsFailed: progress.rowsFailed,
+          batchesCommitted: progress.batchesCommitted,
+          elapsedMs: progress.elapsedMs,
+        });
+      } else if (progress.status === "error" || progress.status === "cancelled") {
+        es.close();
+        reject(new Error(progress.errorMessage || "MongoDB import failed"));
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      reject(new Error("MongoDB import SSE connection failed"));
+    };
+  });
+}
+
+export async function cancelMongodbImport(importId: string): Promise<boolean> {
+  return post("/api/mongo/import/cancel", { importId });
+}
+
+export async function releaseMongodbImportSource(sourceRef: string): Promise<boolean> {
+  const result = await post<{ released: boolean }>("/api/mongo/import/source/release", { sourceRef });
+  return result.released;
+}
+
+export async function exportMongodbQuery(request: MongoExportRequest, onProgress: (progress: MongoExportProgress) => void): Promise<MongoExportSummary> {
+  const res = await fetch(apiUrl("/api/mongo/export"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ request }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+  return new Promise((resolve, reject) => {
+    const es = new EventSource(apiUrl(`/api/mongo/export/progress/${request.exportId}`));
+    es.onmessage = (e) => {
+      const progress: MongoExportProgress = JSON.parse(e.data);
+      onProgress(progress);
+      if (progress.status === "done" || progress.status === "error" || progress.status === "cancelled") {
+        es.close();
+        if (progress.status === "done") {
+          const a = document.createElement("a");
+          a.href = apiUrl(`/api/mongo/export/download/${request.exportId}`);
+          a.click();
+          resolve({
+            exportId: progress.exportId,
+            documentsExported: progress.documentsRead,
+            filePath: request.filePath,
+            elapsedMs: progress.elapsedMs,
+          });
+        } else {
+          reject(new Error(progress.errorMessage || "MongoDB export failed"));
+        }
+      }
+    };
+    es.onerror = () => {
+      es.close();
+      reject(new Error("MongoDB export SSE connection failed"));
+    };
+  });
+}
+
+export async function cancelMongodbExport(exportId: string): Promise<boolean> {
+  return post("/api/mongo/export/cancel", { exportId });
+}
+
 // ---------------------------------------------------------------------------
 // Database Export
 // ---------------------------------------------------------------------------
@@ -2478,6 +2645,10 @@ export async function cancelDatabaseExport(exportId: string): Promise<void> {
 
 export async function clearDatabaseExportCancellation(_exportId: string): Promise<void> {
   // The web exporter owns and clears its cancellation marker on completion.
+}
+
+export async function databaseExportDestinationNeedsConfirmation(_directory: string): Promise<boolean> {
+  throw new Error("Scheduled database backups are only available in the desktop app.");
 }
 
 export async function recordDatabaseExportDestination(_directory: string): Promise<void> {
@@ -2910,6 +3081,14 @@ export async function redisSetExpireAt(connectionId: string, db: number, keyRaw:
   });
 }
 
+export async function redisSetKeysTtl(connectionId: string, db: number, keyRaws: string[], ttl: number): Promise<RedisKeysExpiryResult> {
+  return post("/api/redis/set-keys-ttl", { connectionId, db, keyRaws, ttl });
+}
+
+export async function redisSetKeysExpireAt(connectionId: string, db: number, keyRaws: string[], expireAt: number): Promise<RedisKeysExpiryResult> {
+  return post("/api/redis/set-keys-expire-at", { connectionId, db, keyRaws, expireAt });
+}
+
 export async function redisDeleteKeys(connectionId: string, db: number, keyRaws: string[]): Promise<number> {
   return post("/api/redis/delete-keys", { connectionId, db, keyRaws });
 }
@@ -2949,8 +3128,8 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
-  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`));
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -3823,7 +4002,7 @@ export async function mongoCloneCollection(connectionId: string, database: strin
 
 export async function elasticsearchListIndices(connectionId: string): Promise<string[]> {
   const collections = await documentListCollections(connectionId, "default");
-  return collections.map((c) => c.name);
+  return [...new Set(collections.flatMap((collection) => [collection.name, ...(collection.aliases ?? [])].filter((name) => name.trim())))];
 }
 
 /** Lists every Meilisearch index visible to the current connection credentials. */
@@ -4443,13 +4622,19 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion: string, _attemptId: string, _releaseNotes?: string): Promise<DownloadedUpdate> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
 
 export async function cancelUpdateDownload(): Promise<void> {}
 
-export async function installDownloadedUpdate(): Promise<void> {
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return null;
+}
+
+export async function discardDownloadedUpdate(_cacheId: string): Promise<void> {}
+
+export async function installDownloadedUpdate(_cacheId: string, _expectedVersion: string): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 
@@ -4466,6 +4651,7 @@ export async function getAppSupportInfo(): Promise<AppSupportInfo> {
     osName: navigator.platform || "web",
     osVersion: null,
     arch: "",
+    userAgent: collectBrowserSupportInfo(),
   };
 }
 

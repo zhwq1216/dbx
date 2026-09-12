@@ -6,10 +6,11 @@ use crate::connection::{
 use crate::db;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query::{agent_execute_query_params, should_discard_pool_after_error, QueryExecutionOptions};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 mod kingbase;
@@ -1711,14 +1712,8 @@ async fn external_driver_oracle_columns_via_sql(
     }
 }
 
-fn should_query_oracle_columns_via_sql_first(
-    db_type: &DatabaseType,
-    schema: &str,
-    client_session_id: Option<&str>,
-) -> bool {
-    *db_type == DatabaseType::Oracle
-        && schema.trim().is_empty()
-        && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
+fn should_query_oracle_columns_via_sql_first(db_type: &DatabaseType, client_session_id: Option<&str>) -> bool {
+    *db_type == DatabaseType::Oracle && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
 }
 
 fn oracle_object_statistics_sql(schema: &str) -> String {
@@ -3197,6 +3192,10 @@ mod tests {
 
     use crate::connection::{AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
+    #[cfg(unix)]
+    use crate::plugins::{
+        InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
+    };
     use crate::storage::Storage;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -3214,6 +3213,7 @@ mod tests {
             comment: None,
             key_is_expression: Vec::new(),
             column_opclasses: vec![],
+            key_options: Vec::new(),
             constraint_backed: false,
         };
         let mut filtered = index("uq_active_code", &["active_code"], true, false);
@@ -3404,6 +3404,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -3571,6 +3572,9 @@ mod tests {
         config.connection_string = Some(" jdbc:mysql://127.0.0.1:3306/demo ".to_string());
         assert!(is_mysql_external_driver_config(&config));
 
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        assert!(!is_mysql_external_driver_config(&config));
+
         config.connection_string = Some("jdbc:mariadb://127.0.0.1:3306/demo".to_string());
         config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
@@ -3580,6 +3584,94 @@ mod tests {
 
         config.jdbc_driver_class = Some("org.mariadb.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mysql_external_driver_ddl_falls_back_to_generic_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-mysql-wrapper-ddl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"executeQuery"'*)
+      echo executeQuery >> '{}'
+      printf '{{"id":%s,"error":{{"message":"SHOW CREATE TABLE is not supported"}}}}\n' "$id"
+      ;;
+    *'"method":"getObjectSource"'*)
+      echo getObjectSource >> '{}'
+      printf '{{"id":%s,"result":{{"source":"CREATE TABLE fallback_ddl"}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "test".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+            },
+            path: dir.clone(),
+        };
+        let session = std::sync::Arc::new(
+            PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default()).await.unwrap(),
+        );
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.id = "mysql-wrapper".to_string();
+        config.database = Some("demo".to_string());
+        config.connection_string = Some("jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "mysql-wrapper".to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: std::sync::Arc::new(config),
+                        session,
+                    },
+                );
+            })
+            .await;
+
+        let ddl = super::get_table_ddl_core(&state, "mysql-wrapper", "demo", "", "orders", None)
+            .await
+            .expect("generic DDL should be returned after SHOW CREATE TABLE fails");
+
+        assert_eq!(ddl, "CREATE TABLE fallback_ddl");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQuery\ngetObjectSource\n");
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -5247,17 +5339,16 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn oracle_session_completion_queries_synonym_aware_columns_sql_first() {
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("tab-1")));
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "   ", Some("tab-1")));
+    fn oracle_columns_sql_first_handles_current_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
     }
 
     #[test]
-    fn oracle_columns_sql_first_is_limited_to_current_schema_editor_sessions() {
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "DBX_TEST", Some("tab-1")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", None));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("  ")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, "", Some("tab-1")));
+    fn oracle_columns_sql_first_handles_explicit_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, None));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("  ")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, Some("tab-1")));
     }
 
     #[test]
@@ -6663,7 +6754,7 @@ async fn get_columns_core_for_session_inner(
                     return external_driver_presto_like_columns(session, config.as_ref(), database, schema, table).await;
                 }
                 let query_oracle_columns_first =
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id);
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id);
                 if query_oracle_columns_first {
                     match external_driver_oracle_columns_via_sql(
                         session.clone(),
@@ -6766,7 +6857,7 @@ async fn get_columns_core_for_session_inner(
                 let fallback_config = db_config.clone();
                                 let mut client = client.lock().await;
                 let oracle_sql_config = fallback_config.as_ref().filter(|config| {
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id)
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id)
                 });
                 let query_oracle_columns_first = oracle_sql_config.is_some();
                 if let Some(config) = oracle_sql_config {
@@ -7459,16 +7550,193 @@ pub async fn list_functions_core(
     database: &str,
     schema: &str,
 ) -> Result<Vec<db::FunctionInfo>, String> {
-    retry_metadata_connection(state, connection_id, Some(database), || async {
+    let postgres_functions = retry_metadata_connection(state, connection_id, Some(database), || async {
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
 
         match &pool {
-            PoolKind::Postgres(p) => db::postgres::list_functions(p, schema).await,
-            _ => Ok(vec![]),
+            PoolKind::Postgres(p) => Ok(Some(db::postgres::list_functions(p, schema).await?)),
+            _ => Ok(None),
         }
     })
+    .await?;
+
+    if let Some(functions) = postgres_functions {
+        return Ok(functions);
+    }
+
+    // Non-Postgres: reuse sidebar list_objects + get_object_source paths.
+    list_functions_via_objects(state, connection_id, database, schema).await
+}
+
+/// Build FunctionInfo for non-Postgres pools by reusing list_objects + get_object_source
+/// (same paths the sidebar uses for PROCEDURE/FUNCTION).
+async fn list_functions_via_objects(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::FunctionInfo>, String> {
+    let object_types = ["PROCEDURE".to_string(), "FUNCTION".to_string()];
+    let objects =
+        list_objects_core(state, connection_id, database, schema, None, None, None, Some(&object_types), None).await?;
+
+    // Bound concurrent get_object_source calls (N+1) without requiring AppState: Clone.
+    const CONCURRENCY: usize = 8;
+    let mut functions = Vec::with_capacity(objects.len());
+    for chunk in objects.chunks(CONCURRENCY) {
+        let chunk_results = futures::future::join_all(
+            chunk
+                .iter()
+                .map(|object| load_function_info_via_object(state, connection_id, database, schema, object.clone())),
+        )
+        .await;
+        functions.extend(chunk_results.into_iter().flatten());
+    }
+
+    Ok(functions)
+}
+
+fn schema_diff_routine_kind(object_type: &str) -> Option<(&'static str, db::ObjectSourceKind)> {
+    let object_type_upper = object_type.to_ascii_uppercase();
+    if object_type_upper.contains("PROC") {
+        Some(("PROCEDURE", db::ObjectSourceKind::Procedure))
+    } else if object_type_upper.contains("FUNC") {
+        Some(("FUNCTION", db::ObjectSourceKind::Function))
+    } else {
+        None
+    }
+}
+
+async fn load_function_info_via_object(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    object: db::ObjectInfo,
+) -> Option<db::FunctionInfo> {
+    let (function_type, source_kind) = schema_diff_routine_kind(&object.object_type)?;
+
+    let definition = match get_object_source_core(
+        state,
+        connection_id,
+        database,
+        schema,
+        &object.name,
+        source_kind.clone(),
+        object.signature.as_deref(),
+        None,
+    )
     .await
+    {
+        Ok(source) if !source.source.trim().is_empty() => source.source,
+        Ok(_) | Err(_) => {
+            // Retry the alternate routine kind when the primary getter is empty/fails.
+            let alternate = match source_kind {
+                db::ObjectSourceKind::Procedure => db::ObjectSourceKind::Function,
+                db::ObjectSourceKind::Function => db::ObjectSourceKind::Procedure,
+                other => other,
+            };
+            match get_object_source_core(
+                state,
+                connection_id,
+                database,
+                schema,
+                &object.name,
+                alternate,
+                object.signature.as_deref(),
+                None,
+            )
+            .await
+            {
+                Ok(source) if !source.source.trim().is_empty() => source.source,
+                // Skip objects with no readable source so empty definitions are not treated as loaded.
+                _ => return None,
+            }
+        }
+    };
+
+    Some(db::FunctionInfo {
+        name: object.name,
+        function_type: function_type.to_string(),
+        data_type: String::new(),
+        definition: strip_routine_definer_clause(&definition),
+        arguments: object.signature.unwrap_or_default(),
+    })
+}
+
+/// MySQL's SHOW CREATE PROCEDURE/FUNCTION prefixes `CREATE DEFINER=`user`@`host``.
+/// The definer account typically differs across same-structure databases on
+/// different servers while the routine body is identical, so drop the clause
+/// before schema-diff comparison (same spirit as DBeaver's removeDefiner
+/// option). Definitions without the clause pass through unchanged; the
+/// `^CREATE DEFINER` anchor keeps definer mentions inside a routine body alone.
+fn strip_routine_definer_clause(definition: &str) -> String {
+    static DEFINER_PREFIX: OnceLock<Regex> = OnceLock::new();
+    let definer_prefix = DEFINER_PREFIX.get_or_init(|| {
+        Regex::new(r#"(?is)^\s*CREATE\s+DEFINER\s*=\s*(`(?:[^`]|``)*`|"(?:[^"]|"")*"|[A-Za-z0-9_$]+)@(`(?:[^`]|``)*`|"(?:[^"]|"")*"|[A-Za-z0-9_$.%*-]+)"#).unwrap()
+    });
+    match definer_prefix.find(definition) {
+        Some(found) => format!("CREATE {}", definition[found.end()..].trim_start()),
+        None => definition.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod schema_diff_routine_kind_tests {
+    use super::schema_diff_routine_kind;
+    use crate::db::ObjectSourceKind;
+
+    #[test]
+    fn classifies_procedure_and_function_object_types() {
+        assert_eq!(schema_diff_routine_kind("PROCEDURE"), Some(("PROCEDURE", ObjectSourceKind::Procedure)));
+        assert_eq!(schema_diff_routine_kind("StoredProc"), Some(("PROCEDURE", ObjectSourceKind::Procedure)));
+        assert_eq!(schema_diff_routine_kind("FUNCTION"), Some(("FUNCTION", ObjectSourceKind::Function)));
+        assert_eq!(schema_diff_routine_kind("user_function"), Some(("FUNCTION", ObjectSourceKind::Function)));
+        assert!(schema_diff_routine_kind("TABLE").is_none());
+        assert!(schema_diff_routine_kind("VIEW").is_none());
+    }
+}
+
+#[cfg(test)]
+mod strip_routine_definer_clause_tests {
+    use super::strip_routine_definer_clause;
+
+    #[test]
+    fn strips_backquoted_definer_prefix() {
+        assert_eq!(
+            strip_routine_definer_clause("CREATE DEFINER=`root`@`localhost` PROCEDURE `p`() BEGIN SELECT 1; END"),
+            "CREATE PROCEDURE `p`() BEGIN SELECT 1; END"
+        );
+    }
+
+    #[test]
+    fn strips_bare_definer_prefix() {
+        assert_eq!(
+            strip_routine_definer_clause("CREATE DEFINER=app_user@10.0.0.% FUNCTION `f`() RETURNS int RETURN 1"),
+            "CREATE FUNCTION `f`() RETURNS int RETURN 1"
+        );
+    }
+
+    #[test]
+    fn keeps_definitions_without_definer() {
+        let def = "CREATE PROCEDURE `p`() BEGIN SELECT 1; END";
+        assert_eq!(strip_routine_definer_clause(def), def);
+    }
+
+    #[test]
+    fn keeps_definer_mentions_inside_the_body() {
+        let def = "CREATE PROCEDURE `p`() BEGIN -- CREATE DEFINER=`x`@`y` stays\nSELECT 1; END";
+        assert_eq!(strip_routine_definer_clause(def), def);
+    }
+
+    #[test]
+    fn strips_definer_after_leading_whitespace() {
+        assert_eq!(
+            strip_routine_definer_clause("  CREATE DEFINER=`root`@`%` PROCEDURE `p`() BEGIN END"),
+            "CREATE PROCEDURE `p`() BEGIN END"
+        );
+    }
 }
 
 pub async fn list_sequences_core(
@@ -7824,10 +8092,16 @@ async fn get_table_ddl_once(
                 let session = session.clone();
                 return external_driver_oracle_ddl(session, config.as_ref(), database, schema, table).await;
             }
-            if external_driver_uses_mysql_ddl(config.as_ref()) {
+            if external_driver_uses_mysql_ddl(config.as_ref())
+                || (config.db_type == DatabaseType::Jdbc && mysql_external_driver_url(config.as_ref()) == Some(true))
+            {
                 let config = config.clone();
                 let session = session.clone();
-                return external_driver_mysql_ddl(session, config.as_ref(), database, schema, table).await;
+                let result = external_driver_mysql_ddl(session.clone(), config.as_ref(), database, schema, table).await;
+                if result.is_err() && config.db_type == DatabaseType::Jdbc {
+                    return external_driver_jdbc_ddl(session, config.as_ref(), database, schema, table).await;
+                }
+                return result;
             }
             if external_driver_uses_generic_ddl(config.as_ref()) {
                 let config = config.clone();
@@ -8120,9 +8394,8 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
         return false;
     }
 
-    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
     let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
-    let mysql_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"));
+    let mysql_url = mysql_external_driver_url(config);
     let mysql_driver = driver_class.map(|value| matches!(value, "com.mysql.cj.jdbc.Driver" | "com.mysql.jdbc.Driver"));
 
     match (mysql_url, mysql_driver) {
@@ -8131,6 +8404,15 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
         (None, Some(driver_matches)) => driver_matches,
         (None, None) => false,
     }
+}
+
+fn mysql_external_driver_url(config: &ConnectionConfig) -> Option<bool> {
+    config
+        .connection_string
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"))
 }
 
 fn is_oracle_external_driver_config(config: &ConnectionConfig) -> bool {
@@ -8242,6 +8524,7 @@ async fn external_driver_gaussdb_m_indexes(
                     comment: current_comment.clone(),
                     key_is_expression: current_is_expression.clone(),
                     column_opclasses: vec![],
+                    key_options: Vec::new(),
                     constraint_backed: false,
                 });
             }
@@ -8313,6 +8596,7 @@ async fn external_driver_gaussdb_m_indexes(
             comment: current_comment,
             key_is_expression: current_is_expression,
             column_opclasses: vec![],
+            key_options: Vec::new(),
             constraint_backed: false,
         });
     }
@@ -10267,6 +10551,113 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_preserves_named_unique_and_primary_constraints() {
+        let mut id = column("id", "bigint");
+        id.is_nullable = false;
+        id.is_primary_key = true;
+        let indexes = vec![
+            db::IndexInfo {
+                name: "pk_accounts".to_string(),
+                columns: vec!["id".to_string()],
+                is_unique: true,
+                is_primary: true,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "uq_accounts_code".to_string(),
+                columns: vec!["code".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: true,
+            },
+            db::IndexInfo {
+                name: "idx_accounts_display_name".to_string(),
+                columns: vec!["display_name".to_string()],
+                is_unique: true,
+                is_primary: false,
+                filter: None,
+                index_type: Some("btree".to_string()),
+                included_columns: None,
+                comment: None,
+                key_is_expression: Vec::new(),
+                column_opclasses: Vec::new(),
+                key_options: Vec::new(),
+                constraint_backed: false,
+            },
+        ];
+        let constraints = vec![
+            db::ConstraintInfo {
+                name: "pk_accounts".to_string(),
+                constraint_type: "PRIMARY KEY".to_string(),
+                definition: "PRIMARY KEY (id)".to_string(),
+                columns: vec!["id".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: false,
+                initially_deferred: false,
+                enabled: true,
+                valid: true,
+            },
+            db::ConstraintInfo {
+                name: "uq_accounts_code".to_string(),
+                constraint_type: "UNIQUE".to_string(),
+                definition: "UNIQUE (code) DEFERRABLE INITIALLY DEFERRED".to_string(),
+                columns: vec!["code".to_string()],
+                ref_schema: None,
+                ref_table: None,
+                ref_columns: Vec::new(),
+                match_type: None,
+                on_update: None,
+                on_delete: None,
+                deferrable: true,
+                initially_deferred: true,
+                enabled: true,
+                valid: true,
+            },
+        ];
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "accounts",
+            &[id],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &db::postgres::PostgresTablePartitionInfo::default(),
+            &db::postgres::PostgresTablePartitionLocalObjects::default(),
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"pk_accounts\" PRIMARY KEY (id)"), "ddl: {ddl}");
+        assert!(
+            ddl.contains("CONSTRAINT \"uq_accounts_code\" UNIQUE (code) DEFERRABLE INITIALLY DEFERRED"),
+            "ddl: {ddl}"
+        );
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"pk_accounts\""), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX \"uq_accounts_code\""), "ddl: {ddl}");
+        assert!(ddl.contains("CREATE UNIQUE INDEX \"idx_accounts_display_name\""), "ddl: {ddl}");
+    }
+
+    #[test]
     fn postgres_table_ddl_renders_owned_serial_markers_without_external_defaults() {
         for (column_name, data_type, serial_type) in [
             ("small\"id", "smallint", "smallserial"),
@@ -10374,6 +10765,7 @@ mod ddl_tests {
             comment: None,
             key_is_expression: vec![true],
             column_opclasses: vec![Some("gin_trgm_ops".to_string())],
+            key_options: Vec::new(),
             constraint_backed: false,
         }];
 
@@ -10400,6 +10792,7 @@ mod ddl_tests {
             comment: None,
             key_is_expression: Vec::new(),
             column_opclasses: vec![],
+            key_options: Vec::new(),
             constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
@@ -10438,6 +10831,68 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_partition_ddl_preserves_local_unique_without_local_primary_key() {
+        let indexes = vec![db::IndexInfo {
+            name: "events_2026_code_key".to_string(),
+            columns: vec!["code".to_string()],
+            is_unique: true,
+            is_primary: false,
+            filter: None,
+            index_type: Some("btree".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: Vec::new(),
+            column_opclasses: Vec::new(),
+            key_options: Vec::new(),
+            constraint_backed: true,
+        }];
+        let constraints = vec![db::ConstraintInfo {
+            name: "events_2026_code_key".to_string(),
+            constraint_type: "UNIQUE".to_string(),
+            definition: "UNIQUE (code)".to_string(),
+            columns: vec!["code".to_string()],
+            ref_schema: None,
+            ref_table: None,
+            ref_columns: Vec::new(),
+            match_type: None,
+            on_update: None,
+            on_delete: None,
+            deferrable: false,
+            initially_deferred: false,
+            enabled: true,
+            valid: true,
+        }];
+        let partition_info = db::postgres::PostgresTablePartitionInfo {
+            is_partition: true,
+            parent_schema: Some("public".to_string()),
+            parent_table: Some("events".to_string()),
+            bound: Some("DEFAULT".to_string()),
+            ..Default::default()
+        };
+        let partition_local_objects = db::postgres::PostgresTablePartitionLocalObjects {
+            unique_constraints: BTreeSet::from(["events_2026_code_key".to_string()]),
+            indexes: BTreeSet::from(["events_2026_code_key".to_string()]),
+            ..Default::default()
+        };
+
+        let ddl = render_postgres_table_ddl_with_constraints_and_partition_info(
+            "public",
+            "events_2026",
+            &[column("code", "text")],
+            &indexes,
+            &[],
+            &constraints,
+            &[],
+            None,
+            &partition_info,
+            &partition_local_objects,
+        );
+
+        assert!(ddl.contains("CONSTRAINT \"events_2026_code_key\" UNIQUE (code)"), "ddl: {ddl}");
+        assert!(!ddl.contains("CREATE UNIQUE INDEX"), "ddl: {ddl}");
+    }
+
+    #[test]
     fn postgres_partition_ddl_skips_inherited_constraints_and_indexes() {
         let mut id = column("id", "integer");
         id.is_primary_key = true;
@@ -10452,6 +10907,7 @@ mod ddl_tests {
             comment: None,
             key_is_expression: Vec::new(),
             column_opclasses: vec![],
+            key_options: Vec::new(),
             constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
@@ -10787,6 +11243,40 @@ mod ddl_tests {
         assert!(ddl.contains(
             "\n\nCREATE TRIGGER users_bi BEFORE INSERT ON \"public\".\"users\" FOR EACH ROW EXECUTE PROCEDURE fill_created_at();"
         ));
+    }
+
+    #[test]
+    fn opengauss_ddl_comment_normalization_escapes_unescaped_quotes() {
+        // openGauss 6.x pg_get_tabledef concatenates the stored comment into
+        // the COMMENT ON literal verbatim; embedded single quotes make the
+        // statement invalid. Everything downstream (transfer table creation,
+        // export, UI display) executes this DDL, so the quotes must be doubled.
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+            "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：'0'-未删除，'1'-已删除';"
+        );
+
+        assert_eq!(
+            normalize_opengauss_table_ddl_comments(ddl),
+            concat!(
+                "SET search_path = public;\n",
+                "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+                "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：''0''-未删除，''1''-已删除';"
+            )
+        );
+    }
+
+    #[test]
+    fn opengauss_ddl_comment_normalization_leaves_valid_ddl_unchanged() {
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"notes\" (\"body\" text DEFAULT 'O''Hara');\n",
+            "COMMENT ON TABLE \"public\".\"notes\" IS 'owner''s note';\n",
+            "GRANT SELECT ON TABLE \"public\".\"notes\" TO \"auditor's role\";"
+        );
+
+        assert_eq!(normalize_opengauss_table_ddl_comments(ddl), ddl);
     }
 
     #[test]
@@ -11251,15 +11741,17 @@ pub async fn sqlite_ddl(pool: &db::sqlite::SqliteHandle, schema: &str, table: &s
 /// duplicate every partition's `CREATE TABLE` (once from the parent's DDL,
 /// once from the caller's own loop over that same child relation).
 pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -> Result<String, String> {
-    let (columns, indexes, fkeys, table_comment, partition_info, trigger_definitions, check_constraints) = tokio::try_join!(
-        db::postgres::get_columns(pool, schema, table),
-        db::postgres::list_indexes(pool, schema, table),
-        db::postgres::list_foreign_keys(pool, schema, table),
-        async { db::postgres::get_table_comment(pool, schema, table).await },
-        db::postgres::get_table_partition_info(pool, schema, table),
-        db::postgres::list_trigger_definitions(pool, schema, table),
-        db::postgres::list_check_constraints(pool, schema, table),
-    )?;
+    let (columns, indexes, fkeys, constraints, table_comment, partition_info, trigger_definitions, check_constraints) =
+        tokio::try_join!(
+            db::postgres::get_columns(pool, schema, table),
+            db::postgres::list_indexes(pool, schema, table),
+            db::postgres::list_foreign_keys(pool, schema, table),
+            db::postgres::list_constraints(pool, schema, table),
+            async { db::postgres::get_table_comment(pool, schema, table).await },
+            db::postgres::get_table_partition_info(pool, schema, table),
+            db::postgres::list_trigger_definitions(pool, schema, table),
+            db::postgres::list_check_constraints(pool, schema, table),
+        )?;
     let partition_local_objects = if partition_info.is_partition {
         db::postgres::get_table_partition_local_objects(pool, schema, table).await?
     } else {
@@ -11267,12 +11759,13 @@ pub async fn pg_ddl(pool: &deadpool_postgres::Pool, schema: &str, table: &str) -
     };
 
     Ok(append_postgres_trigger_definitions(
-        render_postgres_table_ddl_with_partition_info(
+        render_postgres_table_ddl_with_constraints_and_partition_info(
             schema,
             table,
             &columns,
             &indexes,
             &fkeys,
+            &constraints,
             &check_constraints,
             table_comment.as_deref(),
             &partition_info,
@@ -11665,12 +12158,139 @@ pub async fn opengauss_table_ddl(pool: &deadpool_postgres::Pool, schema: &str, t
         db::postgres::list_trigger_definitions(pool, schema, table),
     )?;
 
+    // Repair the server's comment literals before anything downstream executes
+    // this DDL: every consumer (transfer table creation, export, UI display)
+    // must receive executable SQL, not the raw pg_get_tabledef output.
+    let ddl = normalize_opengauss_table_ddl_comments(&ddl);
     Ok(append_opengauss_trigger_definitions(ddl, &trigger_definitions))
 }
 
 pub fn opengauss_table_ddl_sql(schema: &str, table: &str) -> String {
     let qualified_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     format!("SELECT pg_get_tabledef({})", sql_string(&qualified_name))
+}
+
+/// openGauss 6.x `pg_get_tabledef` can concatenate comment text into a
+/// `COMMENT ON` literal without escaping embedded single quotes. Normalize
+/// only those generated comment statements; all other DDL text remains
+/// untouched.
+pub(crate) fn normalize_opengauss_table_ddl_comments(ddl: &str) -> String {
+    let mut normalized = String::with_capacity(ddl.len());
+    for line in ddl.split_inclusive('\n') {
+        let (line_body, line_ending) = match line.strip_suffix('\n') {
+            Some(body) => match body.strip_suffix('\r') {
+                Some(body) => (body, "\r\n"),
+                None => (body, "\n"),
+            },
+            None => (line, ""),
+        };
+        let leading = line_body.len() - line_body.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+        let statement = &line_body[leading..];
+        if let Some(statement) = normalize_opengauss_comment_statement(statement) {
+            normalized.push_str(&line_body[..leading]);
+            normalized.push_str(&statement);
+        } else {
+            normalized.push_str(line_body);
+        }
+        normalized.push_str(line_ending);
+    }
+    normalized
+}
+
+fn normalize_opengauss_comment_statement(statement: &str) -> Option<String> {
+    let uppercase = statement.to_ascii_uppercase();
+    if !uppercase.starts_with("COMMENT ON ") {
+        return None;
+    }
+
+    let is_pos = find_opengauss_comment_is_keyword(statement, &uppercase)?;
+    let value_start = is_pos + " IS ".len();
+    let value = &statement[value_start..];
+    let value_leading = value.len() - value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+    let value = &value[value_leading..];
+    let quote_offset = match value.as_bytes() {
+        [b'\'', ..] => 0,
+        [b'e' | b'E', b'\'', ..] => 1,
+        _ => return None,
+    };
+    let opening_quote = value_start + value_leading + quote_offset;
+    let statement_end = statement.trim_end().len();
+    let literal_end = statement[..statement_end]
+        .strip_suffix(';')
+        .map_or(statement_end, |without_terminator| without_terminator.len());
+    if opening_quote >= literal_end {
+        return None;
+    }
+
+    let closing_quote = statement[..literal_end].rfind('\'')?;
+    if closing_quote <= opening_quote || !statement[closing_quote + 1..literal_end].trim().is_empty() {
+        return None;
+    }
+    let literal = &statement[opening_quote..=closing_quote];
+    if opengauss_comment_literal_is_valid(literal) {
+        return Some(statement.to_string());
+    }
+
+    let raw_comment = &statement[opening_quote + 1..closing_quote];
+    let escaped_comment = raw_comment.replace('\'', "''");
+    let mut normalized = String::with_capacity(statement.len() + escaped_comment.len() - raw_comment.len());
+    normalized.push_str(&statement[..opening_quote + 1]);
+    normalized.push_str(&escaped_comment);
+    normalized.push_str(&statement[closing_quote..]);
+    Some(normalized)
+}
+
+fn find_opengauss_comment_is_keyword(statement: &str, uppercase: &str) -> Option<usize> {
+    let mut cursor = "COMMENT ON ".len();
+    while cursor + " IS ".len() <= statement.len() {
+        if statement.as_bytes().get(cursor) == Some(&b'"') {
+            cursor = skip_opengauss_quoted_identifier(statement, cursor);
+            continue;
+        }
+        if uppercase.get(cursor..cursor + " IS ".len()) == Some(" IS ") {
+            return Some(cursor);
+        }
+        cursor += statement[cursor..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn skip_opengauss_quoted_identifier(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            if bytes.get(cursor + 1) == Some(&b'"') {
+                cursor += 2;
+            } else {
+                return cursor + 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn opengauss_comment_literal_is_valid(literal: &str) -> bool {
+    let bytes = literal.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
+        return false;
+    }
+
+    let mut cursor = 1;
+    while cursor < bytes.len() - 1 {
+        if bytes[cursor] == b'\'' {
+            if cursor + 1 < bytes.len() - 1 && bytes[cursor + 1] == b'\'' {
+                cursor += 2;
+            } else {
+                return false;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    true
 }
 
 fn append_postgres_trigger_definitions(mut ddl: String, trigger_definitions: &[String]) -> String {
@@ -11900,6 +12520,32 @@ fn render_postgres_table_ddl_with_partition_info(
     partition_info: &db::postgres::PostgresTablePartitionInfo,
     partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
 ) -> String {
+    render_postgres_table_ddl_with_constraints_and_partition_info(
+        schema,
+        table,
+        columns,
+        indexes,
+        fkeys,
+        &[],
+        check_constraints,
+        table_comment,
+        partition_info,
+        partition_local_objects,
+    )
+}
+
+fn render_postgres_table_ddl_with_constraints_and_partition_info(
+    schema: &str,
+    table: &str,
+    columns: &[db::ColumnInfo],
+    indexes: &[db::IndexInfo],
+    fkeys: &[db::ForeignKeyInfo],
+    constraints: &[db::ConstraintInfo],
+    check_constraints: &[(String, String)],
+    table_comment: Option<&str>,
+    partition_info: &db::postgres::PostgresTablePartitionInfo,
+    partition_local_objects: &db::postgres::PostgresTablePartitionLocalObjects,
+) -> String {
     let table_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     let partition_parent = partition_info
         .is_partition
@@ -11946,14 +12592,38 @@ fn render_postgres_table_ddl_with_partition_info(
             .collect::<Vec<_>>()
     };
 
-    let pks: Vec<&str> = if !is_partition || partition_local_objects.has_primary_key {
-        columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect()
-    } else {
-        Vec::new()
-    };
-    if !pks.is_empty() {
-        definition_lines
-            .push(format!("  PRIMARY KEY ({})", pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")));
+    let primary_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "PRIMARY KEY" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    let unique_constraints = constraints
+        .iter()
+        .filter(|constraint| constraint.constraint_type == "UNIQUE" && !constraint.definition.trim().is_empty())
+        .collect::<Vec<_>>();
+    if !is_partition || partition_local_objects.has_primary_key {
+        if primary_constraints.is_empty() {
+            let pks: Vec<&str> = columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.as_str()).collect();
+            if !pks.is_empty() {
+                definition_lines.push(format!(
+                    "  PRIMARY KEY ({})",
+                    pks.iter().map(|key| pg_ident(key)).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        } else {
+            for constraint in &primary_constraints {
+                definition_lines.push(format!(
+                    "  CONSTRAINT {} {}",
+                    pg_ident(&constraint.name),
+                    constraint.definition.trim()
+                ));
+            }
+        }
+    }
+    for constraint in unique_constraints {
+        if is_partition && !partition_local_objects.unique_constraints.contains(&constraint.name) {
+            continue;
+        }
+        definition_lines.push(format!("  CONSTRAINT {} {}", pg_ident(&constraint.name), constraint.definition.trim()));
     }
     for fk_group in group_foreign_keys_by_name(fkeys) {
         let Some(first_fk) = fk_group.first() else {
@@ -12073,7 +12743,7 @@ fn render_postgres_table_ddl_with_partition_info(
     }
 
     for idx in indexes {
-        if idx.is_primary {
+        if idx.is_primary || idx.constraint_backed {
             continue;
         }
         if is_partition && !partition_local_objects.indexes.contains(&idx.name) {

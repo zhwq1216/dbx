@@ -267,11 +267,12 @@ pub fn build_table_data_select_sql_with_database(
     };
     let order_by = options.order_by.as_deref().filter(|order| !order.trim().is_empty()).or(default_order_by.as_deref());
     let order = order_by.map(|order_by| format!(" ORDER BY {order_by}")).unwrap_or_default();
-    // Oracle join views can raise ORA-01445 when ROWID is selected; keep the
-    // synthetic ROWID fallback scoped to base-table reads.
+    // Oracle views with DISTINCT/GROUP BY raise ORA-01446 when ROWID is
+    // selected. Missing object metadata must therefore fail closed instead of
+    // being treated as a base table.
     let include_oracle_row_id = options.include_row_id
         && uses_oracle_row_id(database_type)
-        && !is_view_table_type(options.table_type.as_deref());
+        && is_oracle_base_table_type(options.table_type.as_deref());
     let include_xugu_row_id =
         options.include_row_id && uses_xugu_row_id(database_type) && !is_view_table_type(options.table_type.as_deref());
     let offset = options.offset.unwrap_or(0);
@@ -530,6 +531,10 @@ fn is_view_table_type(table_type: Option<&str>) -> bool {
     table_type.is_some_and(|value| value.to_ascii_uppercase().contains("VIEW"))
 }
 
+fn is_oracle_base_table_type(table_type: Option<&str>) -> bool {
+    table_type.is_some_and(|value| value.trim().eq_ignore_ascii_case("TABLE"))
+}
+
 pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
     let database_type = options.database_type;
     if database_type == Some(DatabaseType::VictoriaMetrics) {
@@ -555,7 +560,17 @@ pub fn build_table_select_sql(options: TableSelectSqlOptions<'_>) -> String {
             options
                 .order_columns
                 .iter()
-                .map(|column| format!("{} ASC", quote_table_identifier(database_type, column)))
+                .map(|column| {
+                    let quoted = if database_type == Some(DatabaseType::Iris) {
+                        // Caché/IRIS may run with delimited identifiers disabled,
+                        // where a quoted ORDER BY name becomes a string literal and
+                        // silently degrades to a constant sort.
+                        quote_iris_identifier(column, None)
+                    } else {
+                        quote_table_identifier(database_type, column)
+                    };
+                    format!("{quoted} ASC")
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -605,7 +620,20 @@ fn quoted_table_columns_or_star(database_type: Option<DatabaseType>, columns: &[
     if columns.is_empty() {
         return "*".to_string();
     }
-    columns.iter().map(|column| quote_table_identifier(database_type, column)).collect::<Vec<_>>().join(", ")
+    columns
+        .iter()
+        .map(|column| {
+            if database_type == Some(DatabaseType::Iris) {
+                // With delimited identifiers disabled, the Caché/IRIS JDBC
+                // preparser turns a quoted column name into a `:%qpar` host
+                // variable, so ordinary names must stay unquoted.
+                quote_iris_identifier(column, None)
+            } else {
+                quote_table_identifier(database_type, column)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn build_rownum_table_select_sql(

@@ -33,6 +33,8 @@ const props = defineProps<
   }
 >();
 
+const HOT_TAB_SURFACE_CACHE_SIZE = 3;
+
 const emit = defineEmits<
   ContentAreaSurfaceEmits & {
     "focus-group": [groupId: string];
@@ -92,7 +94,10 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const toolbar = inject(EDITOR_TOOLBAR_ACTIONS, createNoopEditorToolbarActions());
 const tabBarPortal = inject(GROUP_TAB_BAR_PORTAL, null);
-const tabBarTarget = computed(() => tabBarPortal?.targets.get(props.groupId));
+const tabBarTarget = computed(() => {
+  if (!tabBarPortal?.active.value) return undefined;
+  return tabBarPortal.targets.get(props.groupId);
+});
 const groupTabs = computed(() => {
   const byId = new Map(queryStore.tabs.map((tab) => [tab.id, tab]));
   return props.tabIds.map((id) => byId.get(id)).filter((tab): tab is QueryTab => !!tab);
@@ -206,8 +211,10 @@ const groupExecutableSql = computed(() => {
         @clear-default-database="activeTab && toolbar.clearDefaultDatabase(activeTab.id)"
       />
       <div class="relative flex-1 min-h-0">
-        <QueryEditorSurface v-if="activeTab?.mode === 'query'" ref="activeSurfaceRef" v-bind="surfaceBindings" :auto-focus="groupId === queryStore.focusedGroupId" class="h-full" />
-        <ContentArea v-else-if="activeTab" ref="activeSurfaceRef" v-bind="surfaceBindings" class="h-full" />
+        <KeepAlive v-if="activeTab" :max="HOT_TAB_SURFACE_CACHE_SIZE">
+          <QueryEditorSurface v-if="activeTab?.mode === 'query'" :key="`query:${activeTab.id}`" ref="activeSurfaceRef" v-bind="surfaceBindings" :auto-focus="groupId === queryStore.focusedGroupId" class="h-full" />
+          <ContentArea v-else :key="`content:${activeTab.id}`" ref="activeSurfaceRef" v-bind="surfaceBindings" class="h-full" />
+        </KeepAlive>
         <slot v-else name="empty">
           <div class="flex h-full items-center justify-center text-sm text-muted-foreground">
             {{ t("tabs.emptyGroup") }}

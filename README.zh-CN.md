@@ -113,13 +113,13 @@
   </tr>
   <tr>
     <td align="center" valign="middle" width="200">
-      <a href="https://api.hualong.online/" target="_blank">
+      <a href="https://api.hualong.online/register?promo=DBX%26HUALONG" target="_blank">
         <img src="docs/public/sponsors/hualong-card.png" alt="HuaLongAI" width="175" />
       </a>
     </td>
     <td>
       HuaLongAI（华龙算力）是面向重度 AI 开发者的模型 API 中转服务商，主营 Codex 与 Claude 系列模型，100% 官方源直供、不掺假；计费透明，Token 级账单可逐笔核验，支持企业合同与发票。
-      <a href="https://api.hualong.online/" target="_blank">访问 HuaLongAI</a>
+      <a href="https://api.hualong.online/register?promo=DBX%26HUALONG" target="_blank">访问 HuaLongAI</a>
     </td>
   </tr>
   <tr>
@@ -526,7 +526,7 @@ DBX 是免费开源项目，但持续维护、数据库兼容性测试、基础�
 
 <details>
 <summary><strong>DBX 会收集用户数据吗？</strong></summary>
-不会。DBX 不收集任何遥测数据。自动更新功能仅检查 GitHub Releases 获取新版本——你可以在设置中禁用它。
+不会。DBX 不收集任何遥测数据。开启更新通知时，桌面端会通过所选更新源检查新版本并静默下载安装包；下载并校验完成后，更新入口显示提示，只有点击“重启并更新”才会安装。已下载的安装包会保留到下次启动，也可忽略该版本。你可以在设置中关闭自动检查和下载。
 </details>
 
 <details>

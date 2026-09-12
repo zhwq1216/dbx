@@ -1,4 +1,24 @@
-export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "kimi" | "qwen" | "minimax" | "ollama" | "anthropic-compatible" | "openai-compatible" | "claude-code-cli" | "pi-agent-cli" | "codex-cli" | "opencode-cli" | "cursor-cli" | "grok-cli" | "codebuddy-cli" | "qoder-cli" | "custom";
+export type AiProvider =
+  | "claude"
+  | "openai"
+  | "gemini"
+  | "deepseek"
+  | "kimi"
+  | "qwen"
+  | "zhipu"
+  | "minimax"
+  | "ollama"
+  | "anthropic-compatible"
+  | "openai-compatible"
+  | "claude-code-cli"
+  | "pi-agent-cli"
+  | "codex-cli"
+  | "opencode-cli"
+  | "cursor-cli"
+  | "grok-cli"
+  | "codebuddy-cli"
+  | "qoder-cli"
+  | "custom";
 export type AiApiStyle = "completions" | "responses" | "anthropic-messages";
 export type AiAuthMethod = "api-key" | "bearer";
 export type AiEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
@@ -96,6 +116,8 @@ export interface AiChatSelectionState {
   active?: AiActiveModelSelection;
   effortPreferences: AiModelEffortPreference[];
   defaultMode?: AiAssistantMode;
+  /** Whether opening the AI panel restores the most recently updated conversation. */
+  restoreLastConversation?: boolean;
   /** Prompt template ids auto-applied when the AI panel opens, keyed by connection db_type. */
   defaultTemplatesByDbType?: Record<string, string[]>;
   /** Prompt template ids from the most recent send, keyed by connection db_type. */
