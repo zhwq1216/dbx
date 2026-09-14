@@ -70,6 +70,7 @@ import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
 import { externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, isSqlFilePath, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, DatabaseType, ObjectBrowserFilter, ObjectSourceKind, QueryTab, TabOutputView, TreeNode } from "@/types/database";
+import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import { parseAiConfigDeepLink, type AiConfigDeepLinkDraft } from "@/lib/ai/aiConfigDeepLink";
 import { activeDesktopAiRuns, blockingDesktopAiRunsForQuit } from "@/lib/ai/desktopAiRunRegistry";
@@ -114,7 +115,7 @@ import { normalizeSqlExecutionTarget, sqlExecutionTargetCapabilities } from "@/l
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates } from "@/lib/connection/agentDriverUpdateBadge";
-import type { DriverStoreFocus } from "@/lib/connection/agentDriverInstallHint";
+import type { DriverStoreFocus, DriverStoreTab } from "@/lib/connection/agentDriverInstallHint";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { apiUrl, webPath } from "@/lib/common/webPath";
 import { shouldBlockAppNativeSelectAll } from "@/lib/common/clipboard";
@@ -151,10 +152,12 @@ import { resolveWindowContext } from "@/lib/app/windowContext";
 import { openDetachedTabWindow } from "@/lib/app/detachedTabWindow";
 
 const AiAssistant = defineAsyncComponent(() => import("@/components/editor/AiAssistant.vue"));
+const PluginWorkbenchTab = defineAsyncComponent(() => import("@/components/plugins/PluginWorkbenchTab.vue"));
 const QueryHistory = defineAsyncComponent(() => import("@/components/editor/QueryHistory.vue"));
 const SqlLibraryPanel = defineAsyncComponent(() => import("@/components/layout/SqlLibraryPanel.vue"));
 const SqlFilePanel = defineAsyncComponent(() => import("@/components/layout/SqlFilePanel.vue"));
 const DriverStorePage = defineAsyncComponent(() => import("@/components/config/DriverStoreDialog.vue"));
+const PluginCenterPage = defineAsyncComponent(() => import("@/components/plugins/PluginContributionsPanel.vue"));
 const EditorSettingsPage = defineAsyncComponent(() => import("@/components/editor/EditorSettingsDialog.vue"));
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
@@ -323,8 +326,13 @@ const showQueryEditorObjectSourceDialog = ref(false);
 const driverStoreTabOpen = ref(false);
 const driverStoreActive = ref(false);
 const driverStoreActiveTab = ref<"agent" | "jdbc" | "storage" | "runtime">("agent");
-const settingsReturnSurface = ref<"query" | "driverStore" | "welcome">("welcome");
+const pluginCenterTabOpen = ref(false);
+const pluginCenterActive = ref(false);
+const pluginCenterFocus = ref<PluginCenterFocus | null>(null);
+const connectionPluginProvider = ref<PluginCenterFocus | null>(null);
+const settingsReturnSurface = ref<"query" | "driverStore" | "pluginCenter" | "welcome">("welcome");
 const showDriverStore = computed(() => driverStoreTabOpen.value && driverStoreActive.value);
+const showPluginCenter = computed(() => pluginCenterTabOpen.value && pluginCenterActive.value);
 const showSettingsPage = computed(() => Boolean(settingsPageTabOpen.value && settingsStore.settingsPageActive));
 const showQuickOpen = ref(false);
 const showTabSwitcher = ref(false);
@@ -409,6 +417,12 @@ const blockingAiRunCount = computed(() => (isDesktop ? blockingDesktopAiRunsForQ
 let aiRunsQuitConfirmed = false;
 
 const activeTab = computed(() => queryStore.tabs.find((t) => t.id === queryStore.activeTabId));
+// Plugin workbench tabs stay mounted once opened (hidden via v-show): an
+// iframe moved out of the DOM reloads from scratch, so KeepAlive/ContentArea
+// remounts flash the whole webview and drop its live session state.
+const mountedPluginWorkbenchTabs = computed(() => queryStore.tabs.filter((tab) => tab.mode === "plugin-workbench" && tab.pluginWorkbench));
+type PluginWorkbenchTabHandle = { refresh: () => Promise<unknown> };
+const pluginWorkbenchTabRefs = new Map<string, PluginWorkbenchTabHandle>();
 const tabNavigationHistory = ref(createTabNavigationHistory());
 let pendingTabHistoryNavigationId: string | null = null;
 let detachedEventUnlisteners: Array<() => void> = [];
@@ -769,18 +783,23 @@ const executableSql = computed(() => {
     : "";
 });
 
-async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot) {
-  const tab = activeTab.value;
-  return tab
-    ? await resolveExecutableSqlWithBackend(snapshot?.fullSql ?? tab.sql, snapshot?.selectedSql ?? selectedSql.value, {
-        mode: settingsStore.editorSettings.executeMode,
-        cursorPos: snapshot?.cursorPos ?? cursorPos.value,
-        databaseType: activeConnection.value?.db_type,
-      })
-    : "";
+async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot, executionTab?: QueryTab) {
+  const tab = executionTab ?? activeTab.value;
+  if (!tab) return "";
+  const connection = connectionStore.getConfig(tab.connectionId) ?? activeConnection.value;
+  const selection = tab.editorSelection;
+  const fallbackSelectedSql = tab.id === activeTab.value?.id ? selectedSql.value : selection && selection.anchor !== selection.head ? tab.sql.slice(Math.min(selection.anchor, selection.head), Math.max(selection.anchor, selection.head)) : "";
+  return await resolveExecutableSqlWithBackend(snapshot?.fullSql ?? tab.sql, snapshot?.selectedSql ?? fallbackSelectedSql, {
+    mode: settingsStore.editorSettings.executeMode,
+    cursorPos: snapshot?.cursorPos ?? (tab.id === activeTab.value?.id ? cursorPos.value : (selection?.head ?? 0)),
+    databaseType: connection?.db_type,
+  });
 }
 
-const blockDangerousRedisCommands = ref(true);
+const blockDangerousRedisCommands = computed({
+  get: () => settingsStore.editorSettings.blockDangerousRedisCommands,
+  set: (value: boolean) => settingsStore.updateEditorSettings({ blockDangerousRedisCommands: value }),
+});
 const databaseRequiredSignal = ref(0);
 const databaseRequiredTabId = ref<string | null>(null);
 const pendingToolbarExecutionSnapshot = ref<SqlExecutionSnapshot & { tabId?: string }>();
@@ -828,22 +847,21 @@ const {
   onExecutionCancelled: (editorViewportRequestId) => contentAreaRef.value?.cancelQueryEditorExecutionViewport(editorViewportRequestId),
 });
 
-function captureActiveEditorExecutionSnapshot() {
-  const snapshot = contentAreaRef.value?.captureQueryEditorExecutionSnapshot?.();
-  pendingToolbarExecutionSnapshot.value = snapshot ? { ...snapshot, tabId: activeTab.value?.id } : undefined;
+function captureActiveEditorExecutionSnapshot(tabId: string) {
+  const snapshot = contentAreaRef.value?.captureQueryEditorExecutionSnapshot?.(tabId);
+  pendingToolbarExecutionSnapshot.value = snapshot ? { ...snapshot, tabId } : undefined;
 }
 
-function requestActiveEditorExecute(source?: "pointer" | "keyboard") {
+function requestActiveEditorExecute(source?: "pointer" | "keyboard", tabId?: string) {
   const snapshot = pendingToolbarExecutionSnapshot.value;
   pendingToolbarExecutionSnapshot.value = undefined;
-  if (source === "pointer") {
-    if (snapshot) {
-      void tryExecute(snapshot, { tabId: snapshot.tabId ?? activeTab.value?.id });
-      return;
-    }
+  const targetTabId = tabId ?? (source === "pointer" ? snapshot?.tabId : undefined);
+  if (source === "pointer" && snapshot && snapshot.tabId === targetTabId) {
+    void tryExecute(snapshot, { tabId: targetTabId });
+    return;
   }
-  if (contentAreaRef.value?.requestQueryEditorExecute?.()) return;
-  void tryExecute();
+  if (contentAreaRef.value?.requestQueryEditorExecute?.(targetTabId)) return;
+  void tryExecute(undefined, targetTabId ? { tabId: targetTabId } : undefined);
 }
 
 function requestActiveEditorExecuteInNewResultTab() {
@@ -859,11 +877,13 @@ function requestActiveEditorExecuteInNewResultTab() {
 const specialPageTabs = computed(() => ({
   settingsOpen: settingsPageTabOpen.value,
   settingsActive: settingsStore.settingsPageActive,
+  pluginCenterOpen: pluginCenterTabOpen.value,
+  pluginCenterActive: pluginCenterActive.value,
   driverStoreOpen: driverStoreTabOpen.value,
   driverStoreActive: driverStoreActive.value,
   driverUpdateCount: toolbarAgentDriverUpdateCount.value,
 }));
-provide(GROUP_TAB_BAR_PORTAL, createGroupTabBarPortal(computed(() => !isDetachedWindowContext && (driverStoreActive.value || settingsStore.settingsPageActive))));
+provide(GROUP_TAB_BAR_PORTAL, createGroupTabBarPortal(computed(() => !isDetachedWindowContext && (driverStoreActive.value || pluginCenterActive.value || settingsStore.settingsPageActive))));
 provide(EDITOR_TOOLBAR_ACTIONS, {
   explainMode,
   blockDangerousRedisCommands,
@@ -890,6 +910,8 @@ provide(EDITOR_TOOLBAR_ACTIONS, {
   specialPageTabs,
   activateSettingsPage,
   closeSettingsPage,
+  activatePluginCenter: () => openPluginCenterPage(pluginCenterFocus.value),
+  closePluginCenter: closePluginCenterPage,
   activateDriverStore: () => openDriverStorePage(),
   closeDriverStore: closeDriverStorePage,
 });
@@ -975,6 +997,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openSqlFilePath,
   openDbFilePath,
   openConnectionDeepLink,
+  closeActiveSurface,
   openAiConfigDeepLink,
 });
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, cancelCloseActionPrompt, performCloseAction, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt({ requestClose: requestAppClose });
@@ -1005,16 +1028,17 @@ function openSettings(initialTab = "appearance", initialSection?: string) {
   settingsInitialSection.value = initialSection;
   settingsNavigationRequestId.value += 1;
   if (!settingsStore.settingsPageActive) {
-    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : activeTab.value ? "query" : "welcome";
+    settingsReturnSurface.value = showDriverStore.value ? "driverStore" : showPluginCenter.value ? "pluginCenter" : activeTab.value ? "query" : "welcome";
   }
   activateSettingsPage();
 }
 
-type MainContentSurface = "query" | "settings" | "driverStore";
+type MainContentSurface = "query" | "settings" | "driverStore" | "pluginCenter";
 
 function activateMainContentSurface(surface: MainContentSurface) {
   settingsStore.settingsPageActive = surface === "settings";
   driverStoreActive.value = surface === "driverStore";
+  pluginCenterActive.value = surface === "pluginCenter";
 }
 
 watch(
@@ -1042,6 +1066,10 @@ function activateOpenSpecialPageFallback() {
   }
   if (driverStoreTabOpen.value) {
     activateMainContentSurface("driverStore");
+    return;
+  }
+  if (pluginCenterTabOpen.value) {
+    activateMainContentSurface("pluginCenter");
   }
 }
 
@@ -1051,12 +1079,24 @@ function closeSettingsPage() {
     activateMainContentSurface("driverStore");
     return;
   }
+  if (settingsReturnSurface.value === "pluginCenter" && pluginCenterTabOpen.value) {
+    activateMainContentSurface("pluginCenter");
+    return;
+  }
+  if (driverStoreTabOpen.value) {
+    activateMainContentSurface("driverStore");
+    return;
+  }
+  if (pluginCenterTabOpen.value) {
+    activateMainContentSurface("pluginCenter");
+    return;
+  }
   activateMainContentSurface("query");
 }
 
 const driverStoreFocus = ref<DriverStoreFocus | null>(null);
 
-function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" | DriverStoreFocus | null) {
+function openDriverStorePage(target?: DriverStoreTab | DriverStoreFocus | null) {
   if (typeof target === "string") {
     driverStoreActiveTab.value = target;
     driverStoreFocus.value = null;
@@ -1068,13 +1108,47 @@ function openDriverStorePage(target?: "agent" | "jdbc" | "storage" | "runtime" |
   }
   driverStoreTabOpen.value = true;
   activateMainContentSurface("driverStore");
+  pluginCenterActive.value = false;
 }
 
 function closeDriverStorePage() {
   driverStoreTabOpen.value = false;
-  activateMainContentSurface("query");
+  // Keep another open special page visible when closing the active one. The
+  // previous implementation always switched to the query surface, which
+  // cleared pluginCenterActive and made an already-open Plugin Center tab
+  // disappear together with Driver Manager.
+  if (pluginCenterTabOpen.value) {
+    activateMainContentSurface("pluginCenter");
+  } else if (settingsPageTabOpen.value) {
+    activateMainContentSurface("settings");
+  } else {
+    activateMainContentSurface("query");
+  }
   driverStoreActiveTab.value = "agent";
   driverStoreFocus.value = null;
+}
+
+function openPluginCenterPage(focus?: PluginCenterFocus | null) {
+  pluginCenterFocus.value = focus ?? null;
+  pluginCenterTabOpen.value = true;
+  activateMainContentSurface("pluginCenter");
+}
+
+function closePluginCenterPage() {
+  pluginCenterTabOpen.value = false;
+  pluginCenterFocus.value = null;
+  if (driverStoreTabOpen.value) {
+    activateMainContentSurface("driverStore");
+  } else if (settingsPageTabOpen.value) {
+    activateMainContentSurface("settings");
+  } else {
+    activateMainContentSurface("query");
+  }
+}
+
+function openPluginConnectionDialog(pluginId: string, providerId: string) {
+  connectionPluginProvider.value = { pluginId, providerId };
+  showConnectionDialog.value = true;
 }
 const toolbarAgentDriverUpdateCount = computed(() => (updateNotificationsEnabled.value ? agentDriverUpdateCount.value : 0));
 const toolbarHasUpdateAvailable = computed(() => updateNotificationsEnabled.value && hasUpdateAvailable.value);
@@ -1263,6 +1337,7 @@ watch(
     if (id) newQueryContextSource.value = "tab";
     if (id) activateQuerySurface();
     else if (previousId) activateOpenSpecialPageFallback();
+    if (id && pluginCenterActive.value) pluginCenterActive.value = false;
     const tab = id ? queryStore.tabs.find((candidate) => candidate.id === id) : undefined;
     const selection = tab?.editorSelection;
     selectedSql.value = tab && selection && selection.anchor !== selection.head ? tab.sql.slice(Math.min(selection.anchor, selection.head), Math.max(selection.anchor, selection.head)) : "";
@@ -2242,6 +2317,7 @@ async function openConnectionDeepLink(url: string) {
     if (!draft) return;
     connectionStore.stopEditing();
     connectionStore.stopCreatingConnectionInGroup();
+    connectionPluginProvider.value = null;
     connectionDialogPrefill.value = draft;
     showConnectionDialog.value = true;
   } catch (e: any) {
@@ -2299,12 +2375,14 @@ function setConnectionDialogOpen(value: boolean) {
   showConnectionDialog.value = value;
   if (!value) {
     connectionDialogPrefill.value = null;
+    connectionPluginProvider.value = null;
     connectionDialogInitialTab.value = undefined;
   }
 }
 
 function openConnectionSettings(connectionId: string, initialTab: ConfigTab = "connection") {
   if (!connectionStore.getConfig(connectionId)) return;
+  connectionPluginProvider.value = null;
   connectionDialogInitialTab.value = initialTab;
   connectionStore.startEditing(connectionId);
   showConnectionDialog.value = true;
@@ -2331,6 +2409,8 @@ async function newQuery() {
       } else if (connectionTarget.kind === "nacos-admin") {
         await connectionStore.loadNacosNamespaces(target.connectionId);
         queryStore.openNacosAdmin(target.connectionId);
+      } else if (connectionTarget.kind === "plugin-workbench") {
+        await queryStore.openPluginConnection(target.connectionId);
       } else {
         queryStore.createTab(target.connectionId, "", `${conn.name}:keys`, connectionTarget.kind);
       }
@@ -2397,6 +2477,19 @@ async function openConnectionQuery(connectionId: string) {
     try {
       await connectionStore.ensureConnected(connectionId);
       await connectionStore.loadNacosNamespaces(connectionId);
+    } catch (e: any) {
+      toast(
+        t("connection.connectFailed", {
+          message: translateBackendError(t, e),
+        }),
+        5000,
+      );
+    }
+    return;
+  }
+  if (initialTarget.kind === "plugin-workbench") {
+    try {
+      await queryStore.openPluginConnection(connectionId);
     } catch (e: any) {
       toast(
         t("connection.connectFailed", {
@@ -2538,7 +2631,7 @@ function onEditTableStructure(table: SqlObjectNavigationTarget) {
   queryStore.openTableStructure(target.connectionId, target.database, target.schema, target.tableName, undefined, undefined, target.catalog);
 }
 
-async function onOpenObjectSource(table: SqlObjectNavigationTarget, initialEditing: boolean) {
+function onOpenObjectSource(table: SqlObjectNavigationTarget, initialEditing: boolean) {
   const provisionalTarget = tableTargetFromActiveTab(table);
   if (!provisionalTarget) return;
   const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(provisionalTarget.connectionId));
@@ -2550,42 +2643,22 @@ async function onOpenObjectSource(table: SqlObjectNavigationTarget, initialEditi
   const sourceName = sqlObjectNavigationSourceName(navigation);
   const sourceSchema = sqlObjectNavigationSourceSchema(navigation, target.schema || target.database);
   try {
-    await connectionStore.ensureConnected(target.connectionId);
-    connectionStore.activeConnectionId = target.connectionId;
-    // Align Ctrl/Cmd+click with sidebar "view source" (dialog vs data tab).
+    // Keep the editor navigation path aligned with the sidebar: create a visible
+    // pending tab first, then let the store own connection/source loading.
     if (settingsStore.editorSettings.routineSourceOpenMode === "query-tab") {
-      try {
-        const resolvedDatabaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(target.connectionId));
-        if (!resolvedDatabaseType) throw new Error("Connection type is unavailable.");
-        // Wrap Oracle bare ALL_SOURCE (`procedure name is ...`) as CREATE OR REPLACE for the editor.
-        const {
-          raw,
-          editableSource,
-          objectType: resolvedType,
-        } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
-          connectionId: target.connectionId,
-          database: target.database,
-          schema: sourceSchema || target.database,
-          name: sourceName,
-          objectType,
-          databaseType: resolvedDatabaseType,
-          signature: navigation.signature,
-        });
-        const tabId = queryStore.createTab(target.connectionId, target.database, `Source - ${sourceName}`, "query", sourceSchema, editableSource, target.catalog, { forceNew: true, sourceView: true });
-        const sourceIsEditable = raw.editable !== false && !["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY"].includes(resolvedType);
-        if (sourceIsEditable) {
-          queryStore.setObjectSource(tabId, {
-            schema: sourceSchema || target.database,
-            name: sourceName,
-            objectType: resolvedType,
-            signature: navigation.signature,
-          });
-        }
-      } catch (e: any) {
-        toast(e?.message || String(e), 5000);
-      }
+      queryStore.openObjectSourceTabPending({
+        connectionId: target.connectionId,
+        database: target.database,
+        title: `Source - ${sourceName}`,
+        schema: sourceSchema || target.database,
+        catalog: target.catalog,
+        request: { name: sourceName, objectType, signature: navigation.signature },
+      });
       return;
     }
+
+    // The dialog owns ensureConnected so its existing loading/error/retry UI is
+    // mounted before a slow connection health check or Oracle metadata query.
     queryEditorObjectSourceTarget.value = {
       connectionId: target.connectionId,
       database: target.database,
@@ -2978,6 +3051,7 @@ function activateQueryTab(tabId: string): boolean {
   dispatchBeforeTabSwitch(tabId);
   if (!queryStore.activateTab(tabId)) return false;
   activateQuerySurface();
+  pluginCenterActive.value = false;
   return true;
 }
 
@@ -3072,6 +3146,35 @@ function handleNativeSelectAll(e: KeyboardEvent) {
   if (shouldBlockAppNativeSelectAll(e)) e.preventDefault();
 }
 
+function setPluginWorkbenchTabRef(tabId: string, element: unknown) {
+  if (element && typeof element === "object" && "refresh" in element && typeof element.refresh === "function") {
+    pluginWorkbenchTabRefs.set(tabId, element as PluginWorkbenchTabHandle);
+  } else {
+    pluginWorkbenchTabRefs.delete(tabId);
+  }
+}
+
+function refreshActivePluginWorkbench(): boolean {
+  const tab = activeTab.value;
+  if (tab?.mode !== "plugin-workbench") return false;
+  const pluginWorkbench = pluginWorkbenchTabRefs.get(tab.id);
+  if (!pluginWorkbench) return false;
+  void pluginWorkbench.refresh();
+  return true;
+}
+
+async function closeActiveSurface() {
+  if (showSettingsPage.value) {
+    closeSettingsPage();
+  } else if (showPluginCenter.value) {
+    closePluginCenterPage();
+  } else if (showDriverStore.value) {
+    closeDriverStorePage();
+  } else if (queryStore.activeTabId) {
+    if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
+    queryStore.closeTab(queryStore.activeTabId);
+  }
+}
 async function handleKeydown(e: KeyboardEvent) {
   if (e.defaultPrevented) return;
 
@@ -3187,14 +3290,7 @@ async function handleKeydown(e: KeyboardEvent) {
   }
   if (isCloseTabShortcut(e, shortcuts)) {
     e.preventDefault();
-    if (showSettingsPage.value) {
-      closeSettingsPage();
-    } else if (showDriverStore.value) {
-      closeDriverStorePage();
-    } else if (queryStore.activeTabId) {
-      if (await queryStore.clearQueryResults(queryStore.activeTabId)) return;
-      queryStore.closeTab(queryStore.activeTabId);
-    }
+    await closeActiveSurface();
     return;
   }
   if (isSaveShortcut(e, shortcuts) && e.target instanceof Element && isObjectSourceSaveShortcutTarget(e.target)) {
@@ -3224,6 +3320,11 @@ async function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     if (selectedSql.value.trim()) sendSelectionToAi(selectedSql.value);
+    return;
+  }
+  if (isModRShortcut(e) && refreshActivePluginWorkbench()) {
+    e.preventDefault();
+    e.stopPropagation();
     return;
   }
   if (isModRShortcut(e) && e.target instanceof Element && contentAreaRef.value?.handleModRTarget(e.target)) {
@@ -3292,6 +3393,11 @@ async function initApp() {
         onOptionalStateError: (error) => console.error("[STARTUP] settingsStore.initAiConfigs failed", error),
       });
     }
+    // Restored plugin tabs need the sidecar connection registry repopulated
+    // (see reconnectRestoredPluginTabs); kick it off before the heavier
+    // optional init so it races ahead of each plugin webview's first
+    // session/open. Fire-and-forget: it must never block startup.
+    void queryStore.reconnectRestoredPluginTabs();
     await settingsStore.initDesktopSettings().catch(() => {});
     if (isDesktop) {
       updateWindowReady = true;
@@ -3522,6 +3628,7 @@ onUnmounted(() => {
           :sql-library-save-feedback-id="sqlLibrarySaveFeedbackId"
           :show-sql-file-panel="showSqlFilePanel"
           :show-driver-store="showDriverStore"
+          :show-plugin-center="showPluginCenter"
           :show-settings-page="showSettingsPage"
           :checking-updates="checkingUpdates"
           :has-update-available="toolbarHasUpdateAvailable"
@@ -3545,6 +3652,7 @@ onUnmounted(() => {
           @open-github="openGitHub"
           @open-settings="openSettings(toolbarMcpUpdateAvailable ? 'mcp' : 'appearance')"
           @open-driver-store="openDriverStorePage"
+          @open-plugin-center="openPluginCenterPage()"
           @check-updates="checkUpdates()"
           @open-transfer="dialogs.showTransferDialog.value = true"
           @open-sql-file="dialogs.showSqlFileDialog.value = true"
@@ -3574,6 +3682,8 @@ onUnmounted(() => {
                 ref="appTabBarRef"
                 :driver-store-open="driverStoreTabOpen"
                 :driver-store-active="driverStoreActive"
+                :plugin-center-open="pluginCenterTabOpen"
+                :plugin-center-active="pluginCenterActive"
                 :settings-page-open="settingsPageTabOpen"
                 :settings-page-active="settingsStore.settingsPageActive"
                 :agent-driver-update-count="toolbarAgentDriverUpdateCount"
@@ -3582,9 +3692,11 @@ onUnmounted(() => {
                 :tab-bar-width="tabBarWidth"
                 :tab-bar-collapsed="tabBarCollapsed"
                 @activate-driver-store="openDriverStorePage"
+                @activate-plugin-center="openPluginCenterPage(pluginCenterFocus)"
                 @activate-settings-page="activateSettingsPage"
                 @activate-tab="activateQueryTab"
                 @close-driver-store="closeDriverStorePage"
+                @close-plugin-center="closePluginCenterPage"
                 @close-settings-page="closeSettingsPage"
                 @save-tab="handleSaveTab"
                 @discard-tab-close="handleDiscardPendingTabClose"
@@ -3594,6 +3706,7 @@ onUnmounted(() => {
                 @detach-tab="detachTab"
               >
                 <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
+                <PluginCenterPage v-if="pluginCenterTabOpen" v-show="pluginCenterActive" class="flex-1 min-h-0" :focus-target="pluginCenterFocus" @new-connection="openPluginConnectionDialog" />
                 <EditorSettingsPage
                   v-if="settingsPageTabOpen"
                   v-show="settingsStore.settingsPageActive"
@@ -3635,16 +3748,22 @@ onUnmounted(() => {
                   </DialogFooter>
                 </DialogContent>
               </Dialog>
-              <div v-show="!driverStoreActive && !settingsStore.settingsPageActive" class="flex min-h-0 min-w-0 flex-1 flex-col">
-                <div class="flex flex-col flex-1 min-h-0">
+              <div v-show="!driverStoreActive && !pluginCenterActive && !settingsStore.settingsPageActive" class="flex min-h-0 min-w-0 flex-1 flex-col">
+                <div class="flex flex-col min-h-0" :class="activeTab?.mode === 'plugin-workbench' ? 'flex-none' : 'flex-1'">
                   <SqlEditorWorkspace
                     ref="contentAreaRef"
+                    :content-suppressed="activeTab?.mode === 'plugin-workbench'"
                     @locate-tab="locateTabInSidebar"
+                    @close-tab="
+                      (tabId: string) => {
+                        if (tabId === queryStore.activeTabId) void closeActiveSurface();
+                      }
+                    "
                     @toggle-zen-mode="toggleZenMode"
                     @start-resize="startTabBarResize"
                     @toggle-collapse="toggleTabBarCollapsed"
                     :active-tab="activeTab ?? undefined"
-                    :show-tab-navigation="queryStore.tabs.length > 0 || settingsPageTabOpen || driverStoreTabOpen"
+                    :show-tab-navigation="queryStore.tabs.length > 0 || settingsPageTabOpen || driverStoreTabOpen || pluginCenterTabOpen"
                     :active-connection="activeConnection"
                     :tab-bar-width="tabBarWidth"
                     :tab-bar-collapsed="tabBarCollapsed"
@@ -3774,6 +3893,21 @@ onUnmounted(() => {
                     </template>
                   </SqlEditorWorkspace>
                 </div>
+                <!-- Always-mounted plugin workbench layer: switching tabs only
+                       toggles visibility, so plugin webviews (SSH terminals) are
+                       never destroyed and reloaded. SqlEditorWorkspace no longer
+                       renders plugin tabs — this layer owns them. It in turn
+                       yields the layout (display:none) while a plugin tab is
+                       active, or both flex-1 siblings would split the column. -->
+                <div v-for="workbenchTab in mountedPluginWorkbenchTabs" :key="workbenchTab.id" v-show="activeTab && workbenchTab.id === activeTab.id" class="flex min-h-0 flex-1 flex-col">
+                  <PluginWorkbenchTab
+                    :ref="(element) => setPluginWorkbenchTabRef(workbenchTab.id, element)"
+                    :plugin-id="workbenchTab.pluginWorkbench!.pluginId"
+                    :contribution-id="workbenchTab.pluginWorkbench!.contributionId"
+                    :context="workbenchTab.pluginWorkbench!.context"
+                    @close-tab="queryStore.closeTab(workbenchTab.id)"
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -3781,7 +3915,7 @@ onUnmounted(() => {
           <div
             v-if="!isDetachedWindowContext && showAiPanel"
             v-show="!isZenMode"
-            :class="[isClassicLayout ? 'h-full relative z-30 isolate bg-background' : 'h-full relative z-30 isolate rounded-md border border-border/80 bg-background', isAiPanelMaximized ? 'min-w-0 flex-1' : 'min-w-[180px] max-w-full']"
+            :class="[isClassicLayout ? 'h-full relative z-30 isolate bg-background' : 'h-full relative z-30 isolate rounded-md border border-border/80 bg-background', isAiPanelMaximized ? 'min-w-0 flex-1' : 'min-w-[240px] max-w-full']"
             :style="isAiPanelMaximized ? {} : { width: aiPanelWidth + 'px' }"
           >
             <div v-if="!isAiPanelMaximized" class="panel-resize-handle panel-resize-handle--left" @mousedown="startAiPanelResize" />
@@ -3845,6 +3979,7 @@ onUnmounted(() => {
         <AppDialogs
           :show-connection-dialog="showConnectionDialog"
           :connection-prefill="connectionDialogPrefill"
+          :connection-plugin-provider="connectionPluginProvider"
           :connection-initial-tab="connectionDialogInitialTab"
           :show-danger-dialog="showDangerDialog"
           :danger-sql="dangerSql"

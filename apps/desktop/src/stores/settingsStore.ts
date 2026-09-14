@@ -754,6 +754,8 @@ export interface EditorSettings {
   executeMode: "all" | "current";
   executeModeDefaultVersion: number;
   executeAllOnBlankLine: boolean;
+  /** Whether DBX blocks Redis commands classified as high risk. */
+  blockDangerousRedisCommands: boolean;
   globalConnectTimeoutSecs: number;
   connectTimeoutInheritConnectionIds: string[];
   globalQueryTimeoutSecs: number;
@@ -900,6 +902,7 @@ export interface EditorSettings {
 export interface ToolbarItems {
   dataTransfer: boolean;
   driverManager: boolean;
+  pluginCenter: boolean;
   sqlFile: boolean;
   schemaDiff: boolean;
   dataCompare: boolean;
@@ -916,6 +919,7 @@ export interface ToolbarItems {
 export const DEFAULT_TOOLBAR_ITEMS: ToolbarItems = {
   dataTransfer: true,
   driverManager: true,
+  pluginCenter: true,
   sqlFile: true,
   schemaDiff: true,
   dataCompare: true,
@@ -993,6 +997,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   executeMode: "current",
   executeModeDefaultVersion: EXECUTE_MODE_CURRENT_DEFAULT_VERSION,
   executeAllOnBlankLine: false,
+  blockDangerousRedisCommands: true,
   globalConnectTimeoutSecs: 10,
   connectTimeoutInheritConnectionIds: [],
   globalQueryTimeoutSecs: DEFAULT_QUERY_TIMEOUT_SECS,
@@ -1369,6 +1374,7 @@ function normalizeToolbarItems(items: Partial<ToolbarItems> | undefined): Toolba
   return {
     dataTransfer: items.dataTransfer ?? defaults.dataTransfer,
     driverManager: items.driverManager ?? defaults.driverManager,
+    pluginCenter: items.pluginCenter ?? defaults.pluginCenter,
     sqlFile: items.sqlFile ?? defaults.sqlFile,
     schemaDiff: items.schemaDiff ?? defaults.schemaDiff,
     dataCompare: items.dataCompare ?? defaults.dataCompare,
@@ -1447,6 +1453,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     executeMode: hasCurrentExecuteModeDefault && (settings.executeMode === "all" || settings.executeMode === "current") ? settings.executeMode : DEFAULT_EDITOR_SETTINGS.executeMode,
     executeModeDefaultVersion,
     executeAllOnBlankLine: settings.executeAllOnBlankLine === true,
+    blockDangerousRedisCommands: typeof settings.blockDangerousRedisCommands === "boolean" ? settings.blockDangerousRedisCommands : DEFAULT_EDITOR_SETTINGS.blockDangerousRedisCommands,
     globalConnectTimeoutSecs: normalizeGlobalConnectTimeoutSecs(settings.globalConnectTimeoutSecs),
     connectTimeoutInheritConnectionIds: Array.isArray(settings.connectTimeoutInheritConnectionIds) ? [...new Set(settings.connectTimeoutInheritConnectionIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))] : [],
     globalQueryTimeoutSecs: normalizeGlobalQueryTimeoutSecs(settings.globalQueryTimeoutSecs ?? legacyTimeoutSettings.queryTimeoutSecs),
@@ -2197,6 +2204,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     if (partial.executeMode !== undefined) editorSettings.value.executeMode = partial.executeMode;
     if (partial.executeAllOnBlankLine !== undefined) editorSettings.value.executeAllOnBlankLine = partial.executeAllOnBlankLine === true;
+    if (partial.blockDangerousRedisCommands !== undefined) editorSettings.value.blockDangerousRedisCommands = partial.blockDangerousRedisCommands === true;
     if (partial.globalConnectTimeoutSecs !== undefined) editorSettings.value.globalConnectTimeoutSecs = normalizeGlobalConnectTimeoutSecs(partial.globalConnectTimeoutSecs);
     if (partial.connectTimeoutInheritConnectionIds !== undefined) {
       editorSettings.value.connectTimeoutInheritConnectionIds = [...new Set(partial.connectTimeoutInheritConnectionIds.filter((id): id is string => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))];

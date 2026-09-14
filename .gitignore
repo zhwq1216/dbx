@@ -1,4 +1,5 @@
 # Dependencies
+openGauss-server/
 node_modules
 .claude/
 .codex/
@@ -32,6 +33,7 @@ plugins/jdbc/build/
 plugins/jdbc/bin/main/
 plugins/jdbc/bin/test/
 plugins/jdbc/dist/
+packages/plugin-cli/sdk-root/
 docs/.next/
 docs/out/
 docs/.source/
@@ -65,9 +67,13 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+.dbx-plugin-signing-key.env
 
 # Temp
 tmp/
+
+# Local issue screenshots (never commit)
+issue-assets/
 
 # AI background-run dev artifacts (never commit)
 .dlp-quarantine/
@@ -81,6 +87,7 @@ review_classified.json
 
 # Logs
 *.log
+/.dbx-dev/
 
 
 # Generated changelog data

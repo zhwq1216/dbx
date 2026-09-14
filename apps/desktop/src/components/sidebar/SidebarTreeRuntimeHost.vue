@@ -28,6 +28,7 @@ import {
   Plug,
   Unplug,
   Pin,
+  PlugZap,
   ArrowRightLeft,
   Download,
   Eye,
@@ -70,6 +71,8 @@ import { useSettingsStore } from "@/stores/settingsStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useToast } from "@/composables/useToast";
+import { createFrontendPluginRegistry } from "@/lib/plugins/frontendPlugin";
+import type { InstalledPlugin } from "@/types/database";
 import { useDatabaseOptions } from "@/composables/useDatabaseOptions";
 import type { ColumnInfo, ConnectionConfig, DatabaseType, TreeNode, TreeNodeType } from "@/types/database";
 import * as api from "@/lib/backend/api";
@@ -153,13 +156,12 @@ import {
   type TableChildObjectType,
 } from "@/lib/database/dbAdminSql";
 import { buildRenameObjectSql, buildRenameDatabaseSql, buildRenameDatabasePreflightSql, databaseRenameMaintenanceDatabase, supportsDatabaseRename, supportsObjectRename, type RenameableObjectType } from "@/lib/table/objectRenameSql";
-import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
-import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
+import { buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { buildViewDdl } from "@/lib/table/viewDdl";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
 import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
-import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionTableSqlSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import {
   defaultPasteTableMode,
@@ -339,7 +341,7 @@ import {
   type DuplicateStructureSource,
 } from "./sidebarTreeDialogState";
 
-const { t } = useI18n();
+const { t, locale: appLocale } = useI18n();
 
 const connectionStore = useConnectionStore();
 
@@ -350,6 +352,15 @@ const settingsStore = useSettingsStore();
 const savedSqlStore = useSavedSqlStore();
 
 const { toast } = useToast();
+const installedPlugins = ref<InstalledPlugin[]>([]);
+const sidebarPluginRegistry = computed(() => createFrontendPluginRegistry(installedPlugins.value, appLocale.value));
+
+void api.listPlugins().then(
+  (plugins) => {
+    installedPlugins.value = plugins.filter((plugin) => plugin.compatibility.compatible);
+  },
+  () => {},
+);
 
 const { highlight } = useSqlHighlighter();
 
@@ -891,7 +902,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       return;
     }
 
-    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(currentDatabaseType())) {
+    const packageDatabaseType = currentDatabaseType();
+    if (node.type === "package" && node.connectionId && supportsPackageMemberExpansion(packageDatabaseType, packageDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(node.connectionId, node.database) : undefined)) {
       await connectionStore.loadPackageMembers(node);
       emitNodeToggled(node, wasExpanded);
       return;
@@ -924,6 +936,9 @@ async function toggle(requestId = beginNavigationRequest()) {
         await connectionStore.loadNacosNamespaces(node.connectionId, treeLoadSearchOptions);
       } else if (config?.db_type === "mqtt") {
         await connectionStore.loadMqttTopics(node.connectionId);
+      } else if (config?.db_type === "plugin") {
+        await queryStore.openPluginConnection(node.connectionId);
+        return;
       } else {
         await connectionStore.loadDatabases(node.connectionId, treeLoadSearchOptions);
       }
@@ -1008,6 +1023,8 @@ async function toggle(requestId = beginNavigationRequest()) {
       await connectionStore.loadDorisCatalogDatabases(node, treeLoadSearchOptions);
     } else if (node.type === "schema" && node.connectionId && hasTreeNodeDatabaseContext(node) && schemaNodeHasLoadableName(effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)), node.schema)) {
       await connectionStore.loadTables(node.connectionId, node.database, node.schema, treeLoadSearchOptions);
+    } else if (node.type === "oracle-db-links") {
+      await connectionStore.loadTreeNodeChildren(node, treeLoadSearchOptions);
     } else if (node.type === "linked-server-root" && node.connectionId) {
       await connectionStore.loadSqlServerLinkedServers(node.connectionId, treeLoadSearchOptions);
     } else if (node.type === "linked-server" && node.connectionId) {
@@ -1626,13 +1643,16 @@ async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean
     const eventCreateRequestId = openEventEditor === "create" && node.type === "group-events" ? ++mysqlEventCreateRequestSeq : undefined;
     const objectFilter = node.type === "event" || node.type === "group-events" ? "events" : undefined;
 
+    const connection = connectionStore.getConfig(node.connectionId);
+    if (!connection) return;
+    if (connection.db_type === "plugin") {
+      await queryStore.openPluginConnection(node.connectionId);
+      return;
+    }
     if (hasTreeNodeDatabaseContext(node)) {
       queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
       return;
     }
-
-    const connection = connectionStore.getConfig(node.connectionId);
-    if (!connection) return;
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
@@ -2505,63 +2525,22 @@ function openObjectSourceDialog(initialEditing: boolean, viewPackageBody = false
   const database = node.database;
   const sourceTarget = objectSourceTargetForTreeNode(sourceNode);
   if (!sourceTarget) return;
-  const openMode = settingsStore.editorSettings.routineSourceOpenMode;
-  if (openMode === "query-tab") {
-    void connectionStore
-      .ensureConnected(connectionId)
-      .then(async () => {
-        connectionStore.activeConnectionId = connectionId;
-        const schema = sourceTarget.schema || database;
-        const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
-        if (!databaseType) throw new Error("Connection type is unavailable.");
-        const objectName = sourceTarget.name;
-        const {
-          raw,
-          editableSource,
-          objectType: resolvedType,
-        } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
-          connectionId,
-          database,
-          schema,
-          name: objectName,
-          objectType: sourceTarget.objectType as any,
-          databaseType,
-          signature: sourceNode.signature,
-        });
-        const sourceIsEditable = raw.editable !== false && !["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY", "JOB"].includes(resolvedType);
-        if (sourceIsEditable) {
-          queryStore.openObjectSourceTab({
-            connectionId,
-            database,
-            title: `Source - ${node.label}`,
-            schema,
-            catalog: node.catalog,
-            sql: editableSource,
-            objectSource: {
-              schema,
-              name: objectName,
-              objectType: resolvedType,
-              signature: node.signature,
-            },
-          });
-        } else {
-          queryStore.createTab(connectionId, database, `Source - ${node.label}`, "query", schema, editableSource, node.catalog, { forceNew: true, sourceView: true });
-        }
-      })
-      .catch((e: any) => {
-        toast(e?.message || String(e), 5000);
-      });
+  const schema = sourceTarget.schema || database;
+  // issue #9035：两个分支都不再 await 连接与取源。先把容器挂出来（源码 tab /
+  // 源码弹窗），ensureConnected 与 getObjectSource 都发生在已挂载的 UI 之内，
+  // 加载中有状态、失败就地重试，而不是点击后一段时间毫无反应。
+  if (settingsStore.editorSettings.routineSourceOpenMode === "query-tab") {
+    queryStore.openObjectSourceTabPending({
+      connectionId,
+      database,
+      title: `Source - ${node.label}`,
+      schema,
+      catalog: node.catalog,
+      request: { name: sourceTarget.name, objectType: sourceTarget.objectType, signature: sourceNode.signature },
+    });
     return;
   }
-  void connectionStore
-    .ensureConnected(connectionId)
-    .then(() => {
-      connectionStore.activeConnectionId = connectionId;
-      emit("open-object-source", sourceNode, initialEditing);
-    })
-    .catch((e: any) => {
-      toast(e?.message || String(e), 5000);
-    });
+  emit("open-object-source", sourceNode, initialEditing);
 }
 
 function openProcedureExecution() {
@@ -2778,11 +2757,13 @@ function batchTruncateConfirmMessage(): string {
 
 async function dropSqlForTreeNode(node: TreeNode, options?: { cascade?: boolean }): Promise<string | null> {
   if (node.type === "table" && node.connectionId && node.database) {
+    const config = connectionStore.getConfig(node.connectionId);
     return buildDropTableSql({
       databaseType: databaseTypeForNode(node),
-      schema: node.schema,
+      schema: connectionTableSqlSchema(config, node.schema),
       tableName: node.label,
       cascade: options?.cascade && supportsDropTableCascade(databaseTypeForNode(node)),
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(node.connectionId),
     });
   }
   const objectOptions = dropObjectSqlOptionsForNode(node);
@@ -6451,7 +6432,38 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
   }
 
+  appendPluginConnectionMenuItems(items, node);
+
   return items;
+}
+
+/** Plugin-contributed native menu entries for saved connections. */
+function appendPluginConnectionMenuItems(items: ContextMenuItem[], node: TreeNode) {
+  if (node.type !== "connection") return;
+  const pluginItems = sidebarPluginRegistry.value.listContextMenuItems("connection");
+  if (pluginItems.length === 0) return;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  if (!config) return;
+  items.push({ label: "", separator: true });
+  for (const { plugin, contribution } of pluginItems) {
+    items.push({
+      label: contribution.label,
+      icon: PlugZap,
+      action: () => {
+        api
+          .invokePlugin(plugin.manifest.id, `contextMenu/${contribution.id}`, {
+            connection: { id: config.id, dbType: config.db_type, name: config.name, database: config.database || "" },
+          })
+          .then((result) => {
+            const message = (result as { message?: unknown } | null | undefined)?.message;
+            if (typeof message === "string" && message.trim()) toast(message, 4000);
+          })
+          .catch((error: unknown) => {
+            toast(String((error as Error)?.message || error), 5000);
+          });
+      },
+    });
+  }
 }
 
 function activateRuntimeNode(node: TreeNode) {
