@@ -305,6 +305,7 @@ import { createDataGridRuntimeScope } from "@/lib/dataGrid/dataGridRuntime";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
 import { useDataGridSort } from "@/composables/useDataGridSort";
 import { useDataGridSearch, type DataGridSearchMatch } from "@/composables/useDataGridSearch";
+import { findDataGridReplacementMatches, replaceDataGridText, type DataGridReplaceScope } from "@/lib/dataGrid/dataGridReplace";
 import { useDataGridResultLifecycle } from "@/composables/useDataGridResultLifecycle";
 import { useDataGridAutoRefresh } from "@/composables/useDataGridAutoRefresh";
 import { useDataGridAsyncSurface } from "@/composables/useDataGridAsyncSurface";
@@ -1012,11 +1013,21 @@ const transposeScrollLeft = ref(0);
 const transposeViewportWidth = ref(0);
 const { sortColumn: sortCol, sortColumnIndex: sortColIndex, sortDirection: sortDir, sortMode, setSort, clearSort } = useDataGridSort();
 const searchBarRef = ref<{ focus: (select?: boolean) => void } | null>(null);
+const replaceOpen = ref(false);
+const replacementText = ref("");
+const replaceScope = ref<DataGridReplaceScope>("loaded");
+const replaceCaseSensitive = ref(false);
+const replaceColumn = ref(-1);
 const dataGridSearch = useDataGridSearch({
   columns: () => props.result.columns,
   suggestionColumns: () => props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns,
   rows: () => displayItems.value,
   getCellSearchText: (row, columnIndex) => (row.data[columnIndex] === null ? "" : rowLowerTextCache.get(row.data, columnIndex)),
+  getCellRawSearchText: (row, columnIndex) => (typeof row.data[columnIndex] === "string" ? (row.data[columnIndex] as string) : replaceOpen.value ? "" : String(row.data[columnIndex] ?? "")),
+  caseSensitive: () => replaceOpen.value && replaceCaseSensitive.value,
+  literalQuery: replaceOpen,
+  includeColumnMatches: () => !replaceOpen.value,
+  isCellSearchable: (row, columnIndex) => !replaceOpen.value || (canReplaceGridCell(row, columnIndex) && replacementCellInScope(row.id, columnIndex)),
   onNavigate: () => nextTick(scrollToCurrentMatch),
   // Same key as useDataGridEditor below: table data tabs use the tab id, query
   // results use resultGridInstanceKey so a re-execute starts with a clean search.
@@ -1724,12 +1735,23 @@ function focusSearch(target: Element | null = null): boolean {
 }
 
 function closeSearch() {
+  replaceOpen.value = false;
   dataGridSearch.close();
 }
 
 const PAIRS: Record<string, string> = { "'": "'", '"': '"', "(": ")" };
 
 function onSearchKeydown(e: KeyboardEvent) {
+  if (replaceOpen.value) {
+    if (isCancelSearchShortcut(e)) {
+      e.preventDefault();
+      closeSearch();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      navigateMatch(e.shiftKey ? -1 : 1);
+    }
+    return;
+  }
   if (e.key in PAIRS && !e.ctrlKey && !e.metaKey) {
     const input = e.target as HTMLInputElement;
     const start = input.selectionStart ?? 0;
@@ -3704,6 +3726,7 @@ const {
   commitEditAndMaybeAutoSave,
   commitEditFromBlur,
   applyCellValue,
+  stageCellReplacements,
   restoreCellValue,
   cancelEdit,
   onEditKeydown,
@@ -4367,7 +4390,7 @@ const rollbackToolbarCapability = computed<DataGridToolbarActionCapability>(() =
 const sortedRows = computed(() => {
   let indices = localFilteredRows.value;
   const q = deferredClientSearchText.value;
-  if (q && dataGridSearchMode.value === "filter") {
+  if (q && dataGridSearchMode.value === "filter" && !replaceOpen.value) {
     // Preserve the legacy Ctrl+F behavior when the user chooses row filtering.
     const rows = props.result.rows;
     indices = indices.filter((sourceIndex) => {
@@ -4771,7 +4794,7 @@ const deleteRowDetails = computed(() => {
 });
 
 const hasVisibleRows = computed(() => displayRowCount.value > 0);
-const hasActiveFilter = computed(() => (dataGridSearchMode.value === "filter" && !!deferredClientSearchText.value) || rowStatusFilter.value !== "all" || hasLocalColumnFilters.value || hasServerColumnFilters.value);
+const hasActiveFilter = computed(() => (dataGridSearchMode.value === "filter" && !replaceOpen.value && !!deferredClientSearchText.value) || rowStatusFilter.value !== "all" || hasLocalColumnFilters.value || hasServerColumnFilters.value);
 const emptyTitle = computed(() => (hasActiveFilter.value ? t("grid.noFilteredRows") : t("grid.noRows")));
 const emptyDescription = computed(() => (hasActiveFilter.value ? t("grid.noFilteredRowsDescription") : t("grid.noRowsDescription")));
 watch(
@@ -5540,6 +5563,12 @@ function exportSelectedRowsMarkdown() {
   const rowIds = affectedRowIds();
   if (rowIds.length === 0) return;
   return exportMarkdown(rowIds);
+}
+
+function exportSelectedRowsHtml() {
+  const rowIds = affectedRowIds();
+  if (rowIds.length === 0) return;
+  return exportHtml(rowIds);
 }
 
 function exportSelectedRowsSql() {
@@ -7444,6 +7473,8 @@ const {
   exportCurrentPageJson,
   exportMarkdown,
   exportCurrentPageMarkdown,
+  exportHtml,
+  exportCurrentPageHtml,
   exportXlsx,
   exportXlsxWithSql,
   exportCurrentPageXlsx,
@@ -7632,6 +7663,10 @@ const exportMenuItems = computed(() => {
           value: "selected-markdown",
           label: t("grid.exportSelectedRowsMarkdown"),
         },
+        {
+          value: "selected-html",
+          label: t("grid.exportSelectedRowsHtml"),
+        },
         { value: "selected-sql", label: t("grid.exportSelectedRowsSql") },
         { value: "selected-txt", label: t("grid.exportSelectedRowsTxt") },
       ]
@@ -7644,6 +7679,7 @@ const exportMenuItems = computed(() => {
       ...(canIncludeSql ? [{ value: "xlsx-with-sql", label: t("grid.exportXlsxWithSql") }] : []),
       { value: "json", label: t("grid.exportJson") },
       { value: "markdown", label: t("grid.exportMarkdown") },
+      { value: "html", label: t("grid.exportHtml") },
       { value: "sql", label: t("grid.exportSql") },
       { value: "txt", label: t("grid.exportTxt") },
       ...allResultItems,
@@ -7664,6 +7700,7 @@ const exportMenuItems = computed(() => {
       : []),
     { value: "page-json", label: t("grid.exportCurrentPageJson") },
     { value: "page-markdown", label: t("grid.exportCurrentPageMarkdown") },
+    { value: "page-html", label: t("grid.exportCurrentPageHtml") },
     { value: "page-sql", label: t("grid.exportCurrentPageSql") },
     { value: "page-txt", label: t("grid.exportCurrentPageTxt") },
     {
@@ -7682,6 +7719,7 @@ const exportMenuItems = computed(() => {
       : []),
     { value: "json", label: t("grid.exportCurrentResultJson") },
     { value: "markdown", label: t("grid.exportCurrentResultMarkdown") },
+    { value: "html", label: t("grid.exportCurrentResultHtml") },
     { value: "sql", label: t("grid.exportCurrentResultSql") },
     { value: "txt", label: t("grid.exportCurrentResultTxt") },
     ...allResultItems,
@@ -7700,6 +7738,7 @@ function selectExportMenuItem(value: string) {
     "page-xlsx-with-sql": exportCurrentPageXlsxWithSql,
     "page-json": exportCurrentPageJson,
     "page-markdown": exportCurrentPageMarkdown,
+    "page-html": exportCurrentPageHtml,
     "page-sql": exportCurrentPageSql,
     "page-txt": exportCurrentPageTxt,
     csv: exportCsv,
@@ -7709,6 +7748,7 @@ function selectExportMenuItem(value: string) {
     "all-results-xlsx-with-sql": exportAllResultsXlsxWithSql,
     json: exportJson,
     markdown: exportMarkdown,
+    html: exportHtml,
     sql: exportSql,
     txt: exportTxt,
     "selected-csv": exportSelectedRowsCsv,
@@ -7716,6 +7756,7 @@ function selectExportMenuItem(value: string) {
     "selected-xlsx-with-sql": exportSelectedRowsXlsxWithSql,
     "selected-json": exportSelectedRowsJson,
     "selected-markdown": exportSelectedRowsMarkdown,
+    "selected-html": exportSelectedRowsHtml,
     "selected-sql": exportSelectedRowsSql,
     "selected-txt": exportSelectedRowsTxt,
   };
@@ -8057,6 +8098,84 @@ function selectedRangeTargetsOnlyDraftRow(): boolean {
   if (!range) return false;
   if (range.startRow !== range.endRow) return false;
   return displayItemAt(range.startRow)?.isDraft === true;
+}
+
+const replaceAvailable = computed(() => !!props.editable && hasDataGridSaveTarget.value && canEditExistingRows.value && !resolvedConnectionConfig.value?.read_only && !isConditionalUpdateActive.value);
+const replaceBusy = computed(() => isSaving.value || gridSurfaceBusy.value || props.loading === true);
+
+function replacementRowItem(rowId: number): RowItem | undefined {
+  const row = props.result.rows[rowId];
+  if (!row || rowId < 0) return undefined;
+  return { id: rowId, displayIndex: displayRowIndexById(rowId), sourceIndex: rowId, data: rowDataWithChanges(row, rowId), isNew: false, isDeleted: deletedRows.value.has(rowId), isDirtyCol: [], status: dirtyRows.value.has(rowId) ? "edited" : "clean" };
+}
+
+function canReplaceGridCell(item: RowItem | undefined, col: number): boolean {
+  const type = allColumnTypes.value[col];
+  return (
+    replaceAvailable.value &&
+    !!item &&
+    item.sourceIndex !== undefined &&
+    !item.isNew &&
+    !item.isDraft &&
+    typeof item.data[col] === "string" &&
+    canEditCellItem(item, col) &&
+    !isLargeValuePreview(item, col) &&
+    !isBinaryCellColumnType(type) &&
+    !isNumericColumnType(type) &&
+    !isBooleanGridCell(item, col)
+  );
+}
+
+function replacementCellInScope(rowId: number, col: number): boolean {
+  if (replaceScope.value === "loaded") return true;
+  if (replaceScope.value === "column") return col === replaceColumn.value;
+  const rowIndex = displayRowIndexById(rowId);
+  const visibleCol = visibleColumnIndexes.value.indexOf(col);
+  return rowIndex >= 0 && visibleCol >= 0 && (cellIsSelected(rowIndex, visibleCol) || isRowSelected(rowId) || columnIsSelected(visibleCol));
+}
+
+const replacementMatches = computed(() => {
+  if (!replaceOpen.value || !replaceAvailable.value) return [];
+  const items = new Map(props.result.rows.map((_, rowId) => [rowId, replacementRowItem(rowId)!]));
+  return findDataGridReplacementMatches({
+    rows: [...items.values()].map((item) => ({ rowId: item.id, data: item.data })),
+    search: deferredClientSearchText.value,
+    caseSensitive: replaceCaseSensitive.value,
+    includesCell: replacementCellInScope,
+    canReplaceCell: (rowId, col) => canReplaceGridCell(items.get(rowId), col),
+  });
+});
+
+const canReplaceCurrent = computed(() => {
+  if (searchText.value !== deferredClientSearchText.value) return false;
+  const match = currentSearchMatch.value;
+  if (!match || match.kind !== "cell") return false;
+  const item = displayItemAt(match.displayRow);
+  return !!item && replacementMatches.value.some((candidate) => candidate.rowId === item.id && candidate.col === match.col);
+});
+
+watch([replaceOpen, replaceScope], () => {
+  if (!replaceOpen.value || replaceScope.value !== "column") return;
+  const selectionCol = selectionFocus.value?.colIndex ?? [...selectedColumnIndexes.value][0];
+  replaceColumn.value = selectionCol !== null && selectionCol !== undefined ? actualColumnIndex(selectionCol) : (currentSearchMatch.value?.col ?? visibleColumnIndexes.value[0] ?? -1);
+});
+
+watch(
+  () => props.result,
+  () => {
+    replaceOpen.value = false;
+    replaceColumn.value = -1;
+  },
+);
+
+function replaceGridMatches(currentOnly = false) {
+  if (!replaceAvailable.value || replaceBusy.value) return;
+  if (currentOnly && !canReplaceCurrent.value) return;
+  const current = currentSearchMatch.value;
+  const currentRowId = current?.kind === "cell" ? displayItemAt(current.displayRow)?.id : undefined;
+  const matches = replacementMatches.value.filter((match) => !currentOnly || (match.rowId === currentRowId && match.col === current?.col));
+  const count = stageCellReplacements(matches.map((match) => ({ ...match, previousValue: match.value, value: replaceDataGridText(match.value, deferredClientSearchText.value, replacementText.value, replaceCaseSensitive.value) })));
+  if (count > 0) toast(t("grid.replaceStagedCells", { count }), 5000);
 }
 
 function fillSelectionWithValue(value: string | null, options: { preserveEmptyString?: boolean; emptyStringAsNull?: boolean } = {}): boolean {
@@ -11314,6 +11433,7 @@ function exportSubmenu(): ContextMenuItem {
     { label: t("grid.exportXlsx"), action: exportXlsx },
     { label: t("grid.exportJson"), action: exportJson },
     { label: t("grid.exportMarkdown"), action: exportMarkdown },
+    { label: t("grid.exportHtml"), action: exportHtml },
     { label: t("grid.exportSql"), action: exportSql },
     { label: t("grid.exportTxt"), action: exportTxt },
   ];
@@ -11346,6 +11466,10 @@ function exportSubmenu(): ContextMenuItem {
       {
         label: t("grid.exportSelectedRowsMarkdown"),
         action: exportSelectedRowsMarkdown,
+      },
+      {
+        label: t("grid.exportSelectedRowsHtml"),
+        action: exportSelectedRowsHtml,
       },
       { label: t("grid.exportSelectedRowsSql"), action: exportSelectedRowsSql },
       { label: t("grid.exportSelectedRowsTxt"), action: exportSelectedRowsTxt },
@@ -11842,6 +11966,16 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
             <DataGridSearchBar
               ref="searchBarRef"
               v-model:text="searchText"
+              v-model:replace-open="replaceOpen"
+              v-model:replacement-text="replacementText"
+              v-model:replace-scope="replaceScope"
+              v-model:case-sensitive="replaceCaseSensitive"
+              v-model:replace-column="replaceColumn"
+              :replace-available="replaceAvailable"
+              :replace-busy="replaceBusy"
+              :replace-match-count="replacementMatches.length"
+              :can-replace-current="canReplaceCurrent"
+              :columns="props.result.columns"
               :open="searchOverlayVisible"
               :suggestions="searchSuggestions"
               :suggestion-index="suggestionIndex"
@@ -11851,6 +11985,8 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               :values-truncated="(props.result.large_value_cells?.length ?? 0) > 0"
               @keydown="onSearchKeydown"
               @navigate="navigateMatch"
+              @replace-current="replaceGridMatches(true)"
+              @replace-all="replaceGridMatches()"
               @close="closeSearch"
               @accept-suggestion="
                 suggestionIndex = $event;
