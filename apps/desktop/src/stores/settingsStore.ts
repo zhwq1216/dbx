@@ -14,7 +14,7 @@ import { normalizeResultPageSize } from "@/lib/dataGrid/paginationPageSize";
 import { DEFAULT_QUERY_RESULT_MAX_ROWS, normalizeQueryResultMaxRows } from "@/lib/dataGrid/queryResultRowLimit";
 import { normalizeExternalSqlEditorMaxMb } from "@/lib/sql/sqlFileOpen";
 import { DEFAULT_QUERY_TIMEOUT_SECS, normalizeConnectTimeoutSecs, normalizeQueryTimeoutSecs } from "@/lib/connection/timeoutLimits";
-import { needsTabNavigationHistoryShortcutMigration, normalizeShortcutSettings, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
+import { needsTabNavigationHistoryShortcutMigration, normalizeShortcutSettings, isReservedShortcut, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
@@ -861,6 +861,7 @@ export interface EditorSettings {
   generateSqlQuoteIdentifiers: boolean;
   formatSqlOnSqlFileSave: boolean;
   updateNotificationsEnabled: boolean;
+  autoDownloadUpdates: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarCopyTableNameSeparator: ColumnNameCopySeparator;
   sidebarCopyTableNameIncludeSchema: boolean;
@@ -1102,6 +1103,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
   updateNotificationsEnabled: true,
+  autoDownloadUpdates: false,
   sidebarHiddenTablePrefixes: [],
   sidebarCopyTableNameSeparator: "comma",
   sidebarCopyTableNameIncludeSchema: false,
@@ -1357,10 +1359,15 @@ function normalizeSqlShortcuts(value: unknown, existing?: SqlShortcutAction[]): 
     if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id || typeof item.label !== "string" || !item.label || typeof item.shortcut !== "string" || typeof item.sql !== "string") {
       continue;
     }
+    const shortcut = item.shortcut.trim();
+    // SQL 快捷键走 createQueryEditorSqlShortcutDomHandler：匹配后 preventDefault，
+    // 与普通动作一样会重新劫持 macOS 的 ⌘H。此处直接丢弃保留组合——SQL 快捷键
+    // 没有“平台默认值”这一概念（它是用户自定义模板的专属触发键），清空即视为未绑定。
+    const normalizedShortcut = isReservedShortcut(shortcut) ? "" : shortcut;
     valid.push({
       id: item.id,
       label: item.label,
-      shortcut: item.shortcut.trim(),
+      shortcut: normalizedShortcut,
       sql: item.sql,
       enabled: item.enabled !== false,
     });
@@ -1593,6 +1600,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     generateSqlQuoteIdentifiers: typeof settings.generateSqlQuoteIdentifiers === "boolean" ? settings.generateSqlQuoteIdentifiers : DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers,
     formatSqlOnSqlFileSave: settings.formatSqlOnSqlFileSave === true,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
+    autoDownloadUpdates: settings.autoDownloadUpdates === true,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarCopyTableNameSeparator: normalizeSidebarCopyTableNameSeparator(settings.sidebarCopyTableNameSeparator),
     sidebarCopyTableNameIncludeSchema: settings.sidebarCopyTableNameIncludeSchema === true,
@@ -1721,6 +1729,9 @@ export const useSettingsStore = defineStore("settings", () => {
   const activeModel = ref<{ configId: string; modelId: string } | null>(null);
   const effortPreferences = ref<AiModelEffortPreference[]>([]);
   const defaultAiMode = ref<AiAssistantMode>("ask");
+  // Opt-in (#9118): new conversations land on the `auto` picker entry only when
+  // the user turned the default on in Settings > AI.
+  const defaultAutoRouting = ref(false);
   const restoreLastConversation = ref(false);
   // Per-db_type prompt template defaults (explicit opt-in) and last-used
   // fallback; both resolved when an AI panel mounts or its namespace changes.
@@ -1925,6 +1936,7 @@ export const useSettingsStore = defineStore("settings", () => {
     const savedSelection = await api.loadAiChatSelection().catch(() => null);
     effortPreferences.value = (savedSelection?.effortPreferences ?? []).filter((preference) => aiConfigs.value.some((config) => config.id === preference.configId));
     defaultAiMode.value = savedSelection?.defaultMode ?? "ask";
+    defaultAutoRouting.value = savedSelection?.defaultAutoRouting ?? false;
     restoreLastConversation.value = savedSelection?.restoreLastConversation ?? false;
     aiDefaultTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.defaultTemplatesByDbType);
     aiLastUsedTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.lastUsedTemplatesByDbType);
@@ -2066,6 +2078,12 @@ export const useSettingsStore = defineStore("settings", () => {
     persistAiChatSelection();
   }
 
+  function setDefaultAutoRouting(value: boolean) {
+    if (value === defaultAutoRouting.value) return;
+    defaultAutoRouting.value = value;
+    persistAiChatSelection();
+  }
+
   function setRestoreLastConversation(value: boolean) {
     if (value === restoreLastConversation.value) return;
     restoreLastConversation.value = value;
@@ -2132,6 +2150,7 @@ export const useSettingsStore = defineStore("settings", () => {
         selection: { ...preference.selection },
       })),
       defaultMode: defaultAiMode.value,
+      defaultAutoRouting: defaultAutoRouting.value,
       restoreLastConversation: restoreLastConversation.value,
       // Match the backend's skip_serializing_if(empty): omit the per-db_type
       // records entirely while nothing is configured so the payload stays
@@ -2322,6 +2341,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.generateSqlQuoteIdentifiers !== undefined) editorSettings.value.generateSqlQuoteIdentifiers = partial.generateSqlQuoteIdentifiers === true;
     if (partial.formatSqlOnSqlFileSave !== undefined) editorSettings.value.formatSqlOnSqlFileSave = partial.formatSqlOnSqlFileSave === true;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
+    if (partial.autoDownloadUpdates !== undefined) editorSettings.value.autoDownloadUpdates = partial.autoDownloadUpdates === true;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarCopyTableNameSeparator !== undefined) editorSettings.value.sidebarCopyTableNameSeparator = normalizeSidebarCopyTableNameSeparator(partial.sidebarCopyTableNameSeparator);
     if (partial.sidebarCopyTableNameIncludeSchema !== undefined) editorSettings.value.sidebarCopyTableNameIncludeSchema = partial.sidebarCopyTableNameIncludeSchema === true;
@@ -2524,6 +2544,8 @@ export const useSettingsStore = defineStore("settings", () => {
     activeEffort,
     defaultAiMode,
     setDefaultAiMode,
+    defaultAutoRouting,
+    setDefaultAutoRouting,
     restoreLastConversation,
     setRestoreLastConversation,
     aiDefaultTemplatesByDbType,

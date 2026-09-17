@@ -1,4 +1,6 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
+import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
 import { assertUpdateAllowsCommand } from "@/lib/app/updatePreparation";
 import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
 
@@ -10,6 +12,7 @@ import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { normalizeRustMongoCommand, type MongoCommand } from "@/lib/mongo/mongoShellCommand";
+import type { MongoBulkWriteResult } from "@/lib/mongo/mongoShellCommand";
 import { ExternalSqlFileTooLargeError } from "@/lib/sql/sqlFileOpen";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
@@ -198,6 +201,11 @@ export interface AgentOfflineExportResult {
   driverCount: number;
   jreCount: number;
   bytes: number;
+}
+
+export interface AgentOfflineImportResult {
+  count: number;
+  jreCount: number;
 }
 
 export type JavaRuntimeMode = "managed" | "system" | "custom";
@@ -491,6 +499,8 @@ export interface AiCompletionRequest {
   messages: AiMessage[];
   taskContract?: AiTaskContract;
   maxTokens?: number;
+  /** Stable per-conversation key used by the Responses API prompt cache. */
+  promptCacheKey?: string;
 }
 
 export interface AiModelInfo {
@@ -769,6 +779,7 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
 
 export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
 import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
+import { uuid } from "@/lib/common/utils";
 
 export async function loadEditorSettings(): Promise<unknown | null> {
   return invoke("load_editor_settings");
@@ -1001,6 +1012,10 @@ export async function pendingOpenConnectionLinks(): Promise<string[]> {
 
 export async function pendingOpenAiConfigLinks(): Promise<string[]> {
   return invoke("pending_open_ai_config_links");
+}
+
+export async function pendingOpenPluginInstallLinks(): Promise<string[]> {
+  return invoke("pending_open_plugin_install_links");
 }
 
 export interface ExternalSqlFileSnapshot {
@@ -1596,7 +1611,7 @@ export async function executeMultiWithProgress(
     executionId?: string;
   },
 ): Promise<QueryResult[]> {
-  const executionId = options?.executionId ?? crypto.randomUUID();
+  const executionId = options?.executionId ?? uuid();
   const { executionId: _executionId, ...invokeOptions } = options ?? {};
   const unlisten = await listen<ExecuteMultiProgress>("query-batch-progress", (event) => {
     if (event.payload.executionId === executionId) onProgress(event.payload);
@@ -2507,7 +2522,7 @@ export async function invalidateAgentRegistryCache(): Promise<void> {
   return invoke("invalidate_agent_registry_cache");
 }
 
-export async function importAgentsFromZip(path: string | File, operationId?: string): Promise<number> {
+export async function importAgentsFromZip(path: string | File, operationId?: string): Promise<AgentOfflineImportResult> {
   if (typeof path !== "string") {
     throw new Error("Desktop offline package import requires a local file path");
   }
@@ -4431,6 +4446,28 @@ export async function documentUpdateDocument(connectionId: string, database: str
   });
 }
 
+export async function mongoBulkWrite(connectionId: string, database: string, collection: string, operationsJson: string, optionsJson?: string): Promise<MongoBulkWriteResult> {
+  return invoke<MongoBulkWriteResult>("mongo_bulk_write", {
+    connectionId,
+    database,
+    collection,
+    operationsJson,
+    optionsJson,
+  });
+}
+
+export async function mongoReplaceDocument(connectionId: string, database: string, collection: string, filterJson: string, replacementJson: string, optionsJson?: string): Promise<{ affected_rows: number }> {
+  const affectedRows = await invoke<number>("mongo_replace_document", {
+    connectionId,
+    database,
+    collection,
+    filterJson,
+    replacementJson,
+    optionsJson,
+  });
+  return { affected_rows: affectedRows };
+}
+
 export async function mongoUpdateDocuments(connectionId: string, database: string, collection: string, filterJson: string, updateJson: string, many: boolean, optionsJson?: string): Promise<{ affected_rows: number }> {
   const affectedRows = await invoke<number>("mongo_update_documents", {
     connectionId,
@@ -4748,6 +4785,8 @@ export interface SqlFileRequest {
   filePath: string;
   continueOnError: boolean;
   selectedTables?: SqlFileTable[];
+  partCooldownMs?: number;
+  skipRelationalConstraints?: boolean;
 }
 
 export interface SqlFileTable {
@@ -4766,6 +4805,8 @@ export interface SqlFilePreview {
   preview: string;
   canExecuteWithoutSelectedDatabase: boolean;
   establishesDatabaseContext?: boolean;
+  packageFilePaths?: string[];
+  packagePartCount?: number;
 }
 
 export interface SqlFileProgress {
@@ -5045,12 +5086,42 @@ export async function releaseTableImportSource(_sourceRef: string): Promise<bool
   return false;
 }
 
-export type MongoImportFormat = "csv" | "json" | "ndjson";
+export function inspectMongodbDatabaseDump(connectionId: string, database: string): Promise<MongoDumpCatalog> {
+  return invoke("inspect_mongodb_database_dump", { connectionId, database });
+}
+export function prepareMongodbRestoreSource(source: MongoDumpSourceInput, format: MongoDumpFormat, gzip: boolean, _options?: MongoSourceReadOptions): Promise<MongoRestoreSourcePreview> {
+  if (typeof source !== "string") throw new Error("Desktop restores require a file or directory path");
+  return invoke("prepare_mongodb_restore_source", { request: { path: source, format, gzip } });
+}
+export function releaseMongodbRestoreSource(sourceRef: string): Promise<boolean> {
+  return invoke("release_mongodb_restore_source", { sourceRef });
+}
+async function runMongodbDatabaseTask(command: string, request: MongoDatabaseDumpRequest | MongoDatabaseRestoreRequest, onProgress: (progress: MongoDatabaseDumpProgress) => void): Promise<MongoDatabaseDumpProgress> {
+  const unlisten = await listen<MongoDatabaseDumpProgress>("mongo-database-dump-progress", (event) => {
+    if (event.payload.taskId === request.taskId) onProgress(event.payload);
+  });
+  try {
+    return await invoke(command, { request });
+  } finally {
+    unlisten();
+  }
+}
+export function dumpMongodbDatabase(request: MongoDatabaseDumpRequest, onProgress: (progress: MongoDatabaseDumpProgress) => void) {
+  return runMongodbDatabaseTask("dump_mongodb_database", request, onProgress);
+}
+export function restoreMongodbDatabase(request: MongoDatabaseRestoreRequest, onProgress: (progress: MongoDatabaseDumpProgress) => void, _upload?: MongoRestoreUpload) {
+  return runMongodbDatabaseTask("restore_mongodb_database", request, onProgress);
+}
+export function cancelMongodbDatabaseDump(taskId: string): Promise<boolean> {
+  return invoke("cancel_mongodb_database_dump", { taskId });
+}
+
+export type MongoImportFormat = "csv" | "json" | "ndjson" | "bson";
 export type MongoImportTypeMode = "string" | "auto" | "extendedJson";
-export type MongoImportInferredType = "boolean" | "integer" | "decimal" | "date" | "object" | "array" | "string";
+export type MongoImportInferredType = "boolean" | "integer" | "decimal" | "date" | "objectId" | "object" | "array" | "mixed" | "string";
 export type MongoImportStatus = "running" | "done" | "error" | "cancelled";
 export type MongoImportPhase = "preparing" | "parsing" | "writing" | "done";
-export type MongoExportFormat = "csv" | "ndjson";
+export type MongoExportFormat = "csv" | "ndjson" | "bson";
 export type MongoExportStatus = "running" | "done" | "error" | "cancelled";
 
 export interface MongoImportIssue {
@@ -5072,6 +5143,7 @@ export interface MongoImportParseOptions {
   typeMode?: MongoImportTypeMode | null;
   recognizeObjectIdHex?: boolean | null;
   skipErrorRows?: boolean | null;
+  columnTypes?: Partial<Record<string, MongoImportInferredType>> | null;
 }
 
 export interface MongoImportPreviewRequest {
@@ -5150,6 +5222,7 @@ export interface MongoExportRequest {
   collation?: string | null;
   format: MongoExportFormat;
   includeHeader?: boolean;
+  gzip?: boolean;
   filePath: string;
   executionId?: string | null;
 }
