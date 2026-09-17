@@ -54,8 +54,6 @@ jobs:
             # page-size ARM64 kernels.
     env:
       CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: ${{ secrets.SCCACHE_S3_BUCKET == '' && 'true' || 'false' }}
       RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
     steps:
       - uses: actions/checkout@v5
