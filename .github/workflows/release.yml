@@ -167,6 +167,7 @@ jobs:
           Copy-Item $exePath (Join-Path $portableDir "dbx-web.exe") -Force
           Copy-Item "LICENSE" (Join-Path $portableDir "LICENSE") -Force
           Copy-Item "README.md" (Join-Path $portableDir "README.md") -Force
+          Copy-Item ".github\scripts\start-dbx-web.bat" (Join-Path $portableDir "start.bat") -Force
           <#
           Copy-Item "dist" (Join-Path $portableDir "dist") -Recurse  -Force
           #>
